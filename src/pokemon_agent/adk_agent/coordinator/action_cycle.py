@@ -4,6 +4,9 @@ import re
 from copy import deepcopy
 from typing import Any, TypedDict
 
+from pokemon_agent.adk_agent.agents.planner.schema import DEFAULT_OBJECTIVE
+from pokemon_agent.adk_agent.runtime.history import RAW_HISTORY_TURNS
+
 
 IMPORTANT_EVENT_TYPES = {
     "map_changed",
@@ -32,7 +35,6 @@ HARD_STOP_REASONS = {
 FAILED_ACTION_STATUSES = {
     "execution_error",
     "interrupted",
-    "max_repeats_reached",
 }
 CONDITION_OPERATORS = ("equals", "min", "max", "contains")
 
@@ -48,41 +50,16 @@ class StateDiff(TypedDict, total=False):
 
 
 def goal_from_objective(objective: str) -> dict[str, Any]:
-    normalized = _slug(objective)
-    aliases: dict[str, dict[str, Any]] = {
-        "obtain_pokeballs": {
-            "id": "obtain_pokeballs",
-            "description": "Obtain at least one Poke Ball.",
-            "success_conditions": [{"path": "inventory.POKE_BALL", "min": 1}],
-        },
-        "obtain_pokedex": {
-            "id": "obtain_pokedex",
-            "description": "Obtain the Pokedex and verify its event flag.",
-            "success_conditions": [{"path": "flags.received_pokedex", "equals": True}],
-        },
-        "obtain_first_pokemon": {
-            "id": "obtain_first_pokemon",
-            "description": "Obtain the first party Pokemon.",
-            "success_conditions": [{"path": "counts.party", "min": 1}],
-        },
-        "reach_viridian_city": {
-            "id": "reach_viridian_city",
-            "description": "Reach Viridian City.",
-            "success_conditions": [{"path": "map_name", "contains": "Viridian City"}],
-        },
+    return {
+        "id": _slug(objective) or DEFAULT_OBJECTIVE,
+        "description": objective or DEFAULT_OBJECTIVE,
+        "success_conditions": [],
+        "status": "in_progress",
+        "verification": {"verified": False, "conditions": []},
     }
-    if normalized == "obtain_poke_balls":
-        normalized = "obtain_pokeballs"
-    goal = deepcopy(aliases.get(normalized, {}))
-    goal.setdefault("id", normalized or "safe_loop")
-    goal.setdefault("description", objective or "Continue safe Pokemon Red progress.")
-    goal.setdefault("success_conditions", [])
-    goal["status"] = "in_progress"
-    goal["verification"] = {"verified": False, "conditions": []}
-    return goal
 
 
-def normalize_repeat_condition(condition: Any) -> dict[str, Any] | None:
+def _normalize_state_condition(condition: Any) -> dict[str, Any] | None:
     if condition is None:
         return None
     if not isinstance(condition, dict):
@@ -96,7 +73,7 @@ def normalize_repeat_condition(condition: Any) -> dict[str, Any] | None:
 
 
 def evaluate_state_condition(condition: Any, observation: dict[str, Any]) -> dict[str, Any]:
-    normalized = normalize_repeat_condition(condition)
+    normalized = _normalize_state_condition(condition)
     if normalized is None:
         return {"condition": condition, "matched": None, "evidence": None}
     game_state = observation.get("state", {}) if isinstance(observation, dict) else {}
@@ -119,50 +96,26 @@ def verify_goal(goal: dict[str, Any], observation: dict[str, Any]) -> dict[str, 
     return {"verified": verified, "conditions": results, "source": "deterministic_game_state"}
 
 
-def action_cycle_needs_planning(state: dict[str, Any]) -> bool:
-    if state.get("replan_required", True):
-        return True
-    plan = state.get("active_action_plan")
-    if not isinstance(plan, dict) or plan.get("status") != "active":
-        return True
-    condition = plan.get("repeat_until")
-    if condition is None:
-        return False
-    return evaluate_state_condition(condition, state.get("observation", {})).get("matched") is True
-
-
 def verify_action_cycle(
     action_plan: dict[str, Any],
     *,
-    after_observation: dict[str, Any],
     action_result: dict[str, Any],
     state_diff: StateDiff,
     goal_completed: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     updated = deepcopy(action_plan)
-    repeat_count = int(updated.get("repeat_count", 0)) + 1
-    updated["repeat_count"] = repeat_count
-    repeat_until = updated.get("repeat_until")
-    condition_result = evaluate_state_condition(repeat_until, after_observation) if repeat_until else None
     stop_reason = str(action_result.get("stop_reason") or "")
     execution_failed = bool(action_result.get("error")) or stop_reason == "execution_error"
-    interrupted = stop_reason in HARD_STOP_REASONS or stop_reason.startswith("interrupted_")
-    max_repeats = max(1, int(updated.get("max_repeats", 1)))
+    interrupted = stop_reason in HARD_STOP_REASONS
 
     if execution_failed:
         status = "execution_error"
-    elif condition_result and condition_result.get("matched") is True:
-        status = "condition_met"
     elif interrupted:
         status = "interrupted"
-    elif repeat_until is None:
-        status = "single_action_complete"
-    elif repeat_count >= max_repeats:
-        status = "max_repeats_reached"
     else:
-        status = "continue"
+        status = "single_action_complete"
 
-    updated["status"] = "active" if status == "continue" else status
+    updated["status"] = status
     durable_event = any(
         event_type
         in {
@@ -178,10 +131,6 @@ def verify_action_cycle(
     outcome = {
         "status": status,
         "action_result": "failed" if execution_failed or interrupted else "success",
-        "repeat_count": repeat_count,
-        "max_repeats": max_repeats,
-        "repeat_until": repeat_until,
-        "condition_result": condition_result,
         "state_changes": list(state_diff.get("event_types", [])),
         "state_changed": bool(state_diff.get("meaningful")),
         "important_event": durable_event or goal_completed,
@@ -192,7 +141,7 @@ def verify_action_cycle(
 
 
 def should_interpret_action_outcome(outcome: dict[str, Any]) -> bool:
-    return bool(outcome.get("important_event")) or outcome.get("status") in FAILED_ACTION_STATUSES | {"condition_met"}
+    return bool(outcome.get("important_event")) or outcome.get("status") in FAILED_ACTION_STATUSES
 
 
 def build_state_diff(before_observation: dict[str, Any], after_observation: dict[str, Any]) -> StateDiff:
@@ -257,15 +206,12 @@ def build_state_diff(before_observation: dict[str, Any], after_observation: dict
 
 
 def action_transition_summary(
-    action_plan: dict[str, Any],
     action: dict[str, Any],
     state_diff: StateDiff,
     outcome: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "action": action,
-        "repeat_until": action_plan.get("repeat_until"),
-        "repeat_count": outcome.get("repeat_count"),
         "before": state_diff.get("before"),
         "after": state_diff.get("after"),
         "state_changes": state_diff.get("event_types", []),
@@ -279,7 +225,7 @@ def append_transition(
     transition: dict[str, Any],
     *,
     existing_summary: Any = None,
-    limit: int = 20,
+    limit: int = RAW_HISTORY_TURNS,
 ) -> tuple[list[dict[str, Any]], str | None]:
     combined = [*history, transition]
     overflow = combined[:-limit] if len(combined) > limit else []
@@ -301,48 +247,11 @@ def append_transition(
     )
     previous = [part for part in str(existing_summary or "").splitlines() if part.strip()]
     previous.append(line)
-    return recent, "\n".join(previous[-20:])
-
-
-def deterministic_memory_candidates(state: dict[str, Any]) -> list[dict[str, Any]]:
-    plan = state.get("active_action_plan", {})
-    action = plan.get("action", {}) if isinstance(plan, dict) else {}
-    outcome = state.get("action_outcome", {})
-    game_state = state.get("observation", {}).get("state", {})
-    action_key = _slug(str(action.get("reason") or action.get("type") or "action"))
-    step = int(state.get("step_count", 0))
-    candidates: list[dict[str, Any]] = []
-    if outcome.get("status") in FAILED_ACTION_STATUSES:
-        candidates.append(
-            {
-                "key": f"failure:{action_key}:{step:03d}",
-                "value": {
-                    "situation": _compact_game_state(game_state),
-                    "action": action,
-                    "result": outcome.get("status"),
-                    "lesson": outcome.get("reason"),
-                },
-            }
-        )
-    for event_type in outcome.get("state_changes", []):
-        if event_type in {"item_obtained", "pokemon_obtained", "map_changed", "event_flags_changed"}:
-            candidates.append(
-                {
-                    "key": f"event:{action_key}:{_slug(event_type)}",
-                    "value": f"After {action.get('reason') or action.get('type')}, observed {event_type} on {game_state.get('map_name', 'Unknown')}.",
-                }
-            )
-    return candidates
+    return recent, "\n".join(previous[-RAW_HISTORY_TURNS:])
 
 
 def _action_outcome_reason(status: str, stop_reason: str) -> str:
-    if status == "condition_met":
-        return "repeat_condition_met"
-    if status == "max_repeats_reached":
-        return "repeat_limit_reached"
-    if status in {"execution_error", "interrupted"}:
-        return stop_reason or status
-    return status
+    return stop_reason or status
 
 
 def _condition_list(value: Any) -> list[Any]:

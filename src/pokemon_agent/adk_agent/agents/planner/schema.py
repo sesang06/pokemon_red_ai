@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Literal, Protocol, TypedDict
 
-from pokemon_agent.adk_agent.coordinator.action_cycle import normalize_repeat_condition
 from pokemon_agent.input_contract import (
     BUTTON_TOKENS,
     MAX_BUTTONS_PER_ACTION,
@@ -16,11 +15,20 @@ from pokemon_agent.tools.screen_navigation import (
 
 PokemonMode = Literal["battle", "dialog", "menu", "overworld", "unknown"]
 ALLOWED_BUTTON_TOKENS = frozenset(BUTTON_TOKENS)
-PROMPT_MEMORY_LIMIT = 3
 PROMPT_TRANSITION_LIMIT = 2
+DEFAULT_OBJECTIVE = "complete_pokemon_red"
+
+
 class ActionPlanner(Protocol):
     def plan(self, state: dict[str, Any]) -> dict[str, Any] | None:
         """Return one direct action plan dict or None."""
+
+
+class PlannerResponse(TypedDict):
+    screen_description: str
+    current_location: str
+    thought_summary: str
+    action: dict[str, Any]
 
 
 class PokemonAgentState(TypedDict, total=False):
@@ -28,13 +36,11 @@ class PokemonAgentState(TypedDict, total=False):
     observation: dict[str, Any]
     previous_observation: dict[str, Any]
     mode: PokemonMode
-    long_term_memory: dict[str, Any]
     current_goal: dict[str, Any]
     active_action_plan: dict[str, Any]
     action_outcome: dict[str, Any]
     state_diff: dict[str, Any]
     transition_history: list[dict[str, Any]]
-    replan_required: bool
     planner_call_count: int
     llm_planner_call_count: int
     interpreter_call_count: int
@@ -43,7 +49,6 @@ class PokemonAgentState(TypedDict, total=False):
     execution_report: dict[str, Any]
     action_result: dict[str, Any]
     action_history: list[dict[str, Any]]
-    session_dialog: list[dict[str, Any]]
     history_summary: str
     memory_path: str
     interpretation: dict[str, Any]
@@ -60,7 +65,7 @@ class PokemonAgentState(TypedDict, total=False):
 
 def initial_state(
     *,
-    objective: str = "safe_loop",
+    objective: str = DEFAULT_OBJECTIVE,
     max_steps: int = 20,
     checkpoint_every: int = 10,
 ) -> PokemonAgentState:
@@ -68,14 +73,12 @@ def initial_state(
         "objective": objective,
         "action_history": [],
         "transition_history": [],
-        "session_dialog": [],
         "stuck_score": 0,
         "step_count": 0,
         "max_steps": max_steps,
         "checkpoint_every": checkpoint_every,
         "checkpoint_path": None,
         "plan_error": None,
-        "replan_required": True,
         "planner_call_count": 0,
         "llm_planner_call_count": 0,
         "interpreter_call_count": 0,
@@ -96,117 +99,6 @@ def classify_mode(observation: dict[str, Any]) -> PokemonMode:
     if mode in {"explore", "navigate", "plan", "start", "building"}:
         return "overworld"
     return "unknown"
-
-
-def rule_based_plan(state: PokemonAgentState) -> PokemonAgentState:
-    mode = state.get("mode", "unknown")
-    if mode in {"battle", "dialog"}:
-        return {"planned_action": {"type": "buttons", "buttons": ["a"], "reason": f"advance_{mode}"}}
-    if mode == "menu":
-        return {"planned_action": {"type": "buttons", "buttons": ["b"], "reason": "close_menu"}}
-    if mode != "overworld":
-        return {"planned_action": {"type": "buttons", "buttons": ["wait"], "reason": "wait_unknown_mode"}}
-
-    failed_targets = _failed_move_targets_for_state(state)
-    frontier_target = state.get("observation", {}).get("world_map", {}).get("nearest_screen_tile")
-    if isinstance(frontier_target, dict):
-        world_x = frontier_target.get("world_x")
-        world_y = frontier_target.get("world_y")
-        distance = int(frontier_target.get("distance") or 0)
-        frontier = (int(world_x), int(world_y)) if world_x is not None and world_y is not None else None
-        if frontier is not None and distance > 1 and frontier not in failed_targets:
-            return {
-                "planned_action": {
-                    "type": "move",
-                    "target": list(frontier),
-                    "reason": "explore_world_map_frontier",
-                }
-            }
-
-    target = select_walkable_world_target(
-        state.get("observation", {}),
-        state.get("step_count", 0),
-        recent_positions=_recent_positions_for_state(state),
-        avoid_targets=failed_targets,
-    )
-    if target is None:
-        if isinstance(frontier_target, dict):
-            world_x = frontier_target.get("world_x")
-            world_y = frontier_target.get("world_y")
-            frontier = (int(world_x), int(world_y)) if world_x is not None and world_y is not None else None
-            if frontier is not None and frontier not in failed_targets:
-                return {
-                    "planned_action": {
-                        "type": "move",
-                        "target": list(frontier),
-                        "reason": "explore_adjacent_world_map_frontier",
-                    }
-                }
-        return {"planned_action": {"type": "buttons", "buttons": ["wait"], "reason": "no_walkable_neighbor"}}
-
-    return {
-        "planned_action": {
-            "type": "move",
-            "target": [target["x"], target["y"]],
-            "reason": "safe_local_explore",
-        }
-    }
-
-
-def _recent_positions_for_state(state: PokemonAgentState) -> list[tuple[int, int]]:
-    observation_state = state.get("observation", {}).get("state", {})
-    current_map_id = observation_state.get("map_id")
-    current_map_name = observation_state.get("map_name")
-    positions: list[tuple[int, int]] = []
-
-    def append_position(game_state: Any) -> None:
-        if not isinstance(game_state, dict):
-            return
-        map_id = game_state.get("map_id")
-        map_name = game_state.get("map_name")
-        if current_map_id is not None and map_id is not None and map_id != current_map_id:
-            return
-        if current_map_name and map_name and map_name != current_map_name:
-            return
-        position = game_state.get("position")
-        if not isinstance(position, dict) or position.get("x") is None or position.get("y") is None:
-            return
-        positions.append((int(position["x"]), int(position["y"])))
-
-    for transition in state.get("transition_history", []):
-        if isinstance(transition, dict):
-            append_position(transition.get("before"))
-            append_position(transition.get("after"))
-    if not positions:
-        for entry in state.get("action_history", []):
-            if isinstance(entry, dict):
-                append_position(entry.get("before_state"))
-                append_position(entry.get("after_state"))
-    append_position(observation_state)
-    return positions
-
-
-def _failed_move_targets_for_state(state: PokemonAgentState) -> set[tuple[int, int]]:
-    stuck_score = int(state.get("stuck_score", 0))
-    if stuck_score <= 0:
-        return set()
-    failed_reasons = {"no_path", "movement_blocked", "max_steps_reached", "execution_error"}
-    failed_targets: set[tuple[int, int]] = set()
-    history = list(state.get("action_history", []))[-max(3, stuck_score) :]
-    for entry in history:
-        if not isinstance(entry, dict):
-            continue
-        action = entry.get("action") if isinstance(entry.get("action"), dict) else {}
-        result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
-        target = action.get("target")
-        if (
-            action.get("type") == "move"
-            and result.get("stop_reason") in failed_reasons
-            and isinstance(target, (list, tuple))
-            and len(target) == 2
-        ):
-            failed_targets.add((int(target[0]), int(target[1])))
-    return failed_targets
 
 
 def sanitize_planned_action(action: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -255,107 +147,10 @@ def normalize_action_plan(raw: dict[str, Any] | None) -> dict[str, Any] | None:
     if action is None:
         return None
 
-    raw_condition = raw.get("repeat_until")
-    repeat_until = normalize_repeat_condition(raw_condition)
-    if raw_condition is not None and repeat_until is None:
-        return None
-    try:
-        max_repeats = bounded_int(raw.get("max_repeats", 1), minimum=1, maximum=16)
-    except (TypeError, ValueError):
-        return None
-    if repeat_until is None:
-        max_repeats = 1
     return {
         "action": action,
-        "repeat_until": repeat_until,
-        "max_repeats": max_repeats,
-        "repeat_count": 0,
         "status": "active",
     }
-
-
-def select_walkable_world_target(
-    observation: dict[str, Any],
-    step_count: int,
-    max_distance: int = MAX_MOVE_PATH_STEPS,
-    *,
-    recent_positions: list[tuple[int, int]] | None = None,
-    avoid_targets: set[tuple[int, int]] | None = None,
-) -> dict[str, int | str] | None:
-    _ = step_count  # Retained for API compatibility; target choice is history-based, not turn rotation.
-    walk_grid = walk_area_collision_for_observation(observation)
-    position = _position_for_observation(observation)
-    if walk_grid is None or position is None:
-        return None
-
-    mutable_grid = [list(row) for row in walk_grid]
-    if _in_bounds(PLAYER_WALK_CELL, mutable_grid):
-        mutable_grid[PLAYER_WALK_CELL.y][PLAYER_WALK_CELL.x] = 1
-    distances = reachable_distances(PLAYER_WALK_CELL, mutable_grid)
-    if not distances:
-        return None
-
-    candidates = [
-        point
-        for point, distance in distances.items()
-        if 0 < distance <= max_distance and point != PLAYER_WALK_CELL
-    ]
-    if not candidates:
-        return None
-    cardinal_candidates = [
-        point
-        for point in candidates
-        if point.x == PLAYER_WALK_CELL.x or point.y == PLAYER_WALK_CELL.y
-    ]
-    if cardinal_candidates:
-        candidates = cardinal_candidates
-
-    recent_positions = list(recent_positions or [])
-    current_position = (position.x, position.y)
-    if not recent_positions or recent_positions[-1] != current_position:
-        recent_positions.append(current_position)
-    visit_counts: dict[tuple[int, int], int] = {}
-    last_seen: dict[tuple[int, int], int] = {}
-    for index, visited in enumerate(recent_positions):
-        visit_counts[visited] = visit_counts.get(visited, 0) + 1
-        last_seen[visited] = index
-    direction_counts = {"right": 0, "down": 0, "left": 0, "up": 0}
-    for before, after in zip(recent_positions, recent_positions[1:]):
-        if before == after:
-            continue
-        direction = _direction_for_delta(after[0] - before[0], after[1] - before[1])
-        direction_counts[direction] += 1
-    previous_position = next(
-        (visited for visited in reversed(recent_positions[:-1]) if visited != current_position),
-        None,
-    )
-
-    world_candidates = [(point, walk_cell_to_map_position(point, position)) for point in candidates]
-    avoided = set(avoid_targets or set())
-    preferred = [candidate for candidate in world_candidates if (candidate[1].x, candidate[1].y) not in avoided]
-    if preferred:
-        world_candidates = preferred
-
-    direction_priority = {"right": 3, "down": 2, "left": 1, "up": 0}
-
-    def score(candidate: tuple[GridPoint, GridPoint]) -> tuple[int, int, int, int, int, int, int]:
-        point, world = candidate
-        world_position = (world.x, world.y)
-        visits = visit_counts.get(world_position, 0)
-        direction = _direction_for_delta(point.x - PLAYER_WALK_CELL.x, point.y - PLAYER_WALK_CELL.y)
-        return (
-            int(visits == 0),
-            int(world_position != previous_position),
-            -direction_counts[direction],
-            -visits,
-            -last_seen.get(world_position, -1),
-            distances[point],
-            direction_priority[direction],
-        )
-
-    target, world = max(world_candidates, key=score)
-    direction = _direction_for_delta(target.x - PLAYER_WALK_CELL.x, target.y - PLAYER_WALK_CELL.y)
-    return {"x": world.x, "y": world.y, "direction": direction, "distance": distances[target]}
 
 
 def compact_state_for_prompt(state: dict[str, Any]) -> dict[str, Any]:
@@ -385,12 +180,6 @@ def compact_state_for_prompt(state: dict[str, Any]) -> dict[str, Any]:
             state.get("action_outcome"),
             state.get("state_diff"),
         ),
-        "long_term_memory": _compact_memory_for_prompt(
-            state.get("long_term_memory"),
-            game_state=game_state,
-            active_action_plan=active_action_plan,
-            objective=str(state.get("objective") or ""),
-        ),
         "recent_state_transitions": [
             _compact_transition_for_prompt(entry)
             for entry in state.get("transition_history", [])[-PROMPT_TRANSITION_LIMIT:]
@@ -398,7 +187,9 @@ def compact_state_for_prompt(state: dict[str, Any]) -> dict[str, Any]:
         ],
         "last_execution": _compact_execution_for_prompt(state.get("execution_report")),
         "instruction": (
-            "Return one direct ActionPlan JSON containing action, optional repeat_until, and max_repeats. "
+            "Return one direct ActionPlan JSON containing exactly one action. It is executed once, then Python "
+            "observes the new RAM/GameState and asks the Planner for the next action. Express repeated button input "
+            "directly in the ordered buttons array. "
             "The only action types are buttons and move. For move, copy [x,y] from a navigation.reachable_targets "
             "entry and use its third value as the Dijkstra path length; one call can traverse up to "
             f"{MAX_MOVE_PATH_STEPS} steps. Never create a Task or mark a goal complete; "
@@ -434,9 +225,6 @@ def _compact_action_plan_for_prompt(plan: Any) -> dict[str, Any] | None:
     return _without_empty(
         {
             "action": _compact_action(plan.get("action")),
-            "repeat_until": plan.get("repeat_until"),
-            "repeat_count": plan.get("repeat_count"),
-            "max_repeats": plan.get("max_repeats"),
             "status": plan.get("status"),
         }
     )
@@ -470,6 +258,7 @@ def _canonical_game_state_for_prompt(game_state: dict[str, Any], *, mode: str) -
     menu = game_state.get("menu") if isinstance(game_state.get("menu"), dict) else {}
     menu_open = mode == "menu" or bool(menu.get("active"))
     flags = game_state.get("flags") if isinstance(game_state.get("flags"), dict) else {}
+    raw = game_state.get("raw") if isinstance(game_state.get("raw"), dict) else {}
 
     compact = {
         "map_id": game_state.get("map_id"),
@@ -479,6 +268,7 @@ def _canonical_game_state_for_prompt(game_state: dict[str, Any], *, mode: str) -
         "dialog_open": dialog_open,
         "in_battle": in_battle,
         "menu_open": menu_open,
+        "controls_locked": bool(raw.get("controls_locked")),
         "counts": {
             "party": counts.get("party", len(party)),
             "items": counts.get("items", len(items)),
@@ -530,64 +320,6 @@ def _compact_party_member(member: dict[str, Any]) -> dict[str, Any]:
             "status": member.get("status"),
         }
     )
-
-
-def _compact_memory_for_prompt(
-    memory: Any,
-    *,
-    game_state: dict[str, Any],
-    active_action_plan: dict[str, Any] | None,
-    objective: str,
-) -> dict[str, Any] | None:
-    if not isinstance(memory, dict) or not isinstance(memory.get("items"), dict):
-        return None
-    items = memory["items"]
-    plan = active_action_plan or {}
-    action = plan.get("action") if isinstance(plan.get("action"), dict) else {}
-    map_name = str(game_state.get("map_name") or "")
-    action_reason = str(action.get("reason") or action.get("type") or "")
-    query_tokens = _prompt_tokens(map_name, objective, action_reason)
-    exact_map_key = f"map:{map_name}".lower()
-
-    ranked: list[tuple[int, str, str, Any]] = []
-    for raw_key, raw_item in items.items():
-        key = str(raw_key)
-        item = raw_item if isinstance(raw_item, dict) else {"value": raw_item}
-        value = item.get("value")
-        searchable = f"{key} {value}".lower()
-        score = sum(1 for token in query_tokens if token in searchable)
-        if key.lower() == exact_map_key:
-            score += 100
-        if action_reason and action_reason.lower() in searchable:
-            score += 50
-        if key.startswith(("failure:", "strategy:")) and score:
-            score += 10
-        if key == "goal:main" and objective.lower() in searchable:
-            score += 5
-        ranked.append((score, str(item.get("updated_at") or ""), key, value))
-
-    ranked.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
-    relevant = [entry for entry in ranked if entry[0] > 0]
-    selected = (relevant or ranked)[:PROMPT_MEMORY_LIMIT]
-    return {"items": {key: value for _score, _updated_at, key, value in selected}}
-
-
-def _prompt_tokens(*values: str) -> set[str]:
-    tokens: set[str] = set()
-    current: list[str] = []
-    for char in " ".join(values).lower():
-        if char.isalnum() or char == "_":
-            current.append(char)
-        elif current:
-            token = "".join(current)
-            if len(token) >= 3:
-                tokens.add(token)
-            current = []
-    if current:
-        token = "".join(current)
-        if len(token) >= 3:
-            tokens.add(token)
-    return tokens
 
 
 def _compact_transition_for_prompt(entry: dict[str, Any]) -> dict[str, Any]:

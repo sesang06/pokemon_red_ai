@@ -544,25 +544,6 @@ BADGES: tuple[tuple[str, int], ...] = (
 PARTY_DATA_BASES = (0xD16B, 0xD197, 0xD1C3, 0xD1EF, 0xD21B, 0xD247)
 PARTY_NICKNAME_BASES = (0xD2B5, 0xD2C0, 0xD2CB, 0xD2D6, 0xD2E1, 0xD2EC)
 
-# Bit offsets in wEventFlags from pret/pokered constants/event_constants.asm.
-# These early-story flags are enough to verify the Oak/Poke Ball progression
-# without asking vision or an LLM to infer it from dialog text.
-STORY_EVENT_FLAGS: dict[str, int] = {
-    "followed_oak_into_lab": 0x000,
-    "pallet_after_getting_pokeballs": 0x006,
-    "followed_oak_into_lab_2": 0x020,
-    "oak_asked_to_choose_mon": 0x021,
-    "got_starter": 0x022,
-    "battled_rival_in_oaks_lab": 0x023,
-    "got_pokeballs_from_oak": 0x024,
-    "got_pokedex": 0x025,
-    "pallet_after_getting_pokeballs_2": 0x026,
-    "oak_appeared_in_pallet": 0x027,
-    "oak_got_parcel": 0x038,
-    "got_oaks_parcel": 0x039,
-    "beat_route22_rival_1st_battle": 0x525,
-}
-
 
 @dataclass(frozen=True)
 class PokemonRedRamMap:
@@ -603,7 +584,6 @@ class PokemonRedRamMap:
     tilemap_end: int = 0xC507
     pokedex_owned_start: int = 0xD2F7
     pokedex_owned_end: int = 0xD30A
-    event_flags_start: int = 0xD747
     joy_ignore: int = 0xCD6B
     status_flags_5: int = 0xD730
 
@@ -644,7 +624,6 @@ class PokemonRedMemoryReader:
                 "has_badges": bool(raw["badge_bits"]),
                 "has_dialog_text": bool(dialog_text),
                 "has_warps": raw["warp_count"] > 0,
-                **self.read_story_event_flags(memory),
             },
             raw=raw,
         )
@@ -682,7 +661,6 @@ class PokemonRedMemoryReader:
             "dialog_text": dialog_text,
             "dialog_box_detected": dialog_box_detected,
             "pokedex_caught": self.read_pokedex_caught_count(memory),
-            "story_event_flags": self.read_story_event_flags(memory),
             "joy_ignore": self._read_u8(memory, addresses.joy_ignore),
             "status_flags_5": self._read_u8(memory, addresses.status_flags_5),
             "controls_locked": bool(
@@ -803,17 +781,6 @@ class PokemonRedMemoryReader:
             caught_count += self._read_u8(memory, address).bit_count()
         return caught_count
 
-    def read_story_event_flags(self, memory: MemoryView) -> dict[str, bool]:
-        flags = {
-            name: bool(self._read_u8(memory, self.ram_map.event_flags_start + bit // 8) & (1 << (bit % 8)))
-            for name, bit in STORY_EVENT_FLAGS.items()
-        }
-        # Keep the public verifier vocabulary independent from the disassembly's
-        # historical EVENT_GOT_* spelling.
-        flags["received_pokedex"] = flags["got_pokedex"]
-        flags["received_pokeballs"] = flags["got_pokeballs_from_oak"]
-        return flags
-
     def _read_dialog(self, memory: MemoryView) -> tuple[str, bool]:
         text_lines: list[str] = []
         current_line: list[int] = []
@@ -927,6 +894,7 @@ TEXT_OVERRIDES: dict[int, str] = {
     0xED: ">",
     0xEE: "v",
     0xEF: "M",
+    0xF0: "END",
     0xF1: "x",
     0xF2: ".",
     0xF3: "/",

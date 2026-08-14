@@ -9,6 +9,7 @@ from typing import Any
 
 from pokemon_agent.adk_agent.agents.interpreter.agent import GoogleAdkResultInterpreter
 from pokemon_agent.adk_agent.agents.planner.agent import DEFAULT_ADK_MODEL, GoogleAdkPlanner
+from pokemon_agent.adk_agent.agents.planner.schema import DEFAULT_OBJECTIVE
 from pokemon_agent.adk_agent.client import InProcessPokemonMcpClient
 from pokemon_agent.adk_agent.coordinator.loop import PokemonAdkLoop
 from pokemon_agent.adk_agent.runtime.logging import DateGroupedActionLogger
@@ -44,9 +45,9 @@ def load_project_env() -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the MCP-backed Google ADK Pokemon Red agent loop.")
-    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="Number of safe-loop action cycles.")
+    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="Maximum number of agent action cycles.")
     parser.add_argument("--window", default="null", help="PyBoy window backend, for example null or SDL2.")
-    parser.add_argument("--objective", default="safe_loop", help="Agent objective label.")
+    parser.add_argument("--objective", default=DEFAULT_OBJECTIVE, help="Agent objective label.")
     parser.add_argument("--checkpoint-every", type=int, default=10, help="Save PyBoy state every N loop actions.")
     parser.add_argument("--no-load-fixed", action="store_true", help="Start without loading states/fixed_start.state.")
     parser.add_argument(
@@ -73,7 +74,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("POKEMON_AGENT_ADK_MODEL", DEFAULT_ADK_MODEL),
         help=f"Enable Google ADK LLM planning with this model, for example {DEFAULT_ADK_MODEL}.",
     )
-    parser.add_argument("--no-adk-model", dest="adk_model", action="store_const", const=None, help="Use the built-in rule planner only.")
     parser.add_argument(
         "--adk-vision",
         dest="adk_vision",
@@ -158,29 +158,27 @@ def main() -> None:
     client.set_realtime_ticks(enabled=args.realtime_ticks, fps=args.realtime_fps)
     dashboard: DashboardService | None = None
     try:
-        action_planner = None
-        if args.adk_model:
-            action_planner = GoogleAdkPlanner.from_env(
-                model=args.adk_model,
-                include_screenshot=args.adk_vision,
-                thinking_budget=args.adk_thinking_budget,
-                session_db_path=args.adk_session_db,
-            )
-        result_interpreter = None
-        if args.adk_model:
-            result_interpreter = GoogleAdkResultInterpreter.from_env(
-                model=args.adk_model,
-                thinking_budget=args.adk_thinking_budget,
-                session_db_path=args.adk_session_db,
-            )
+        memory_store = FileLongTermMemory(args.memory_path)
+        action_planner = GoogleAdkPlanner.from_env(
+            model=args.adk_model,
+            include_screenshot=args.adk_vision,
+            thinking_budget=args.adk_thinking_budget,
+            session_db_path=args.adk_session_db,
+            memory_store=memory_store,
+        )
+        result_interpreter = GoogleAdkResultInterpreter.from_env(
+            model=args.adk_model,
+            thinking_budget=args.adk_thinking_budget,
+            session_db_path=args.adk_session_db,
+            memory_store=memory_store,
+        )
 
         idle_pump = client.pump_realtime if args.control_ui or args.realtime_ticks else None
-        memory_store = FileLongTermMemory(args.memory_path)
         file_runtime_state_store = FileAgentRuntimeState(
             args.runtime_state_path,
             metadata={
                 "session_db": str(args.adk_session_db.resolve()),
-                "planner_session_id": "pokemon-red-safe-loop",
+                "planner_session_id": "pokemon-red-planner",
                 "result_interpreter_session_id": "pokemon-red-result-interpreter",
             },
         )
@@ -254,7 +252,6 @@ def summarize_result(result: dict[str, Any]) -> dict[str, Any]:
         "execution_report": result.get("execution_report"),
         "interpretation": result.get("interpretation"),
         "interpret_error": result.get("interpret_error"),
-        "session_dialog": result.get("session_dialog"),
         "history_summary": result.get("history_summary"),
         "adk_thinking_budget": result.get("adk_thinking_budget"),
         "last_action": result.get("planned_action"),

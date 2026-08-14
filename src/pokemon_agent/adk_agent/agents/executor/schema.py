@@ -26,14 +26,6 @@ def compact_plan_decision(plan_decision: Any) -> dict[str, Any]:
         "current_goal": plan_decision.get("current_goal"),
         "action_plan": plan_decision.get("action_plan"),
         "memory_keys_read": plan_decision.get("memory_keys_read"),
-        "screen_description": plan_decision.get("screen_description"),
-        "current_location": plan_decision.get("current_location"),
-        "future_objective": plan_decision.get("future_objective"),
-        "thought_summary": plan_decision.get("thought_summary"),
-        "decision_rationale": plan_decision.get("decision_rationale"),
-        "session_dialog": plan_decision.get("session_dialog"),
-        "decision_trace": plan_decision.get("decision_trace"),
-        "expected_result": plan_decision.get("expected_result"),
         "reason": plan_decision.get("reason"),
     }
 

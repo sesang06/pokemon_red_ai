@@ -36,8 +36,7 @@ snapshot and then nested state deltas and typed events.
 - Subscriber queues and the shared event history are bounded.
 - Slow or disconnected clients drop old transport messages, not game frames.
 - Browser reconnect restores current state and up to 500 recent events.
-- Planner event details expose the selected structured action and expected
-  result, not `session_dialog`, `decision_trace`, or hidden model reasoning.
+- Planner event details expose only the selected structured action, map-memory keys, and errors.
 - The dashboard is disabled with `--no-dashboard`; startup failure is logged and
   gameplay continues.
 
@@ -79,12 +78,6 @@ Production UI with the normal ADK agent:
 ```
 
 Open `http://127.0.0.1:8765`.
-
-Deterministic local smoke run without Gemini calls or the Qt window:
-
-```powershell
-.\.venv\Scripts\pokemon-adk.exe --no-adk-model --no-control-ui --steps 1000
-```
 
 Frontend development:
 

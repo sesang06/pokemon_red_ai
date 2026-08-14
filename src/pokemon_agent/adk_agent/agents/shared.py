@@ -9,6 +9,7 @@ from typing import Any
 
 
 TraceSink = Callable[[dict[str, Any]], None]
+PUBLIC_OUTPUT_FIELDS = ("screen_description", "current_location", "thought_summary")
 
 
 class ConsoleTokenStream:
@@ -35,13 +36,27 @@ class ConsoleTokenStream:
 
 
 def event_text(event: Any) -> str:
+    return _event_part_text(event, include_thoughts=False)
+
+
+def event_thinking_summary(event: Any) -> str:
+    return _event_part_text(event, include_thoughts=True)
+
+
+def _event_part_text(event: Any, *, include_thoughts: bool) -> str:
     content = getattr(event, "content", None)
     if content is None:
+        if include_thoughts:
+            return ""
         output = getattr(event, "output", None)
         return "" if output is None else str(output)
 
     parts = getattr(content, "parts", None) or []
-    text_parts = [str(part.text) for part in parts if getattr(part, "text", None)]
+    text_parts = [
+        str(part.text)
+        for part in parts
+        if getattr(part, "text", None) and bool(getattr(part, "thought", False)) is include_thoughts
+    ]
     return "\n".join(text_parts)
 
 
@@ -74,6 +89,45 @@ def parse_json_object(content: str) -> Any:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         return None
+
+
+def public_output_fields(
+    raw: dict[str, Any] | None,
+    state: dict[str, Any],
+    *,
+    default_thought: str,
+) -> dict[str, str]:
+    observation = state.get("observation") if isinstance(state.get("observation"), dict) else {}
+    game_state = observation.get("state") if isinstance(observation.get("state"), dict) else {}
+    map_name = str(game_state.get("map_name") or "Unknown area")
+    mode = str(game_state.get("mode") or state.get("mode") or "unknown mode")
+    position = game_state.get("position") if isinstance(game_state.get("position"), dict) else {}
+    x = position.get("x")
+    y = position.get("y")
+    location = map_name if x is None or y is None else f"{map_name} ({x}, {y})"
+    source = raw if isinstance(raw, dict) else {}
+    return {
+        "screen_description": _public_text(
+            source.get("screen_description"),
+            default=f"Current game screen in {map_name}, mode={mode}",
+            limit=500,
+        ),
+        "current_location": _public_text(
+            source.get("current_location"),
+            default=location,
+            limit=200,
+        ),
+        "thought_summary": _public_text(
+            source.get("thought_summary"),
+            default=default_thought,
+            limit=500,
+        ),
+    }
+
+
+def _public_text(value: Any, *, default: str, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return (text or default)[:limit]
 
 
 def emit_trace(trace: TraceSink | None, event: dict[str, Any]) -> None:

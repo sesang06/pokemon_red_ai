@@ -65,6 +65,12 @@ def initial_live_state() -> dict[str, Any]:
             "interpreter_calls": 0,
             "plan_error": None,
             "interpret_error": None,
+            "thinking": {
+                "agent": None,
+                "status": "idle",
+                "summary": None,
+                "updated_at": None,
+            },
         },
         "navigation": {
             "player": None,
@@ -149,7 +155,6 @@ def runtime_state(state: dict[str, Any], *, phase: str) -> dict[str, Any]:
             "id": goal.get("id"),
             "description": goal.get("description") or goal.get("id"),
             "status": goal.get("status") or "planned",
-            "attempt": int(plan.get("repeat_count", 0)) + 1,
             "step": int(state.get("step_count", 0)),
             "max_steps": state.get("max_steps"),
             "verification": goal.get("verification"),

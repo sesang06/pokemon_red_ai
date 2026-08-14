@@ -69,12 +69,6 @@ class ExecutionAgent:
                 "agent": self.name,
                 "phase": "execution_done",
                 "step": state.get("step_count", 0),
-                "thought_summary": f"Executed the validated direct action: {action.get('type')}.",
-                "decision_trace": {
-                    "validated_action_type": action.get("type"),
-                    "allowed_actions": sorted(ALLOWED_EXECUTION_ACTIONS),
-                    "execution_guard": "invalid or unsupported actions are replaced with wait",
-                },
                 "action": action,
                 "stop_reason": report["stop_reason"],
                 "success_hint": report["success_hint"],

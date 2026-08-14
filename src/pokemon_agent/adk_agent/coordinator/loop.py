@@ -6,7 +6,6 @@ from typing import Any
 
 from pokemon_agent.adk_agent.runtime.logging import DateGroupedActionLogger
 from pokemon_agent.adk_agent.coordinator.action_cycle import (
-    action_cycle_needs_planning,
     action_transition_summary,
     append_transition,
     build_state_diff,
@@ -17,6 +16,7 @@ from pokemon_agent.adk_agent.coordinator.action_cycle import (
 from pokemon_agent.adk_agent.client import PokemonToolClient
 from pokemon_agent.adk_agent.agents.planner.schema import (
     ActionPlanner,
+    DEFAULT_OBJECTIVE,
     PokemonAgentState,
     classify_mode,
     initial_state,
@@ -27,6 +27,7 @@ from pokemon_agent.adk_agent.agents.interpreter.schema import ResultSummarizer
 from pokemon_agent.adk_agent.agents.planner.agent import PlanningAgent
 from pokemon_agent.adk_agent.agents.shared import TraceSink
 from pokemon_agent.adk_agent.runtime.state import FileAgentRuntimeState
+from pokemon_agent.adk_agent.runtime.history import RAW_HISTORY_TURNS
 from pokemon_agent.memory.file_memory import FileLongTermMemory
 
 
@@ -51,7 +52,6 @@ class PokemonAdkLoop:
         self.idle_pump_interval = idle_pump_interval
         self.runtime_state_store = runtime_state_store
         self.planning_agent = PlanningAgent(
-            memory_store=self.memory_store,
             action_planner=action_planner,
             idle_pump=idle_pump,
             idle_pump_interval=idle_pump_interval,
@@ -59,7 +59,6 @@ class PokemonAdkLoop:
         )
         self.execution_agent = ExecutionAgent(client=client, trace=trace, action_logger=action_logger)
         self.result_interpreter_agent = ResultInterpreterAgent(
-            memory_store=self.memory_store,
             summarizer=result_interpreter,
             idle_pump=idle_pump,
             idle_pump_interval=idle_pump_interval,
@@ -69,7 +68,7 @@ class PokemonAdkLoop:
     def run(
         self,
         *,
-        objective: str = "safe_loop",
+        objective: str = DEFAULT_OBJECTIVE,
         max_steps: int = 20,
         checkpoint_every: int = 10,
         initial_runtime_state: PokemonAgentState | None = None,
@@ -83,7 +82,7 @@ class PokemonAdkLoop:
             state["current_goal"] = goal_from_objective(objective)
         else:
             state = deepcopy(initial_runtime_state)
-            previous_objective = str(state.get("objective") or "safe_loop")
+            previous_objective = str(state.get("objective") or DEFAULT_OBJECTIVE)
             requested_objective = objective or previous_objective
             state["objective"] = requested_objective
             state["max_steps"] = int(state.get("step_count", 0)) + max(0, int(max_steps))
@@ -94,7 +93,6 @@ class PokemonAdkLoop:
                 state["current_goal"] = goal_from_objective(requested_objective)
                 state.pop("active_action_plan", None)
                 state.pop("action_outcome", None)
-                state["replan_required"] = True
             else:
                 state.setdefault("current_goal", goal_from_objective(requested_objective))
         state["memory_path"] = str(self.memory_store.path)
@@ -108,11 +106,11 @@ class PokemonAdkLoop:
             if state.get("done"):
                 self._publish(state, phase="completed")
                 break
-            if action_cycle_needs_planning(state):
-                state.update(self._plan(state))
-            else:
-                state["planned_action"] = dict(state["active_action_plan"]["action"])
+            state.update(self._plan(state))
             self._publish(state, phase="planned")
+            if state.get("done"):
+                self._publish(state, phase="completed")
+                break
             state.update(self._act(state))
             state.update(self._verify(state))
             self._publish(state, phase="executed")
@@ -149,7 +147,6 @@ class PokemonAdkLoop:
         goal_completed = bool(goal_verification.get("verified"))
         active_action_plan, action_outcome = verify_action_cycle(
             state.get("active_action_plan", {}),
-            after_observation=after,
             action_result=result,
             state_diff=state_diff,
             goal_completed=goal_completed,
@@ -179,29 +176,12 @@ class PokemonAdkLoop:
         transitions, history_summary = append_transition(
             list(state.get("transition_history", [])),
             action_transition_summary(
-                active_action_plan,
                 state.get("planned_action", {}),
                 state_diff,
                 action_outcome,
             ),
             existing_summary=state.get("history_summary"),
         )
-        session_dialog = list(state.get("session_dialog", []))
-        session_dialog.append(
-            {
-                "agent": "pokemon_red_execution_agent",
-                "phase": "action_progress",
-                "step": state.get("step_count", 0),
-                "content": (
-                    f"Action {state.get('planned_action', {}).get('type')} -> {action_outcome.get('status')}; "
-                    f"state changes: {', '.join(state_diff.get('event_types', [])) or 'none'}."
-                ),
-                "current_goal": current_goal.get("id"),
-                "action_plan": active_action_plan,
-            }
-        )
-        session_dialog = session_dialog[-20:]
-
         history = list(state.get("action_history", []))
         if history:
             history[-1]["before_state"] = state_diff.get("before")
@@ -213,7 +193,7 @@ class PokemonAdkLoop:
             if log_path is not None:
                 history[-1]["action_log_path"] = str(log_path)
                 state.get("execution_report", {})["action_log_path"] = str(log_path)
-        history = history[-20:]
+        history = history[-RAW_HISTORY_TURNS:]
 
         return {
             "observation": after,
@@ -224,8 +204,6 @@ class PokemonAdkLoop:
             "transition_history": transitions,
             "history_summary": history_summary,
             "action_history": history,
-            "session_dialog": session_dialog,
-            "replan_required": action_outcome.get("status") != "continue",
             "stuck_score": stuck_score,
             "termination_reason": termination_reason,
             "done": done,

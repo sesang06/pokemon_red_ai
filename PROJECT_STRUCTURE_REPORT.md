@@ -239,10 +239,9 @@ flowchart LR
 | 이전 이미지 | 모델 context에서 제거 | 매 호출마다 누적되는 vision token 방지 |
 | 최신 screenshot/overlay | 현재 planner 호출에만 첨부 | 현재 화면 판단 |
 | `action_history` | raw 최근 20개 | 실행 결과 판단 및 압축 대상 |
-| `session_dialog` | UI용 최근 20개 | 사람이 계획/결과 대화를 확인 |
 | Result Interpreter 이전 세션 | 유지하지 않음 | 매 요약 호출을 stateless하게 처리 |
 
-파일 장기기억은 `memory/file_memory.py`가 `data/long_term_memory.json`에 원자적으로 저장한다. key namespace는 `map:*`, `keyword:*`, `goal:*`이며 planner에는 현재 관찰과 관련성이 높은 항목만 최대 12개 전달한다.
+파일 장기기억은 `memory/file_memory.py`가 `data/long_term_memory.json`에 원자적으로 저장한다. Planner는 `search_memory(map_name)` 도구로 현재 맵의 항목만 읽고, Interpreter는 `save_memory(map_name, value)` 도구로 저장한다. 키는 항상 `map:<map_name>`이다.
 
 `memory/`의 주요 구성은 다음과 같다.
 
@@ -252,7 +251,7 @@ flowchart LR
 | `world_state.py` | RAM 결과를 구조화된 `GameState`로 변환 |
 | `ram_map.py` | Qt UI에서 볼 수 있는 RAM map 텍스트 생성 |
 | `world_map.py` | 맵별 방문 위치, frontier, collision을 동적으로 누적 |
-| `file_memory.py` | JSON key:value 장기기억 읽기/검색/원자적 쓰기 |
+| `file_memory.py` | 맵 단위 JSON 장기기억 읽기와 원자적 쓰기 |
 
 ### 5.6 Qt UI와 캡처
 
@@ -345,8 +344,8 @@ Root agent는 다음 판단에 모델을 사용한다.
 
 | Dev UI agent | 정의 위치 | LLM 호출 시점 | 도구 |
 |---|---|---|---|
-| `pokemon_red_planning_agent` | `agent.py:53-69` | 직접 메시지를 보내거나 root가 planning agent로 위임할 때 | start/observe/screenshot, memory/log read/search |
-| `pokemon_red_result_interpreter_agent` | `agent.py:70-83` | 직접 메시지를 보내거나 root가 결과 해석 agent로 위임할 때 | observe, log/memory read/search/write |
+| `pokemon_red_planning_agent` | `agent.py:53-69` | 직접 메시지를 보내거나 root가 planning agent로 위임할 때 | start/observe/screenshot, `search_memory`, log read |
+| `pokemon_red_result_interpreter_agent` | `agent.py:70-83` | 직접 메시지를 보내거나 root가 결과 해석 agent로 위임할 때 | observe, `search_memory`, `save_memory`, log read |
 
 Dev UI execution sub-agent는 제거되었다. 실제 action 실행은 Python `ExecutionAgent`와 MCP 도구가 담당하며 별도 execution LLM 호출은 없다.
 

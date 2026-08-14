@@ -23,7 +23,7 @@
 - `src/pokemon_agent/adk_agent/agent.py`: Dev UI execution LLM sub-agent 제거
 - `src/pokemon_agent/adk_agent/runtime_state.py`: Goal/Task/StateDiff/call count 게시
 - `src/pokemon_agent/adk_agent/web_tools.py`: Dev UI Python Task state를 step 사이에 유지
-- `src/pokemon_agent/memory/file_memory.py`: memory namespace와 관련 실패/전략 검색 확장
+- `src/pokemon_agent/memory/file_memory.py`: `map:<map_name>` 단일 namespace와 맵 단위 원자적 저장
 - `src/pokemon_agent/session.py`: warp/menu/item/Pokemon/flag/Pokedex state event 확장
 
 문서 및 테스트:
@@ -165,18 +165,17 @@ Oak dialog가 열리거나 닫혀도 inventory가 0이면 Goal은 완료되지 �
 
 ## 6. Memory 구조
 
-저장 파일과 원자적 쓰기 방식은 `data/long_term_memory.json` 그대로 유지했다. namespace는 다음으로 확장했다.
+저장 파일과 원자적 쓰기 방식은 `data/long_term_memory.json` 그대로 유지한다. 현재 지원 key는 맵 단위 하나뿐이다.
 
 ```text
-map:* event:* npc:* item:* goal:* strategy:* failure:* episode:*
+map:<map_name>
 ```
 
-- 완료 Task는 `episode:*` 후보를 만든다.
-- failed/blocked/unexpected Task는 `failure:*` 후보를 만든다.
-- item/Pokemon/map/flag 변화는 `event:*` 후보를 만들 수 있다.
-- planner는 현재 Goal, Task, map과 관련된 `failure:*`와 `strategy:*`를 우선 검색한다.
+- Planner는 `search_memory(map_name)` 도구로 현재 맵의 단일 항목을 읽는다.
+- Result Interpreter는 먼저 `search_memory(map_name)`를 호출하고, 갱신할 맵 지식이 있을 때만 `save_memory(map_name, value)`를 호출한다.
+- 두 도구 모두 임의 key 인자를 받지 않으며 저장 key는 항상 `map:<map_name>`이다.
 
-Memory Consolidator는 Result Interpreter와 분리되어 후보를 검증·중복 제거한 뒤 파일에 쓴다. LLM 해석이 실패해도 deterministic failure/episode memory를 저장할 수 있다.
+별도 Memory Consolidator와 namespace 후보 후처리는 제거했다. ADK 도구 호출이 실제 파일 읽기와 쓰기를 담당한다.
 
 Raw action은 날짜별 JSONL과 ADK SQLite에 남는다. 모델용 short-term context는 raw turn 나열 대신 최근 `transition_history` 20개와 deterministic overflow summary를 사용한다. 숫자 20에 도달했다는 이유만으로 LLM을 호출하지 않는다.
 
@@ -221,7 +220,7 @@ GoogleAdkResultInterpreter.summarize_async() -> Runner.run_async()
 - Dijkstra navigation
 - MCP action execution
 - transition history compression
-- deterministic memory candidate와 파일 쓰기
+- map-scoped `search_memory`/`save_memory` 도구
 
 ### ADK Dev UI
 
@@ -258,9 +257,9 @@ warning 4건은 Google ADK `BaseAgentConfig` deprecation이다.
 - RAM inventory Poke Ball 0 -> 5로 바뀔 때만 Goal/Task 완료
 - Oak dialog open + inventory 0인 false success 방지
 - structured StateDiff의 dialog/item event
-- no-progress Task blocked와 `failure:*` memory
+- map-scoped memory tool read/write
 - task boundary에서만 interpreter 호출
-- extended memory namespace round trip
+- `map:<map_name>` key round trip
 - 방향성 장애물 학습과 재계획
 - 화면 밖/도달 불가 목표가 현재 칸을 `target_reached`로 오인하지 않음
 - Route 22 왕복 waypoint와 Pallet Town 연구소 입구 판정

@@ -68,7 +68,6 @@ export type LiveState = {
       id: string | null;
       description: string | null;
       status: string;
-      attempt: number;
       step: number;
       max_steps: number | null;
       verification?: unknown;
@@ -81,6 +80,12 @@ export type LiveState = {
     interpreter_calls: number;
     plan_error: string | null;
     interpret_error: string | null;
+    thinking?: {
+      agent: "planner" | "interpreter" | null;
+      status: "idle" | "streaming" | "complete";
+      summary: string | null;
+      updated_at: string | null;
+    };
     done?: boolean;
     termination_reason?: string | null;
   };

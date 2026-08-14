@@ -12,18 +12,16 @@ from pokemon_agent.adk_agent.runtime.trace import format_trace_event
 from pokemon_agent.memory.file_memory import FileLongTermMemory
 
 
-def action_plan(
-    action: dict,
-    *,
-    repeat_until: dict | None = None,
-    max_repeats: int = 1,
-) -> dict:
+def action_plan(action: dict) -> dict:
     return {
         "action": action,
-        "repeat_until": repeat_until,
-        "max_repeats": max_repeats,
         "reason": f"test action {action.get('type')}",
     }
+
+
+class WaitPlanner:
+    def plan(self, state):
+        return action_plan({"type": "buttons", "buttons": ["wait"], "reason": "observe_once"})
 
 
 class FakeClient:
@@ -84,16 +82,19 @@ class FakeClient:
         }
 
 
-def test_adk_safe_loop_runs_with_fake_client(tmp_path: Path) -> None:
+def test_adk_loop_without_llm_planner_stops_without_game_input(tmp_path: Path) -> None:
+    client = FakeClient()
     result = PokemonAdkLoop(
-        FakeClient(),
+        client,
         memory_store=FileLongTermMemory(tmp_path / "memory.json"),
     ).run(max_steps=2)
 
     assert result["done"] is True
-    assert result["termination_reason"] == "max_steps_reached"
-    assert result["step_count"] == 2
-    assert result["action_history"]
+    assert result["termination_reason"] == "planning_failed"
+    assert result["plan_error"] == "planner_unavailable"
+    assert result["step_count"] == 0
+    assert result["action_history"] == []
+    assert client.world_move_calls == []
 
 
 def test_adk_loop_uses_action_planner_when_available(tmp_path: Path) -> None:
@@ -127,8 +128,10 @@ def test_adk_loop_exposes_empty_llm_decision_as_plan_error(tmp_path: Path) -> No
         memory_store=FileLongTermMemory(tmp_path / "memory.json"),
     ).run(max_steps=1)
 
-    assert result["active_action_plan"]["source"] == "rule"
+    assert result["active_action_plan"] == {}
     assert result["plan_error"] == "invalid_json_response (finish_reason=MAX_TOKENS, chars=221)"
+    assert result["termination_reason"] == "planning_failed"
+    assert result["step_count"] == 0
 
 
 def test_execution_agent_allows_multi_step_world_moves(tmp_path: Path) -> None:
@@ -178,6 +181,7 @@ def test_execution_agent_writes_date_grouped_action_log(tmp_path: Path) -> None:
     logger = DateGroupedActionLogger(tmp_path / "actions", clock=lambda: fixed_now)
     result = PokemonAdkLoop(
         FakeClient(),
+        action_planner=WaitPlanner(),
         action_logger=logger,
         memory_store=FileLongTermMemory(tmp_path / "memory.json"),
     ).run(max_steps=1, checkpoint_every=0)
@@ -189,40 +193,24 @@ def test_execution_agent_writes_date_grouped_action_log(tmp_path: Path) -> None:
     assert log_entry["timestamp"] == "2026-08-14T12:30:00.000"
     assert log_entry["agent"] == "pokemon_red_execution_agent"
     assert log_entry["action"]["type"] in {"move", "buttons"}
-    assert log_entry["result"]["stop_reason"]
+    assert log_entry["result"]["executed_actions"] == [{"button": "wait"}]
 
 
 def test_adk_loop_emits_agent_trace_events(tmp_path: Path) -> None:
     events = []
 
     class FakePlanner:
+        thinking_summary_callback = None
+        last_thinking_summary = "Dialog is open, so one A press is the bounded next action."
+
         def plan(self, state):
-            decision = action_plan({"type": "buttons", "buttons": ["a"], "reason": "advance_dialog"})
-            decision.update({
-                "thought_summary": "Dialog is open, so advance it with A.",
-                "screen_description": "The screen shows a dialog box over the current map.",
-                "current_location": "Pallet Town at world position {'x': 5, 'y': 6}.",
-                "current_goal": "Advance the visible dialog safely.",
-                "future_objective": "Return to overworld exploration after the dialog changes or closes.",
-                "decision_rationale": (
-                    "The observation indicates dialog mode, so movement would be unsafe and waiting would not actively "
-                    "advance the text. Pressing A once is bounded, reversible in the sense that it advances only one "
-                    "dialog step, and the next observation can verify whether the dialog changed or closed."
-                ),
-                "session_dialog": (
-                    "Screen: a dialog is visible. Location: Pallet Town around position 5,6. Current goal: advance "
-                    "the dialog. Future objective: resume safe exploration after the dialog resolves. Rationale: A "
-                    "is the safest bounded action for dialog mode."
-                ),
-                "decision_trace": {
-                    "observations_considered": ["mode=dialog"],
-                    "candidate_actions": ["buttons([a])", "buttons([wait])"],
-                    "risk_check": "A is bounded.",
-                    "decision_basis": "Dialog needs A.",
-                },
-                "expected_result": "dialog advances",
-            })
-            return decision
+            self.thinking_summary_callback(self.last_thinking_summary)
+            return {
+                "screen_description": "오박사 연구실의 대화 화면",
+                "current_location": "Oak's Lab (5, 6)",
+                "thought_summary": "대화를 진행한 뒤 새 상태를 확인합니다.",
+                "action": {"type": "buttons", "buttons": ["a"], "reason": "advance_dialog"},
+            }
 
     result = PokemonAdkLoop(
         FakeClient(),
@@ -231,20 +219,36 @@ def test_adk_loop_emits_agent_trace_events(tmp_path: Path) -> None:
         trace=events.append,
     ).run(max_steps=1)
 
-    assert result["plan_decision"]["thought_summary"] == "Dialog is open, so advance it with A."
-    assert result["plan_decision"]["screen_description"].startswith("The screen shows")
-    assert result["plan_decision"]["decision_rationale"].startswith("The observation indicates")
-    planning_dialog = next(entry for entry in result["session_dialog"] if entry["phase"] == "planning_dialog")
-    assert planning_dialog["content"].startswith("Screen: a dialog is visible")
-    assert result["plan_decision"]["decision_trace"]["decision_basis"] == "Dialog needs A."
+    assert set(result["plan_decision"]) == {
+        "agent",
+        "phase",
+        "objective",
+        "current_goal",
+        "action_plan",
+        "memory_keys_read",
+        "reason",
+        "screen_description",
+        "current_location",
+        "thought_summary",
+    }
+    assert result["plan_decision"]["reason"] == "advance_dialog"
+    assert result["plan_decision"]["screen_description"] == "오박사 연구실의 대화 화면"
+    assert result["plan_decision"]["current_location"] == "Oak's Lab (5, 6)"
+    assert result["plan_decision"]["thought_summary"] == "대화를 진행한 뒤 새 상태를 확인합니다."
+    assert "session_dialog" not in result
     assert [event["phase"] for event in events] == [
+        "planning_thinking",
         "planning_done",
         "execution_done",
         "result_interpretation",
     ]
-    assert "<thought_summary>Dialog is open" in format_trace_event(events[0])
-    assert "<session_dialog>Screen: a dialog is visible" in format_trace_event(events[0])
-    assert "<decision_trace>" in format_trace_event(events[0])
+    assert events[0]["thinking_summary"].startswith("Dialog is open")
+    assert events[1]["thinking_summary"].startswith("Dialog is open")
+    assert events[1]["screen_description"] == "오박사 연구실의 대화 화면"
+    assert format_trace_event(events[1]).startswith(
+        "[agent-trace] pokemon_red_planning_agent phase=planning_done"
+    )
+    assert "thought_summary: 대화를 진행한 뒤 새 상태를 확인합니다." in format_trace_event(events[1])
 
 
 def test_adk_loop_pumps_realtime_while_waiting_for_planner(tmp_path: Path) -> None:
@@ -303,16 +307,18 @@ def test_adk_loop_does_not_recover_when_stuck_score_reaches_threshold(tmp_path: 
     assert all(entry["action"]["type"] != "recover" for entry in result["action_history"])
 
 
-def test_adk_loop_reuses_action_until_condition_and_writes_memory(tmp_path) -> None:
+def test_adk_loop_executes_each_button_sequence_once_and_replans_each_cycle(tmp_path) -> None:
     class DialogClient(FakeClient):
         def __init__(self):
             super().__init__()
             self.dialog_open = True
             self.button_calls = 0
+            self.received_buttons = []
 
         def press_buttons(self, buttons: list[str]):
             self.button_calls += 1
-            if self.button_calls >= 3:
+            self.received_buttons.append(list(buttons))
+            if buttons.count("a") >= 3:
                 self.dialog_open = False
             return {
                 "stop_reason": "buttons_complete",
@@ -326,73 +332,46 @@ def test_adk_loop_reuses_action_until_condition_and_writes_memory(tmp_path) -> N
             observation["state"]["mode"] = "talk" if self.dialog_open else "explore"
             return observation
 
-    class RepeatPlanner:
+    class SequencePlanner:
         def __init__(self):
             self.calls = 0
 
         def plan(self, state):
             self.calls += 1
             return action_plan(
-                {"type": "buttons", "buttons": ["a", "wait"], "reason": "advance_dialog"},
-                repeat_until={"path": "dialog_open", "equals": False},
-                max_repeats=4,
+                {
+                    "type": "buttons",
+                    "buttons": ["a", "wait", "a", "wait", "a"],
+                    "reason": "advance_dialog_three_times",
+                }
             )
 
-    class FakeSummarizer:
-        def __init__(self):
-            self.payloads = []
-
-        def summarize(self, payload):
-            self.payloads.append(payload)
-            return {
-                "summary": "Reached a useful frontier.",
-                "action_succeeded": True,
-                "goal_progress": "Reached a useful frontier.",
-                "goal_completed": False,
-                "verified_state_change": "position changed",
-                "failure_reason": "",
-                "memory_writes": [
-                    {"key": "map:Pallet Town", "value": "Reached a useful frontier."},
-                    {"key": "goal:main", "value": "Keep exploring safely."},
-                ],
-            }
-
-    summarizer = FakeSummarizer()
-    planner = RepeatPlanner()
+    planner = SequencePlanner()
     client = DialogClient()
     store = FileLongTermMemory(tmp_path / "long_term_memory.json")
 
     result = PokemonAdkLoop(
         client,
         action_planner=planner,
-        result_interpreter=summarizer,
         memory_store=store,
     ).run(max_steps=3, checkpoint_every=0)
 
     assert result["done"] is True
-    assert planner.calls == 1
+    assert planner.calls == 3
     assert client.button_calls == 3
-    assert result["action_outcome"]["status"] == "condition_met"
-    assert result["active_action_plan"]["repeat_count"] == 3
-    assert result["interpretation"]["action_succeeded"] is True
-    assert result["interpretation"]["goal_progress"] == "Reached a useful frontier."
-    assert result["interpretation"]["goal_completed"] is False
-    assert result["interpretation"]["verified_state_change"] == "position changed"
-    assert result["interpretation"]["failure_reason"] == ""
-    assert result["interpretation"]["memory_written"] == ["map:Pallet Town", "goal:main"]
-    assert store.get("map:Pallet Town")["value"] == "Reached a useful frontier."
-    assert len(summarizer.payloads) == 1
-    assert summarizer.payloads[0]["last_result"]["status"] == "condition_met"
+    assert client.received_buttons == [["a", "wait", "a", "wait", "a"]] * 3
+    assert result["action_outcome"]["status"] == "single_action_complete"
+    assert not {"repeat_until", "repeat_count", "max_repeats"}.intersection(result["active_action_plan"])
 
 
 def test_adk_loop_compacts_action_history_after_twenty_turns(tmp_path) -> None:
     result = PokemonAdkLoop(
         FakeClient(),
+        action_planner=WaitPlanner(),
         memory_store=FileLongTermMemory(tmp_path / "memory.json"),
     ).run(max_steps=22, checkpoint_every=0)
 
     assert len(result["action_history"]) == 20
-    assert len(result["session_dialog"]) == 20
     assert result["history_summary"].startswith("Compacted 1 state transition(s)")
 
 

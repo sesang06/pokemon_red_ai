@@ -5,17 +5,19 @@ import base64
 import json
 import logging
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from pokemon_agent.adk_agent.agents.planner.prompt import PLANNING_AGENT_PROMPT
+from pokemon_agent.adk_agent.agents.memory_tools import build_search_memory_tool
 from pokemon_agent.adk_agent.agents.planner.schema import (
     ActionPlanner,
+    DEFAULT_OBJECTIVE,
     PokemonAgentState,
     compact_state_for_prompt,
     normalize_action_plan,
-    rule_based_plan,
 )
 from pokemon_agent.adk_agent.agents.shared import (
     ConsoleTokenStream,
@@ -23,11 +25,12 @@ from pokemon_agent.adk_agent.agents.shared import (
     emit_trace,
     event_finish_reason,
     event_text,
+    event_thinking_summary,
     invalid_response_error,
     parse_json_object,
+    public_output_fields,
     run_with_idle_pump,
 )
-from pokemon_agent.adk_agent.runtime.history import RAW_HISTORY_TURNS
 from pokemon_agent.adk_agent.runtime.session import (
     ADK_WEB_APP_NAME,
     DEFAULT_ADK_USER_ID,
@@ -38,7 +41,7 @@ from pokemon_agent.adk_agent.runtime.session import (
 )
 from pokemon_agent.memory.file_memory import FileLongTermMemory
 
-DEFAULT_ADK_MODEL = "gemini-2.5-flash"
+DEFAULT_ADK_MODEL = "gemini-3.5-flash"
 LOGGER = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = PLANNING_AGENT_PROMPT
@@ -46,22 +49,29 @@ SYSTEM_PROMPT = PLANNING_AGENT_PROMPT
 
 @dataclass
 class PlanningAgent:
-    memory_store: FileLongTermMemory
     action_planner: ActionPlanner | None = None
     idle_pump: Callable[[], Any] | None = None
     idle_pump_interval: float = 1 / 30
     trace: TraceSink | None = None
     name: str = "pokemon_red_planning_agent"
-    history_limit: int = RAW_HISTORY_TURNS
 
     def plan(self, state: PokemonAgentState) -> PokemonAgentState:
-        memory_context = self.memory_store.relevant_for_state(dict(state))
         enriched_state = dict(state)
-        enriched_state["long_term_memory"] = memory_context
 
         raw_decision: dict[str, Any] | None = None
         plan_error: str | None = None
         if self.action_planner is not None:
+            supports_thinking_callback = hasattr(self.action_planner, "thinking_summary_callback")
+            if supports_thinking_callback:
+                self.action_planner.thinking_summary_callback = lambda summary: emit_trace(
+                    self.trace,
+                    {
+                        "agent": self.name,
+                        "phase": "planning_thinking",
+                        "step": state.get("step_count", 0),
+                        "thinking_summary": summary,
+                    },
+                )
             try:
                 planning_wait_trace = None
                 if not bool(getattr(self.action_planner, "stream_output", False)):
@@ -71,10 +81,7 @@ class PlanningAgent:
                             "agent": self.name,
                             "phase": "planning_wait",
                             "step": state.get("step_count", 0),
-                            "thought_summary": (
-                                "LLM planner is still preparing a visible decision summary "
-                                f"({elapsed:.1f}s)."
-                            ),
+                            "elapsed_seconds": round(elapsed, 1),
                         },
                     )
                 raw_decision = run_with_idle_pump(
@@ -85,46 +92,60 @@ class PlanningAgent:
                 )
             except Exception as exc:
                 plan_error = f"{type(exc).__name__}: {exc}"
-                LOGGER.warning("LLM action planning failed; using deterministic fallback: %s", plan_error)
+                LOGGER.warning("LLM action planning failed: %s", plan_error)
                 emit_trace(
                     self.trace,
                     {
                         "agent": self.name,
                         "phase": "planning_error",
                         "step": state.get("step_count", 0),
-                        "thought_summary": "LLM planning failed; falling back to the rule-based planner.",
                         "error": plan_error,
                     },
                 )
+            finally:
+                if supports_thinking_callback:
+                    self.action_planner.thinking_summary_callback = None
 
         active_plan = normalize_action_plan(raw_decision)
         if active_plan is None:
-            fallback_action = rule_based_plan(enriched_state).get("planned_action")
-            active_plan = normalize_action_plan({"action": fallback_action})
-            if active_plan is None:
-                active_plan = normalize_action_plan(
-                    {"action": {"type": "buttons", "buttons": ["wait"], "reason": "planner_fallback_wait"}}
-                )
-            assert active_plan is not None
-            if self.action_planner is not None and plan_error is None:
-                if raw_decision is None:
-                    plan_error = str(
+            if plan_error is None:
+                plan_error = (
+                    "planner_unavailable"
+                    if self.action_planner is None
+                    else str(
                         getattr(self.action_planner, "last_plan_error", None)
-                        or "planner_returned_no_action_plan"
+                        or ("invalid_action_plan" if raw_decision is not None else "planner_returned_no_action_plan")
                     )
-                else:
-                    plan_error = "invalid_action_plan"
-                LOGGER.warning("LLM action plan rejected; using deterministic fallback: %s", plan_error)
+                )
+            LOGGER.warning("No valid LLM action plan; stopping without game input: %s", plan_error)
+            emit_trace(
+                self.trace,
+                {
+                    "agent": self.name,
+                    "phase": "planning_error",
+                    "step": state.get("step_count", 0),
+                    "error": plan_error,
+                },
+            )
+            return {
+                "active_action_plan": {},
+                "planned_action": {},
+                "plan_error": plan_error,
+                "termination_reason": "planning_failed",
+                "done": True,
+                "planner_call_count": int(state.get("planner_call_count", 0)) + 1,
+                "llm_planner_call_count": int(state.get("llm_planner_call_count", 0))
+                + int(self.action_planner is not None),
+            }
 
-        planner_used = self.action_planner is not None and raw_decision is not None and plan_error is None
-        active_plan["source"] = "adk" if planner_used else "rule"
+        memory_keys = list(getattr(self.action_planner, "last_memory_search_keys", []))
+        active_plan["source"] = "adk"
         active_plan["action"]["source"] = active_plan["source"]
         plan_decision = _normalize_action_plan_decision(
-            raw_decision if isinstance(raw_decision, dict) else {},
+            raw=raw_decision,
             active_plan=active_plan,
             state=enriched_state,
-            memory_keys=list(memory_context.get("keys", [])),
-            planner_used=planner_used,
+            memory_keys=memory_keys,
         )
         emit_trace(
             self.trace,
@@ -132,30 +153,24 @@ class PlanningAgent:
                 "agent": self.name,
                 "phase": "planning_done",
                 "step": state.get("step_count", 0),
-                "thought_summary": plan_decision.get("thought_summary"),
-                "session_dialog": plan_decision.get("session_dialog"),
-                "decision_trace": plan_decision.get("decision_trace"),
                 "memory_keys_read": plan_decision.get("memory_keys_read"),
                 "action_plan": active_plan,
-                "expected_result": active_plan.get("repeat_until") or "single bounded action",
+                "screen_description": plan_decision["screen_description"],
+                "current_location": plan_decision["current_location"],
+                "thought_summary": plan_decision["thought_summary"],
+                "thinking_summary": getattr(self.action_planner, "last_thinking_summary", None),
                 "error": plan_error,
             },
         )
-        session_dialog = list(state.get("session_dialog", []))
-        session_dialog.append(_session_dialog_entry(plan_decision, step=state.get("step_count", 0)))
-        session_dialog = session_dialog[-self.history_limit :]
 
         return {
-            "long_term_memory": memory_context,
             "active_action_plan": active_plan,
             "plan_decision": plan_decision,
             "planned_action": dict(active_plan["action"]),
             "plan_error": plan_error,
-            "session_dialog": session_dialog,
             "planner_call_count": int(state.get("planner_call_count", 0)) + 1,
             "llm_planner_call_count": int(state.get("llm_planner_call_count", 0))
             + int(self.action_planner is not None),
-            "replan_required": False,
         }
 
 
@@ -165,7 +180,7 @@ class GoogleAdkPlanner:
     include_screenshot: bool = False
     app_name: str = ADK_WEB_APP_NAME
     user_id: str = DEFAULT_ADK_USER_ID
-    session_id: str = "pokemon-red-safe-loop"
+    session_id: str = "pokemon-red-planner"
     temperature: float = 0.2
     max_output_tokens: int = 4096
     thinking_budget: int | None = -1
@@ -173,8 +188,12 @@ class GoogleAdkPlanner:
     compaction_interval: int = DEFAULT_COMPACTION_INTERVAL
     compaction_overlap_size: int = DEFAULT_COMPACTION_OVERLAP_SIZE
     session_db_path: str | os.PathLike[str] | None = None
+    memory_store: FileLongTermMemory = field(default_factory=FileLongTermMemory)
     last_plan_error: str | None = field(init=False, default=None)
     last_finish_reason: str | None = field(init=False, default=None)
+    last_thinking_summary: str | None = field(init=False, default=None)
+    thinking_summary_callback: Callable[[str], None] | None = field(init=False, default=None, repr=False)
+    memory_tool_activity: list[dict[str, Any]] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
         try:
@@ -190,10 +209,12 @@ class GoogleAdkPlanner:
         config_kwargs: dict[str, Any] = {
             "temperature": self.temperature,
             "maxOutputTokens": self.max_output_tokens,
-            "responseMimeType": "application/json",
         }
         if self.thinking_budget is not None:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(thinkingBudget=self.thinking_budget)
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=self.thinking_budget,
+                include_thoughts=True,
+            )
         generate_config = types.GenerateContentConfig(**config_kwargs)
         self.session_service = (
             ContextFilteringSqliteSessionService(
@@ -206,9 +227,10 @@ class GoogleAdkPlanner:
         self.agent = Agent(
             name="pokemon_red_planner",
             model=self.model,
-            description="Creates one bounded Pokemon Red direct action plan with an optional repeat condition as JSON.",
+            description="Creates one bounded Pokemon Red direct action plan for one-shot execution as JSON.",
             instruction=SYSTEM_PROMPT,
             generate_content_config=generate_config,
+            tools=[build_search_memory_tool(self.memory_store, activity=self.memory_tool_activity)],
         )
         self.app = App(
             name=self.app_name,
@@ -236,6 +258,7 @@ class GoogleAdkPlanner:
         thinking_budget: int | None = -1,
         stream_output: bool = True,
         session_db_path: str | os.PathLike[str] | None = None,
+        memory_store: FileLongTermMemory | None = None,
     ) -> "GoogleAdkPlanner":
         return cls(
             model=model or os.environ.get("POKEMON_AGENT_ADK_MODEL", DEFAULT_ADK_MODEL),
@@ -243,6 +266,7 @@ class GoogleAdkPlanner:
             thinking_budget=thinking_budget,
             stream_output=stream_output,
             session_db_path=session_db_path,
+            memory_store=memory_store or FileLongTermMemory(),
         )
 
     def plan(self, state: dict[str, Any]) -> dict[str, Any] | None:
@@ -251,6 +275,11 @@ class GoogleAdkPlanner:
     async def plan_async(self, state: dict[str, Any]) -> dict[str, Any] | None:
         self.last_plan_error = None
         self.last_finish_reason = None
+        self.last_thinking_summary = None
+        if not hasattr(self, "memory_tool_activity"):
+            self.memory_tool_activity = []
+        else:
+            self.memory_tool_activity.clear()
         await self._ensure_session()
         _strip_prior_media_from_session_service(
             self.session_service,
@@ -261,6 +290,8 @@ class GoogleAdkPlanner:
         content = self._content_for_state(state)
         final_text = ""
         streamed_text = ""
+        streamed_thinking = ""
+        final_thinking = ""
         console_stream = ConsoleTokenStream("pokemon_red_planner", enabled=self.stream_output)
         async for event in self.runner.run_async(
             user_id=self.user_id,
@@ -269,6 +300,22 @@ class GoogleAdkPlanner:
             run_config=self.run_config,
         ):
             text = event_text(event)
+            thinking = event_thinking_summary(event)
+            if thinking:
+                if getattr(event, "partial", False):
+                    streamed_thinking += thinking
+                else:
+                    final_thinking = (
+                        thinking
+                        if not streamed_thinking or thinking.startswith(streamed_thinking)
+                        else streamed_thinking + thinking
+                    )
+                current_thinking = (final_thinking or streamed_thinking).strip()
+                if current_thinking:
+                    self.last_thinking_summary = current_thinking
+                    callback = getattr(self, "thinking_summary_callback", None)
+                    if callback is not None:
+                        callback(current_thinking)
             if getattr(event, "partial", False) and text:
                 streamed_text += text
                 console_stream.write(text)
@@ -282,7 +329,7 @@ class GoogleAdkPlanner:
         if not final_text:
             final_text = streamed_text
         console_stream.finish(final_text)
-        action = parse_json_object(final_text)
+        action = parse_planner_response(final_text)
         if isinstance(action, dict):
             action.setdefault("source", "adk")
             return action
@@ -296,6 +343,16 @@ class GoogleAdkPlanner:
             final_text[:500],
         )
         return None
+
+    @property
+    def last_memory_search_keys(self) -> list[str]:
+        return list(
+            dict.fromkeys(
+                str(entry["key"])
+                for entry in self.memory_tool_activity
+                if entry.get("tool") == "search_memory" and entry.get("key")
+            )
+        )
 
     async def _ensure_session(self) -> None:
         if self._session_created:
@@ -403,6 +460,34 @@ def _part_has_media_payload(part: Any) -> bool:
     return bool(getattr(part, "inline_data", None) or getattr(part, "file_data", None))
 
 
+def parse_planner_response(content: str) -> dict[str, Any] | None:
+    """Parse the strict response contract and recover a labeled action response."""
+    parsed = parse_json_object(content)
+    if not isinstance(parsed, dict):
+        return None
+
+    if isinstance(parsed.get("action"), dict):
+        return parsed
+    if parsed.get("type") not in {"buttons", "move"}:
+        return None
+
+    recovered: dict[str, Any] = {"action": parsed}
+    labels = {
+        "screen_description": ("화면 설명", "screen_description"),
+        "current_location": ("현재 위치", "current_location"),
+        "thought_summary": ("생각 요약", "thought_summary"),
+    }
+    for field, aliases in labels.items():
+        alternatives = "|".join(re.escape(alias) for alias in aliases)
+        match = re.search(
+            rf"(?im)^\s*(?:{alternatives})\s*:\s*(.+?)\s*$",
+            content,
+        )
+        if match:
+            recovered[field] = match.group(1).strip()
+    return recovered
+
+
 def _omitted_prior_media_part(count: int) -> Any:
     from google.genai import types
 
@@ -415,60 +500,20 @@ def _omitted_prior_media_part(count: int) -> Any:
     )
 
 
-def _session_dialog_entry(plan_decision: dict[str, Any], *, step: int) -> dict[str, Any]:
-    return {
-        "agent": plan_decision.get("agent", "pokemon_red_planning_agent"),
-        "phase": "planning_dialog",
-        "step": step,
-        "content": plan_decision.get("session_dialog"),
-        "screen_description": plan_decision.get("screen_description"),
-        "current_location": plan_decision.get("current_location"),
-        "current_goal": plan_decision.get("current_goal"),
-        "future_objective": plan_decision.get("future_objective"),
-        "decision_rationale": plan_decision.get("decision_rationale"),
-        "action_plan": plan_decision.get("action_plan"),
-    }
-
-
 def _normalize_action_plan_decision(
-    raw: dict[str, Any],
+    raw: dict[str, Any] | None,
     *,
     active_plan: dict[str, Any],
     state: dict[str, Any],
     memory_keys: list[str],
-    planner_used: bool,
 ) -> dict[str, Any]:
     action = active_plan.get("action", {})
-    screen_description = _text_or_default(raw.get("screen_description"), _default_screen_description(state))
-    current_location = _text_or_default(raw.get("current_location"), _default_current_location(state))
-    current_goal = _text_or_default(
-        raw.get("current_goal") or raw.get("goal"),
-        str(state.get("current_goal", {}).get("id") or state.get("objective") or "safe_loop"),
-    )
-    future_objective = _text_or_default(
-        raw.get("future_objective"),
-        (
-            f"Execute {action.get('type')} and observe whether "
-            f"{active_plan.get('repeat_until') or 'the state changes as expected'}."
-        ),
-    )
-    decision_rationale = _text_or_default(
-        raw.get("decision_rationale"),
-        (
-            f"The {'LLM' if planner_used else 'rule-based'} planner selected a bounded "
-            f"{action.get('type')} action. Python may repeat it up to "
-            f"{active_plan.get('max_repeats', 1)} time(s) and checks "
-            f"{active_plan.get('repeat_until') or 'the result after one action'} from RAM-derived state."
-        ),
-    )
-    session_dialog = _text_or_default(
-        raw.get("session_dialog"),
-        _default_session_dialog(
-            screen_description=screen_description,
-            current_location=current_location,
-            current_goal=current_goal,
-            future_objective=future_objective,
-            decision_rationale=decision_rationale,
+    current_goal = str(state.get("current_goal", {}).get("id") or state.get("objective") or DEFAULT_OBJECTIVE)
+    public_fields = public_output_fields(
+        raw,
+        state,
+        default_thought=(
+            f"Execute {action.get('reason') or action.get('type') or 'the next action'} and observe the updated state."
         ),
     )
     return {
@@ -478,65 +523,6 @@ def _normalize_action_plan_decision(
         "current_goal": current_goal,
         "action_plan": active_plan,
         "memory_keys_read": memory_keys,
-        "screen_description": screen_description,
-        "current_location": current_location,
-        "future_objective": future_objective,
-        "thought_summary": raw.get("thought_summary") or f"Selected a bounded {action.get('type')} action plan.",
-        "decision_rationale": decision_rationale,
-        "session_dialog": session_dialog,
-        "decision_trace": raw.get("decision_trace")
-        or {
-            "planner": "llm" if planner_used else "rule_based",
-            "decision": "direct_action",
-            "action_type": action.get("type"),
-            "verification_source": "RAM/structured GameState",
-        },
-        "expected_result": active_plan.get("repeat_until") or "single bounded action",
-        "reason": raw.get("reason") or action.get("reason"),
+        "reason": action.get("reason"),
+        **public_fields,
     }
-
-
-def _text_or_default(value: Any, default: str) -> str:
-    text = str(value).strip() if value is not None else ""
-    return text or default
-
-
-def _default_screen_description(state: dict[str, Any]) -> str:
-    observation = state.get("observation", {})
-    game_state = observation.get("state", {}) if isinstance(observation, dict) else {}
-    mode = state.get("mode", game_state.get("mode", "unknown"))
-    dialog = game_state.get("dialog") if isinstance(game_state.get("dialog"), dict) else {}
-    dialog_text = dialog.get("text") or game_state.get("dialog_text")
-    if dialog_text:
-        return f"The current screen appears to be in {mode} mode with dialog text visible: {dialog_text!r}."
-    return f"The current screen appears to be in {mode} mode with the latest RAM-derived state available."
-
-
-def _default_current_location(state: dict[str, Any]) -> str:
-    observation = state.get("observation", {})
-    game_state = observation.get("state", {}) if isinstance(observation, dict) else {}
-    map_info = game_state.get("map")
-    map_name = game_state.get("map_name")
-    if not map_name and isinstance(map_info, dict):
-        map_name = map_info.get("name")
-    position = game_state.get("position")
-    parts = []
-    if map_name:
-        parts.append(f"map={map_name}")
-    if position:
-        parts.append(f"position={position}")
-    return ", ".join(parts) if parts else "Current location is unknown from the available observation."
-
-
-def _default_session_dialog(
-    *,
-    screen_description: str,
-    current_location: str,
-    current_goal: str,
-    future_objective: str,
-    decision_rationale: str,
-) -> str:
-    return (
-        f"Screen: {screen_description} Location: {current_location} Current goal: {current_goal}. "
-        f"Future objective: {future_objective} Decision rationale: {decision_rationale}"
-    )

@@ -6,13 +6,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pokemon_agent.adk_agent.client import InProcessPokemonMcpClient
-from pokemon_agent.adk_agent.coordinator.loop import PokemonAdkLoop
+from pokemon_agent.adk_agent.agents.memory_tools import save_map_memory, search_map_memory
 from pokemon_agent.adk_agent.runtime.state import FileAgentRuntimeState
 from pokemon_agent.memory.file_memory import FileLongTermMemory
-
-
-_WEB_LOOP_STATE: dict[str, Any] | None = None
 
 
 def start_game(
@@ -24,8 +20,6 @@ def start_game(
 ) -> dict[str, Any]:
     """Start the Pokemon Red PyBoy session for ADK Web tool testing."""
 
-    global _WEB_LOOP_STATE
-    _WEB_LOOP_STATE = None
     server = _mcp_server()
     start_result = server.start_session(window=window, load_fixed=load_fixed, control_ui=control_ui)
     realtime_result = server.set_realtime_ticks(enabled=realtime_ticks, fps=realtime_fps)
@@ -33,15 +27,13 @@ def start_game(
     return {
         "session": start_result,
         "realtime": realtime_result,
-        "next": "Call observe_game, buttons, move, or run_rule_based_step.",
+        "next": "Call observe_game, buttons, or move.",
     }
 
 
 def stop_game(save_final: bool = False) -> dict[str, Any]:
     """Stop the active Pokemon Red PyBoy session."""
 
-    global _WEB_LOOP_STATE
-    _WEB_LOOP_STATE = None
     return _mcp_server().stop_session(save_final=save_final)
 
 
@@ -132,48 +124,6 @@ def realtime_tick_status() -> dict[str, Any]:
     return _mcp_server().realtime_tick_status()
 
 
-def run_rule_based_step(objective: str = "safe_loop") -> dict[str, Any]:
-    """Run one safe non-LLM Pokemon control step and return the chosen action."""
-
-    global _WEB_LOOP_STATE
-    _ensure_game_started()
-    client = InProcessPokemonMcpClient()
-    result = PokemonAdkLoop(client).run(
-        objective=objective,
-        max_steps=1,
-        checkpoint_every=0,
-        initial_runtime_state=_WEB_LOOP_STATE,
-    )
-    _WEB_LOOP_STATE = result
-    return {
-        "done": result.get("done"),
-        "step_count": result.get("step_count"),
-        "mode": result.get("mode"),
-        "current_goal": result.get("current_goal"),
-        "active_action_plan": result.get("active_action_plan"),
-        "action_outcome": result.get("action_outcome"),
-        "state_diff": result.get("state_diff"),
-        "planner_call_count": result.get("planner_call_count"),
-        "plan_decision": result.get("plan_decision"),
-        "planned_action": result.get("planned_action"),
-        "plan_error": result.get("plan_error"),
-        "execution_report": result.get("execution_report"),
-        "interpretation": result.get("interpretation"),
-        "interpret_error": result.get("interpret_error"),
-        "action_result": compact_tool_result(result.get("action_result", {})),
-        "observation": compact_observation(result.get("observation", {})),
-    }
-
-
-def run_team_step(objective: str = "safe_loop") -> dict[str, Any]:
-    """Run one direct Action -> Observe -> deterministic Verify cycle, planning only when needed."""
-
-    result = run_rule_based_step(objective=objective)
-    result["agent"] = "pokemon_red_team"
-    result["phase"] = "action_execution_observation_verification"
-    return result
-
-
 def recent_game_commands(limit: int = 50) -> dict[str, Any]:
     """Return the recent MCP/game command log."""
 
@@ -195,7 +145,6 @@ def agent_runtime_status() -> dict[str, Any]:
             "active_action_plan",
             "action_outcome",
             "state_diff",
-            "replan_required",
             "planner_call_count",
             "llm_planner_call_count",
             "interpreter_call_count",
@@ -227,65 +176,25 @@ def recent_agent_actions(limit: int = 20) -> dict[str, Any]:
     }
 
 
-def recent_session_dialog(limit: int = 20) -> dict[str, Any]:
-    """Return recent human-readable CLI planner session_dialog entries."""
-
-    state = _runtime_store().read()
-    bounded_limit = max(1, min(int(limit), 20))
-    dialog = list(state.get("session_dialog", []))[-bounded_limit:]
-    return {
-        "updated_at": state.get("updated_at"),
-        "phase": state.get("phase"),
-        "count": len(dialog),
-        "dialog": dialog,
-    }
-
-
-def read_long_term_memory(key: str = "") -> dict[str, Any]:
-    """Read the file-backed long-term memory store or one exact key."""
-
-    store = _memory_store()
-    if key.strip():
-        return {
-            "agent": "pokemon_red_planning_agent",
-            "phase": "memory_read",
-            "path": str(store.path),
-            "key": key,
-            "item": store.get(key),
-        }
-    return {
-        "agent": "pokemon_red_planning_agent",
-        "phase": "memory_read",
-        "path": str(store.path),
-        "memory": store.read_all(),
-    }
-
-
-def search_long_term_memory(query: str = "", limit: int = 20) -> dict[str, Any]:
-    """Search long-term memory by key or value substring."""
+def search_memory(map_name: str) -> dict[str, Any]:
+    """Load the single file-backed memory entry for an exact Pokemon map name."""
 
     store = _memory_store()
     return {
         "agent": "pokemon_red_planning_agent",
-        "phase": "memory_search",
         "path": str(store.path),
-        "query": query,
-        "items": store.search(query, limit=max(1, min(int(limit), 50))),
+        **search_map_memory(store, map_name),
     }
 
 
-def write_long_term_memory(key: str, value: str, source: str = "adk_web") -> dict[str, Any]:
-    """Write one durable key/value memory fact."""
+def save_memory(map_name: str, value: str) -> dict[str, Any]:
+    """Save consolidated memory under the exact Pokemon map name."""
 
     store = _memory_store()
-    written_key = store.remember(key, value, source=source)
     return {
         "agent": "pokemon_red_result_interpreter_agent",
-        "phase": "memory_write",
         "path": str(store.path),
-        "written": True,
-        "key": written_key,
-        "item": store.get(written_key),
+        **save_map_memory(store, map_name, value, source="adk_web"),
     }
 
 

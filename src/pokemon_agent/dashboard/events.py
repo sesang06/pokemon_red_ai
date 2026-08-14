@@ -83,6 +83,8 @@ class LiveEventHub:
             for raw_event in state_events:
                 if not isinstance(raw_event, dict):
                     continue
+                if raw_event.get("type") == "dialog_text_changed":
+                    continue
                 event_type, message, payload = state_event_record(raw_event)
                 self._append_event(event_type, message, payload, source="game")
             self._emit_state_if_due(force=False)
@@ -94,7 +96,7 @@ class LiveEventHub:
             if phase == "executed":
                 outcome = state.get("action_outcome") if isinstance(state.get("action_outcome"), dict) else {}
                 status = str(outcome.get("status") or "unknown")
-                passed = status in {"condition_met", "single_action_complete", "continue"}
+                passed = status == "single_action_complete"
                 self._append_event(
                     "VERIFICATION_PASSED" if passed else "VERIFICATION_FAILED",
                     f"Verifier: {status.replace('_', ' ')}",
@@ -117,7 +119,10 @@ class LiveEventHub:
     def publish_trace(self, trace: dict[str, Any]) -> None:
         phase = str(trace.get("phase") or "unknown")
         with self._lock:
-            if phase == "planning_done":
+            if phase in {"planning_thinking", "result_interpretation_thinking"}:
+                self._update_thinking(trace, status="streaming", append_event=False)
+            elif phase == "planning_done":
+                self._update_thinking(trace, status="complete", append_event=True)
                 action_plan = trace.get("action_plan") if isinstance(trace.get("action_plan"), dict) else {}
                 action = action_plan.get("action") if isinstance(action_plan.get("action"), dict) else {}
                 self._append_event(
@@ -145,6 +150,7 @@ class LiveEventHub:
                     source="executor",
                 )
             elif phase in {"result_interpretation", "result_interpretation_done"}:
+                self._update_thinking(trace, status="complete", append_event=True)
                 self._append_event(
                     "RESULT_INTERPRETED",
                     "Action result interpreted",
@@ -167,7 +173,41 @@ class LiveEventHub:
                     _json_safe(trace),
                     source=str(trace.get("agent") or "agent"),
                 )
+            # Thinking summaries reuse one state slot. Push every streamed chunk
+            # immediately; only the completed summary is appended to the event log.
             self._emit_state_if_due(force=True)
+
+    def _update_thinking(
+        self,
+        trace: dict[str, Any],
+        *,
+        status: str,
+        append_event: bool,
+    ) -> None:
+        summary = str(trace.get("thinking_summary") or "").strip()
+        if not summary:
+            return
+        phase = str(trace.get("phase") or "")
+        role = "interpreter" if phase.startswith("result_interpretation") else "planner"
+        updated_at = now_iso()
+        self._state["agent"]["thinking"] = {
+            "agent": role,
+            "status": status,
+            "summary": summary,
+            "updated_at": updated_at,
+        }
+        if append_event:
+            self._append_event(
+                "THINKING_SUMMARY",
+                f"{role.title()} thinking summary",
+                {
+                    "agent": role,
+                    "step": trace.get("step"),
+                    "summary": summary,
+                    "status": status,
+                },
+                source=role,
+            )
 
     def publish_memory_snapshot(self, items: dict[str, dict[str, Any]]) -> None:
         with self._lock:
@@ -262,14 +302,14 @@ def _action_message(prefix: str, action: dict[str, Any]) -> str:
 
 
 def _planner_event_payload(trace: dict[str, Any], action_plan: dict[str, Any]) -> dict[str, Any]:
-    """Expose the decision contract, never planner conversation or reasoning fields."""
+    """Expose the action contract and explicitly public context fields."""
     return _without_none(
         {
             "step": trace.get("step"),
+            "screen_description": trace.get("screen_description"),
+            "current_location": trace.get("current_location"),
+            "thought_summary": trace.get("thought_summary"),
             "decision": action_plan.get("action"),
-            "repeat_until": action_plan.get("repeat_until"),
-            "max_repeats": action_plan.get("max_repeats"),
-            "expected_result": trace.get("expected_result"),
             "memory_keys_read": (
                 trace.get("memory_keys_read", [])[:8]
                 if isinstance(trace.get("memory_keys_read"), list)
@@ -296,6 +336,9 @@ def _interpreter_event_payload(trace: dict[str, Any]) -> dict[str, Any]:
     return _without_none(
         {
             "step": trace.get("step"),
+            "screen_description": trace.get("screen_description"),
+            "current_location": trace.get("current_location"),
+            "thought_summary": trace.get("thought_summary"),
             "memory_written": trace.get("memory_written"),
             "error": trace.get("error"),
         }

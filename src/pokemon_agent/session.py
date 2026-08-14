@@ -46,6 +46,7 @@ VALID_BUTTON_TOKENS = frozenset(BUTTON_TOKENS)
 DEFAULT_REALTIME_FPS = 60.0
 DEFAULT_SNAPSHOT_HZ = 30.0
 BUTTON_HOLD_FRAMES = 4
+INPUT_AFTER_FRAMES = 20
 ACTION_WAIT_SECONDS = 0.3
 MOVE_STEP_TIMEOUT_SECONDS = 1.0
 
@@ -477,6 +478,16 @@ class PokemonSession:
                     return True
                 self._frame_condition.wait(timeout=max(0.001, min(0.05, deadline - now if now < deadline else 0.01)))
 
+    def _wait_realtime_frames(self, frames: int, *, start_frame: int) -> bool:
+        target_frame = start_frame + max(0, int(frames))
+        with self._frame_condition:
+            while True:
+                if self._closing or self.env is None or self._realtime_error or not self.realtime_ticks_enabled:
+                    return False
+                if self.frame_index >= target_frame:
+                    return True
+                self._frame_condition.wait(timeout=0.05)
+
     def _realtime_stop_reason(self) -> str:
         return "realtime_ticker_stopped"
 
@@ -601,7 +612,7 @@ class PokemonSession:
 
         with self._snapshot_condition:
             for event in state_events:
-                self._pending_state_events.append(dict(event))
+                _append_pending_state_event(self._pending_state_events, event)
             self._latest_observation = observation
             self._latest_ui_payload = ui_payload
             listeners = tuple(self._observation_listeners)
@@ -643,7 +654,13 @@ class PokemonSession:
                             stop_reason = self._realtime_stop_reason()
                             break
                         raise
-                if not self._wait_realtime(ACTION_WAIT_SECONDS, start_frame=start_frame):
+                    completed = self._wait_realtime_frames(
+                        BUTTON_HOLD_FRAMES + INPUT_AFTER_FRAMES,
+                        start_frame=start_frame,
+                    )
+                else:
+                    completed = self._wait_realtime(ACTION_WAIT_SECONDS, start_frame=start_frame)
+                if not completed:
                     stop_reason = self._realtime_stop_reason()
                     break
                 executed_actions.append({"button": token})
@@ -831,6 +848,17 @@ class PokemonSession:
                 executed_actions.append({"button": direction})
                 self.tool_step_index += 1
 
+                if step_stop_reason is None:
+                    with self._env_lock:
+                        current_frame = self.frame_index
+                    remaining_frames = max(
+                        0,
+                        BUTTON_HOLD_FRAMES + INPUT_AFTER_FRAMES - (current_frame - start_frame),
+                    )
+                    if not self._wait_realtime_frames(remaining_frames, start_frame=current_frame):
+                        stop_reason = self._realtime_stop_reason()
+                        break
+
                 after_step = self.observe(refresh_control_panel=False)
                 interruption = _interruption_reason(after_step)
                 if interruption is not None:
@@ -893,7 +921,6 @@ class PokemonSession:
                     before_position is not None
                     and current_position != before_position
                     and int(compact_observation.get("frame_index", 0)) > start_frame
-                    and not last_controls_locked
                 ):
                     return None
                 now = time.monotonic()
@@ -1300,6 +1327,25 @@ def _state_events(previous: dict[str, Any] | None, current: dict[str, Any]) -> l
         events.append({"type": "event_flags_changed", "from": previous_flags, "to": current_flags})
 
     return events
+
+
+def _append_pending_state_event(
+    pending: deque[dict[str, Any]],
+    event: dict[str, Any],
+) -> None:
+    incoming = dict(event)
+    if incoming.get("type") == "dialog_text_changed":
+        for existing in reversed(pending):
+            existing_type = existing.get("type")
+            if existing_type == "dialog_closed":
+                break
+            if existing_type == "dialog_opened":
+                existing["text"] = incoming.get("to")
+                return
+            if existing_type == "dialog_text_changed":
+                existing["to"] = incoming.get("to")
+                return
+    pending.append(incoming)
 
 
 def _append_changed_event(

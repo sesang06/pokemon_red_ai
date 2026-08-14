@@ -4,25 +4,26 @@ The runtime source of truth is
 `src/pokemon_agent/adk_agent/agents/planner/prompt.py`.
 
 The planner emits one bounded `buttons` or current-map world-coordinate `move`
-action. It may request bounded repetition but cannot mark a Goal complete.
+action. Each action is executed exactly once and cannot mark a Goal complete.
 
 ```json
 {
   "action": {
     "type": "buttons",
-    "buttons": ["a", "wait"],
-    "reason": "advance_dialog"
+    "buttons": ["a", "wait", "a", "wait", "a"],
+    "reason": "advance_dialog_three_times"
   },
-  "repeat_until": {"path": "dialog_open", "equals": false},
-  "max_repeats": 8,
-  "reason": "Advance the current dialog until RAM reports that it closed"
+  "reason": "Send the complete ordered input sequence once, then observe fresh state"
 }
 ```
 
-`repeat_until` supports exactly one of `equals`, `min`, `max`, or `contains`.
-Without it, `max_repeats` is forced to 1. Planner-generated preconditions and
-Task objects are not accepted.
+Repeated button presses and timing pauses must be explicit tokens in the same
+ordered `buttons` array. After that array or one `move` completes, the runtime
+observes RAM/GameState and asks the Planner for a new action. Separate repetition
+control fields, Planner-generated preconditions, and Task objects are not accepted.
 
 Input priority is RAM/GameState, verifier state, previous action outcome,
-relevant memory, and finally model inference. The latest screenshot and overlay
-support interpretation but are not Goal-success evidence.
+the current map memory returned by `search_memory(map_name)`, and finally model
+inference. Memory is never injected into the Planner JSON and the Planner cannot
+save it. The latest screenshot and overlay support interpretation but are not
+Goal-success evidence.

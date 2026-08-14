@@ -14,20 +14,19 @@ from pokemon_agent.adk_agent.runtime.session import ADK_WEB_APP_NAME, build_even
 from pokemon_agent.adk_agent.web.prompt import WEB_AGENT_PROMPT
 from pokemon_agent.adk_agent.web.tools import (
     agent_runtime_status,
-    read_long_term_memory,
+    buttons,
+    move,
     observe_game,
     realtime_tick_status,
     recent_agent_actions,
     recent_game_commands,
-    recent_session_dialog,
-    run_rule_based_step,
-    run_team_step,
+    save_memory,
     save_current_screenshot,
-    search_long_term_memory,
+    search_memory,
     set_realtime_ticks,
     start_game,
     stop_game,
-    write_long_term_memory,
+    wait,
 )
 
 
@@ -47,6 +46,7 @@ def build_root_agent(model: str | None = None) -> Agent:
     generate_content_config = types.GenerateContentConfig(
         temperature=0.2,
         maxOutputTokens=900,
+        thinking_config=types.ThinkingConfig(include_thoughts=True),
     )
     planning_agent = Agent(
         name="pokemon_red_planning_agent",
@@ -58,11 +58,9 @@ def build_root_agent(model: str | None = None) -> Agent:
             start_game,
             observe_game,
             save_current_screenshot,
-            read_long_term_memory,
-            search_long_term_memory,
+            search_memory,
             recent_game_commands,
             recent_agent_actions,
-            recent_session_dialog,
         ],
     )
     result_interpreter_agent = Agent(
@@ -74,15 +72,14 @@ def build_root_agent(model: str | None = None) -> Agent:
         tools=[
             observe_game,
             recent_game_commands,
-            read_long_term_memory,
-            search_long_term_memory,
-            write_long_term_memory,
+            search_memory,
+            save_memory,
         ],
     )
     return Agent(
         name="pokemon_red_team",
         model=selected_model,
-        description="Coordinates direct LLM action planning with deterministic execution, repetition, and verification.",
+        description="Coordinates direct LLM action planning with deterministic one-shot execution and verification.",
         instruction=WEB_AGENT_PROMPT,
         generate_content_config=generate_content_config,
         tools=[
@@ -90,12 +87,12 @@ def build_root_agent(model: str | None = None) -> Agent:
             stop_game,
             set_realtime_ticks,
             realtime_tick_status,
-            run_team_step,
-            run_rule_based_step,
+            buttons,
+            move,
+            wait,
             recent_game_commands,
             agent_runtime_status,
             recent_agent_actions,
-            recent_session_dialog,
         ],
         sub_agents=[
             planning_agent,

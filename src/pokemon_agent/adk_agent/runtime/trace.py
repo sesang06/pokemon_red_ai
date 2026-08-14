@@ -27,19 +27,17 @@ def format_trace_event(event: dict[str, Any]) -> str:
         header += f" step={step}"
 
     lines = [header]
-    thought_summary = event.get("thought_summary") or event.get("summary")
-    if thought_summary:
-        lines.append(f"<thought_summary>{thought_summary}</thought_summary>")
-
-    session_dialog = event.get("session_dialog")
-    if session_dialog:
-        lines.append(f"<session_dialog>{session_dialog}</session_dialog>")
-
-    decision_trace = event.get("decision_trace")
-    if decision_trace:
-        lines.append(f"<decision_trace>{_compact_json(decision_trace)}</decision_trace>")
-
-    for key in ("memory_keys_read", "action", "expected_result", "stop_reason", "success_hint", "memory_written"):
+    for key in (
+        "screen_description",
+        "current_location",
+        "thought_summary",
+        "elapsed_seconds",
+        "memory_keys_read",
+        "action",
+        "stop_reason",
+        "success_hint",
+        "memory_written",
+    ):
         value = event.get(key)
         if value is not None:
             lines.append(f"{key}: {_compact_json(value)}")

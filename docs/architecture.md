@@ -4,16 +4,16 @@
 
 ```text
 Goal
-  -> Action Planner (Google ADK LLM, only when planning is required)
-  -> bounded ActionPlan: action + optional repeat_until + max_repeats
-  -> Python action validator/repeater
+  -> Action Planner (Google ADK LLM, once per action)
+  -> bounded one-shot ActionPlan
+  -> Python action validator
   -> buttons/move MCP action
   -> PokemonSession.observe() (RAM + vision)
   -> deterministic StateDiff and action/Goal verifier
-       -> continue: reuse the same action without an LLM call
-       -> condition met/limit/error/interruption: replan
-  -> Result Interpreter (LLM only at an action-cycle boundary or durable event)
-  -> Memory Consolidator
+  -> Result Interpreter (LLM only on failure or a durable event)
+       -> search_memory(current map)
+       -> save_memory(current map, consolidated value) when needed
+  -> next Planner call with fresh state
 ```
 
 The optional web debugger receives the same live objects without polling PyBoy:
@@ -30,9 +30,10 @@ If the dashboard server or browser disconnects, the ticker and coordinator keep
 running. Reconnecting starts with a current state snapshot plus at most 500
 recent events.
 
-The LLM chooses **one direct bounded action and repeat policy**. Python validates
-and executes it, and structured game state decides **whether repetition should
-stop and whether the Goal actually succeeded**.
+The LLM chooses **one direct bounded action**. Python validates and executes it
+once, and structured game state decides **what changed and whether the Goal
+actually succeeded**. Repeated button presses are explicit tokens in one ordered
+`buttons` array.
 
 ## ADK Package Layout
 
@@ -87,11 +88,10 @@ item, Pokemon, badge, or story reward was received.
 The coordinator keeps these state groups separate:
 
 - `current_goal`: long-running objective and machine-verifiable conditions
-- `active_action_plan`: direct action, optional RAM stop condition, repeat count/limit
+- `active_action_plan`: the direct action selected for the current cycle
 - `planned_action`: the validated `buttons` or `move` action used this cycle
 - `state_diff`: structured before/after changes and event types
-- `action_outcome`: `continue`, `condition_met`, `single_action_complete`,
-  `max_repeats_reached`, `interrupted`, or `execution_error`
+- `action_outcome`: `single_action_complete`, `interrupted`, or `execution_error`
 - `transition_history`: recent structured state transitions
 - `history_summary`: deterministic overflow summary
 
@@ -126,27 +126,23 @@ advances frames.
 
 ### Action Planner
 
-The Google ADK planner returns one direct action with an optional repeat policy:
+The Google ADK planner returns one direct action:
 
 ```json
 {
-  "action":{"type":"buttons","buttons":["a","wait"],"reason":"advance_dialog"},
-  "repeat_until":{"path":"dialog_open","equals":false},
-  "max_repeats":8
+  "action":{"type":"buttons","buttons":["a","wait","a","wait","a"],"reason":"advance_dialog_three_times"}
 }
 ```
 
-Supported repeat operators are `equals`, `min`, `max`, and `contains`.
-Unsupported condition shapes reject the whole model response and trigger one
-rule-based fallback action. There are no planner-generated preconditions or
-Task objects.
+The button array is the complete one-shot input sequence. Invalid action shapes
+stop the loop with `planning_failed` before any game input is sent. There are
+no planner-generated preconditions or Task objects.
 
 ### Action Executor
 
-The executor validates the planner's direct action and calls MCP/PokemonSession.
-If `repeat_until` is still false, it reuses the same validated action on the
-next cycle without calling the planner. Repetition stops at `max_repeats`, on
-condition success, or on an execution interruption.
+The executor validates the planner's direct action and calls MCP/PokemonSession
+exactly once. The coordinator then observes fresh state and calls the Planner
+again for the next cycle.
 
 ```json
 {"type":"buttons","buttons":["a","wait"]}
@@ -172,24 +168,21 @@ and walk-cell coordinates are private session details.
 ### StateDiff and Verifier
 
 Every action compares before and after structured observations. The verifier
-checks repeat and Goal conditions without an LLM. Supported evidence includes
-inventory, party, Pokedex, badges, money, map, position, flags, dialog, battle,
-warp, event types, and action results.
-
-For example, `obtain_pokeballs` completes only when RAM-derived inventory
-contains at least one Poke Ball. Opening or closing Oak dialog is insufficient.
+can evaluate explicitly supplied Goal conditions without an LLM, but built-in
+objectives do not register automatic RAM success conditions. Action outcomes
+still use RAM-derived inventory, party, map, position, flags, dialog, battle,
+warp, event types, and action results as deterministic evidence.
 
 ### Result Interpreter and Memory
 
 The interpreter is not a 20-turn history compressor. It is called only for an
-action-cycle boundary that needs interpretation or a durable/unexpected event, and it may explain verified facts or
-propose memory candidates. It cannot override deterministic outcomes.
+action failure or a durable/unexpected event, and it may explain verified facts.
+It cannot override deterministic outcomes.
 
-Memory consolidation is a separate component. Long-term keys use:
-
-```text
-map:* event:* npc:* item:* goal:* strategy:* failure:* episode:*
-```
+Long-term memory is accessed only through ADK tools. The Planner calls
+`search_memory(map_name)` and the interpreter calls `search_memory(map_name)`
+before optionally calling `save_memory(map_name, value)`. Neither tool accepts an
+arbitrary key. Storage is always the single `map:<map_name>` entry for that map.
 
 Full actions remain in date-grouped JSONL and ADK SQLite. The model receives a
 short state-transition context, while deterministic compression bounds recent

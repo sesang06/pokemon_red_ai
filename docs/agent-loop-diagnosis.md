@@ -53,7 +53,7 @@ response text   : '{ "objective": "safe_loop", "current_goal": "Obtain a starter
 
 1. `adk_agent/adk_planner.py:29` — `max_output_tokens: int = 1000`
 2. `adk_agent/adk_planner.py:31` — `thinking_budget: int | None = -1` (자동). Gemini 2.5 Flash는 **thinking 토큰이 `maxOutputTokens`에 함께 계상**되므로 thinking 764 토큰이 예산을 먼저 잠식한다.
-3. `adk_agent/prompts.py`의 `PLANNING_AGENT_PROMPT`가 요구하는 스키마 — 문단형 필드 3개(`decision_rationale`, `session_dialog`, `future_objective`) + `decision_trace` 12개 필드 — 는 **정상 완료 시 1,092 토큰**을 소비한다.
+3. 당시 `PLANNING_AGENT_PROMPT`가 요구하던 장문의 설명 스키마는 **정상 완료 시 1,092 토큰**을 소비했다. 현재는 단일 `action` 객체만 반환한다.
 4. → 1,000 예산으로는 thinking을 0으로 만들어도 구조적으로 완주가 불가능하다.
 5. 절단된 JSON → `adk_planner.py:261`의 `_parse_json_object`가 `JSONDecodeError`를 잡고 `None` 반환
 6. → `team.py`의 `raw_decision = None` → `rule_based_plan` 폴백
@@ -152,7 +152,7 @@ action_request: {'type': 'move', 'target': [4, 3]}
 
 | # | 조치 | 위치 | 기대 효과 |
 |---|---|---|---|
-| 1 | `max_output_tokens` 1,000 → 4,000. 또는 `thinking_budget`을 512로 고정하고 `decision_trace` 스키마를 축소 | `adk_planner.py:29,31` / `prompts.py` | **LLM이 실제로 조종석에 앉는다.** 단독으로 왕복 현상 해소 |
+| 1 | `max_output_tokens` 1,000 → 4,000. 또는 thinking 예산과 출력 스키마를 축소 | `adk_planner.py:29,31` / `prompts.py` | **LLM이 실제로 조종석에 앉는다.** 단독으로 왕복 현상 해소 |
 | 2 | `raw_decision is None`일 때도 `plan_error`를 채우고, 폴백 발생 시 경고 로그. `_parse_json_object`에 원문 일부 로깅 | `team.py:92`, `adk_planner.py:261` | 동일 장애의 재발을 즉시 감지 |
 | 3 | `recent_actions`용 슬림 엔트리 도입(관측 blob 제거) + `indent` 제거 | `planning.py:306`, `team.py` `compact_result`, `adk_planner.py:147` | 54k → 5.6k 토큰 (90% 절감) |
 | 4 | 룰 폴백을 방문 좌표 기록 기반으로 교체하고 `stuck_score`를 실제로 소비 (임계 초과 시 직전 방향 반전 금지, 미방문 프론티어 강제) | `planning.py:187-233`, `loop.py:109` | LLM 실패 시에도 왕복하지 않는 안전망 |

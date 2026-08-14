@@ -15,16 +15,22 @@ ADK_WEB_APP_NAME = "adk_agent"
 DEFAULT_ADK_USER_ID = "user"
 DEFAULT_COMPACTION_INTERVAL = 5
 DEFAULT_COMPACTION_OVERLAP_SIZE = 1
+DEFAULT_COMPACTION_TOKEN_THRESHOLD = 1_00_000
+DEFAULT_EVENT_RETENTION_SIZE = 20
 
 
 def build_events_compaction_config(
     *,
     interval: int = DEFAULT_COMPACTION_INTERVAL,
     overlap_size: int = DEFAULT_COMPACTION_OVERLAP_SIZE,
+    token_threshold: int = DEFAULT_COMPACTION_TOKEN_THRESHOLD,
+    event_retention_size: int = DEFAULT_EVENT_RETENTION_SIZE,
 ) -> EventsCompactionConfig:
     return EventsCompactionConfig(
         compaction_interval=interval,
         overlap_size=overlap_size,
+        token_threshold=token_threshold,
+        event_retention_size=event_retention_size,
     )
 
 

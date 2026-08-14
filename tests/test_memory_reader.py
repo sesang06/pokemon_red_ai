@@ -115,31 +115,6 @@ def test_party_species_ids_are_national_pokedex_numbers() -> None:
         assert member.internal_species_id == internal_id
 
 
-def test_memory_reader_exposes_oak_story_event_flags() -> None:
-    ram = PokemonRedRamMap()
-    memory = FakeMemory(
-        {
-            ram.event_flags_start + 4: 0b00111111,
-            ram.event_flags_start + 7: 0b00000011,
-            ram.event_flags_start + (0x525 // 8): 1 << (0x525 % 8),
-        }
-    )
-
-    state = PokemonRedMemoryReader(ram).read(memory)
-
-    assert state.flags["followed_oak_into_lab_2"] is True
-    assert state.flags["oak_asked_to_choose_mon"] is True
-    assert state.flags["got_starter"] is True
-    assert state.flags["battled_rival_in_oaks_lab"] is True
-    assert state.flags["got_pokeballs_from_oak"] is True
-    assert state.flags["got_pokedex"] is True
-    assert state.flags["received_pokedex"] is True
-    assert state.flags["oak_got_parcel"] is True
-    assert state.flags["got_oaks_parcel"] is True
-    assert state.flags["beat_route22_rival_1st_battle"] is True
-    assert state.raw["story_event_flags"]["got_pokeballs_from_oak"] is True
-
-
 def test_memory_reader_exposes_transient_input_lock_state() -> None:
     ram = PokemonRedRamMap()
     memory = FakeMemory({ram.joy_ignore: 0xF0, ram.status_flags_5: 0x01})
@@ -149,6 +124,22 @@ def test_memory_reader_exposes_transient_input_lock_state() -> None:
     assert state.raw["joy_ignore"] == 0xF0
     assert state.raw["status_flags_5"] == 0x01
     assert state.raw["controls_locked"] is True
+
+
+def test_memory_reader_decodes_end_dialog_tile() -> None:
+    ram = PokemonRedRamMap()
+    memory = FakeMemory(
+        {
+            ram.tilemap_start: 0x7C,
+            ram.tilemap_start + 1: 0xF0,
+            ram.tilemap_start + 2: 0x7C,
+        }
+    )
+
+    state = PokemonRedMemoryReader(ram).read(memory)
+
+    assert state.dialog_open is True
+    assert state.dialog_text == "END"
 
 
 def _write_party_slot(memory: FakeMemory, base: int) -> None:

@@ -26,7 +26,6 @@ class FileAgentRuntimeState:
                 "updated_at": None,
                 "phase": "not_started",
                 "action_history": [],
-                "session_dialog": [],
             }
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -36,7 +35,6 @@ class FileAgentRuntimeState:
                 "updated_at": None,
                 "phase": "unavailable",
                 "action_history": [],
-                "session_dialog": [],
             }
         return data if isinstance(data, dict) else {}
 
@@ -52,7 +50,6 @@ class FileAgentRuntimeState:
             "action_outcome": state.get("action_outcome"),
             "state_diff": state.get("state_diff"),
             "transition_history": list(state.get("transition_history", [])),
-            "replan_required": state.get("replan_required", False),
             "planner_call_count": state.get("planner_call_count", 0),
             "llm_planner_call_count": state.get("llm_planner_call_count", 0),
             "interpreter_call_count": state.get("interpreter_call_count", 0),
@@ -63,7 +60,6 @@ class FileAgentRuntimeState:
             "stuck_score": state.get("stuck_score", 0),
             "history_summary": state.get("history_summary"),
             "action_history": list(state.get("action_history", [])),
-            "session_dialog": list(state.get("session_dialog", [])),
             "plan_decision": state.get("plan_decision"),
             "execution_report": state.get("execution_report"),
             "interpretation": state.get("interpretation"),

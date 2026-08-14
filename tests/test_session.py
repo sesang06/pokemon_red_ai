@@ -9,7 +9,7 @@ import pytest
 
 from pokemon_agent.memory.world_state import GameMode
 import pokemon_agent.session as session_module
-from pokemon_agent.session import BUTTON_HOLD_FRAMES, PokemonSession
+from pokemon_agent.session import BUTTON_HOLD_FRAMES, INPUT_AFTER_FRAMES, PokemonSession
 
 from tests.fakes import FakePokemonEnvironment, fake_session_paths
 
@@ -93,6 +93,33 @@ def test_observe_tracks_ram_derived_state_events(tmp_path: Path) -> None:
     assert closed["state"]["dialog"]["open"] is False
 
 
+def test_observe_coalesces_progressive_dialog_typing_events(tmp_path: Path) -> None:
+    fake_env = FakePokemonEnvironment()
+    session = PokemonSession(
+        paths=fake_session_paths(tmp_path),
+        env_factory=lambda rom, window: fake_env,
+    )
+    session.start(load_fixed=False)
+    session.observe()
+
+    for text in ("W", "WA", "WAN", "WANT"):
+        _write_dialog_tiles(fake_env.memory, text)
+        _wait_for_next_frame(session)
+    opened = session.observe()
+
+    assert {"type": "dialog_opened", "text": "WANT"} in opened["state_events"]
+    assert not any(event["type"] == "dialog_text_changed" for event in opened["state_events"])
+
+    for text in ("N", "NE", "NEXT"):
+        _write_dialog_tiles(fake_env.memory, text)
+        _wait_for_next_frame(session)
+    changed = session.observe()
+
+    assert changed["state_events"] == [
+        {"type": "dialog_text_changed", "from": "WANT", "to": "NEXT"}
+    ]
+
+
 def test_move_to_world_cell_executes_dijkstra_direction(tmp_path: Path) -> None:
     fake_env = FakePokemonEnvironment()
     session = PokemonSession(
@@ -110,6 +137,59 @@ def test_move_to_world_cell_executes_dijkstra_direction(tmp_path: Path) -> None:
     assert result["stop_reason"] == "target_reached"
     assert "requested_walk_cell" not in result
     assert any(render for _, render in fake_env.ticks)
+
+
+def test_move_waits_for_realtime_settle_between_direction_inputs(tmp_path: Path, monkeypatch) -> None:
+    class TickSpacingEnvironment(FakePokemonEnvironment):
+        def __init__(self):
+            super().__init__()
+            self.button_tick_counts: list[int] = []
+
+        def button(self, button: str, frames: int = 1) -> None:
+            self.button_tick_counts.append(len(self.ticks))
+            super().button(button, frames)
+
+    fake_env = TickSpacingEnvironment()
+    session = PokemonSession(
+        paths=fake_session_paths(tmp_path),
+        env_factory=lambda rom, window: fake_env,
+    )
+
+    session.start(load_fixed=False)
+    result = session.move_to_world_cell(7, 6)
+
+    assert [action["button"] for action in result["executed_actions"]] == ["right", "right"]
+    assert (
+        fake_env.button_tick_counts[1] - fake_env.button_tick_counts[0]
+        >= BUTTON_HOLD_FRAMES + INPUT_AFTER_FRAMES
+    )
+    assert result["stop_reason"] == "target_reached"
+
+
+def test_button_array_waits_hold_and_after_frames_between_inputs(tmp_path: Path) -> None:
+    class TickSpacingEnvironment(FakePokemonEnvironment):
+        def __init__(self):
+            super().__init__()
+            self.button_tick_counts: list[int] = []
+
+        def button(self, button: str, frames: int = 1) -> None:
+            self.button_tick_counts.append(len(self.ticks))
+            super().button(button, frames)
+
+    fake_env = TickSpacingEnvironment()
+    session = PokemonSession(
+        paths=fake_session_paths(tmp_path),
+        env_factory=lambda rom, window: fake_env,
+    )
+
+    session.start(load_fixed=False)
+    result = session.press_buttons(["a", "start"])
+
+    assert result["executed_actions"] == [{"button": "a"}, {"button": "start"}]
+    assert (
+        fake_env.button_tick_counts[1] - fake_env.button_tick_counts[0]
+        >= BUTTON_HOLD_FRAMES + INPUT_AFTER_FRAMES
+    )
 
 
 def test_move_to_world_cell_clamps_out_of_view_target_to_nearest_visible_cell(tmp_path: Path) -> None:
@@ -207,6 +287,28 @@ def test_navigation_does_not_learn_an_edge_while_controls_are_locked(
     assert first["stop_reason"] == "controls_locked"
     assert [action["button"] for action in second["executed_actions"]] == ["right"]
     assert second["stop_reason"] == "target_reached"
+
+
+def test_move_reports_target_reached_when_script_locks_controls_after_position_change(
+    tmp_path: Path,
+) -> None:
+    class ScriptedArrivalEnvironment(FakePokemonEnvironment):
+        def button(self, button: str, frames: int = 1) -> None:
+            super().button(button, frames)
+            self.memory[0xCD6B] = 0xF0
+
+    fake_env = ScriptedArrivalEnvironment()
+    session = PokemonSession(
+        paths=fake_session_paths(tmp_path),
+        env_factory=lambda rom, window: fake_env,
+    )
+    session.start(load_fixed=False)
+
+    result = session.move_to_world_cell(6, 6)
+
+    assert result["after_observation"]["state"]["position"] == {"x": 6, "y": 6}
+    assert result["after_observation"]["state"]["raw"]["controls_locked"] is True
+    assert result["stop_reason"] == "target_reached"
 
 
 def test_press_buttons_and_wait_contract(tmp_path: Path, monkeypatch) -> None:
@@ -439,23 +541,23 @@ def test_concurrent_actions_are_fifo_serialized(tmp_path: Path, monkeypatch) -> 
         env_factory=lambda rom, window: fake_env,
     )
     session.start(load_fixed=False)
-    original_wait = session._wait_realtime
+    original_wait = session._wait_realtime_frames
     active_waits = 0
     max_active_waits = 0
     counter_lock = threading.Lock()
 
-    def tracked_wait(seconds: float, *, start_frame: int | None = None) -> bool:
+    def tracked_wait(frames: int, *, start_frame: int) -> bool:
         nonlocal active_waits, max_active_waits
         with counter_lock:
             active_waits += 1
             max_active_waits = max(max_active_waits, active_waits)
         try:
-            return original_wait(seconds, start_frame=start_frame)
+            return original_wait(frames, start_frame=start_frame)
         finally:
             with counter_lock:
                 active_waits -= 1
 
-    monkeypatch.setattr(session, "_wait_realtime", tracked_wait)
+    monkeypatch.setattr(session, "_wait_realtime_frames", tracked_wait)
     first = threading.Thread(target=lambda: session.press_buttons(["a"]), name="first-action")
     second = threading.Thread(target=lambda: session.press_buttons(["b"]), name="second-action")
     first.start()
@@ -523,11 +625,11 @@ def test_load_state_waits_for_active_action(tmp_path: Path, monkeypatch) -> None
     wait_entered = threading.Event()
     release_wait = threading.Event()
 
-    def controlled_wait(seconds: float, *, start_frame: int | None = None) -> bool:
+    def controlled_wait(frames: int, *, start_frame: int) -> bool:
         wait_entered.set()
         return release_wait.wait(timeout=1.0)
 
-    monkeypatch.setattr(session, "_wait_realtime", controlled_wait)
+    monkeypatch.setattr(session, "_wait_realtime_frames", controlled_wait)
     action = threading.Thread(target=lambda: session.press_buttons(["a"]))
     loader = threading.Thread(target=lambda: session.load_state(kind="fixed"))
     action.start()

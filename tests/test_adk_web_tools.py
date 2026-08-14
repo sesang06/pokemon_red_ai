@@ -131,18 +131,18 @@ def test_adk_web_tools_save_screenshot_uses_date_folder(tmp_path: Path) -> None:
     assert saved_path.suffix == ".png"
 
 
-def test_adk_web_tools_read_search_and_write_long_term_memory(tmp_path: Path, monkeypatch) -> None:
+def test_adk_web_memory_tools_are_map_scoped(tmp_path: Path, monkeypatch) -> None:
     store = FileLongTermMemory(tmp_path / "long_term_memory.json")
     monkeypatch.setattr(web_tools, "_memory_store", lambda: store)
 
-    write_result = web_tools.write_long_term_memory("keyword:oak lab", "starter location", source="test")
-    search_result = web_tools.search_long_term_memory("starter")
-    read_result = web_tools.read_long_term_memory("keyword:oak_lab")
+    write_result = web_tools.save_memory("Oak's Lab", "starter location")
+    search_result = web_tools.search_memory("Oak's Lab")
 
     assert write_result["phase"] == "memory_write"
-    assert write_result["key"] == "keyword:oak_lab"
-    assert "keyword:oak_lab" in search_result["items"]
-    assert read_result["item"]["value"] == "starter location"
+    assert write_result["key"] == "map:Oak's Lab"
+    assert search_result["key"] == "map:Oak's Lab"
+    assert search_result["item"]["value"] == "starter location"
+    assert list(store.items()) == ["map:Oak's Lab"]
 
 
 def test_adk_web_tools_read_shared_cli_runtime_history(tmp_path: Path, monkeypatch) -> None:
@@ -153,7 +153,6 @@ def test_adk_web_tools_read_shared_cli_runtime_history(tmp_path: Path, monkeypat
             "step_count": 7,
             "mode": "overworld",
             "action_history": [{"step": 6}, {"step": 7}],
-            "session_dialog": [{"step": 7, "content": "Moving toward the exit."}],
             "history_summary": "Started in Oak's Lab.",
         },
         phase="executed",
@@ -162,12 +161,24 @@ def test_adk_web_tools_read_shared_cli_runtime_history(tmp_path: Path, monkeypat
 
     status = web_tools.agent_runtime_status()
     actions = web_tools.recent_agent_actions(limit=1)
-    dialog = web_tools.recent_session_dialog(limit=20)
 
     assert status["phase"] == "executed"
     assert status["step_count"] == 7
     assert actions["actions"] == [{"step": 7}]
-    assert dialog["dialog"][0]["content"] == "Moving toward the exit."
+
+
+def test_recent_agent_actions_is_capped_at_twenty_turns(tmp_path: Path, monkeypatch) -> None:
+    store = FileAgentRuntimeState(tmp_path / "adk_runtime_state.json")
+    store.publish(
+        {"action_history": [{"step": step} for step in range(22)]},
+        phase="executed",
+    )
+    monkeypatch.setattr(web_tools, "_runtime_store", lambda: store)
+
+    actions = web_tools.recent_agent_actions(limit=20)
+
+    assert actions["count"] == 20
+    assert actions["actions"][0] == {"step": 2}
 
 
 def test_runtime_state_publish_retries_windows_replace_contention(tmp_path: Path, monkeypatch) -> None:
@@ -197,8 +208,20 @@ def test_adk_web_root_agent_exposes_only_llm_decision_sub_agents() -> None:
         "pokemon_red_planning_agent",
         "pokemon_red_result_interpreter_agent",
     ]
+    planner_tools = {
+        getattr(tool, "name", getattr(tool, "__name__", ""))
+        for tool in root_agent.sub_agents[0].tools
+    }
+    interpreter_tools = {
+        getattr(tool, "name", getattr(tool, "__name__", ""))
+        for tool in root_agent.sub_agents[1].tools
+    }
+    assert "search_memory" in planner_tools
+    assert {"search_memory", "save_memory"} <= interpreter_tools
     tool_names = {getattr(tool, "name", getattr(tool, "__name__", "")) for tool in root_agent.tools}
-    assert {"agent_runtime_status", "recent_agent_actions", "recent_session_dialog"} <= tool_names
+    assert {"agent_runtime_status", "recent_agent_actions", "buttons", "move", "wait"} <= tool_names
+    assert "run_rule_based_step" not in tool_names
+    assert "run_team_step" not in tool_names
 
 
 def test_adk_web_exports_compacted_app() -> None:
@@ -209,21 +232,39 @@ def test_adk_web_exports_compacted_app() -> None:
     assert configured.root_agent.name == "pokemon_red_team"
     assert configured.events_compaction_config.compaction_interval == 5
     assert configured.events_compaction_config.overlap_size == 1
-    assert configured.events_compaction_config.token_threshold is None
+    assert configured.events_compaction_config.token_threshold is not None
+    assert configured.events_compaction_config.event_retention_size == 20
 
 
 def test_adk_web_planning_prompt_documents_direct_action_contract() -> None:
     assert '"action": {"type":"buttons"' in PLANNING_AGENT_PROMPT
-    assert '"repeat_until"' in PLANNING_AGENT_PROMPT
-    assert '"max_repeats"' in PLANNING_AGENT_PROMPT
-    assert "Never return preconditions" in PLANNING_AGENT_PROMPT
+    assert '["a","wait","a","wait","a"]' in PLANNING_AGENT_PROMPT
+    assert '["right","wait","right","wait","right"]' in PLANNING_AGENT_PROMPT
+    assert "same button token may appear multiple times" in PLANNING_AGENT_PROMPT
+    assert "executor runs it exactly once" in PLANNING_AGENT_PROMPT
+    assert "separate repetition-control fields" in PLANNING_AGENT_PROMPT
     assert "world coordinates" in PLANNING_AGENT_PROMPT
     assert "walk_area_collision coordinates" not in PLANNING_AGENT_PROMPT
-    assert "screen_description" in PLANNING_AGENT_PROMPT
-    assert "current_location" in PLANNING_AGENT_PROMPT
-    assert "session_dialog" in PLANNING_AGENT_PROMPT
+    assert '"screen_description"' in PLANNING_AGENT_PROMPT
+    assert '"current_location"' in PLANNING_AGENT_PROMPT
+    assert '"thought_summary"' in PLANNING_AGENT_PROMPT
+    assert "public 1-2 sentence decision summary" in PLANNING_AGENT_PROMPT
+    assert "decision_trace" not in PLANNING_AGENT_PROMPT
+    assert "session_dialog" not in PLANNING_AGENT_PROMPT
     assert "RAM/GameState" in PLANNING_AGENT_PROMPT
-    assert "failure:*" in PLANNING_AGENT_PROMPT
+    assert "repeat_until" not in PLANNING_AGENT_PROMPT
+    assert "max_repeats" not in PLANNING_AGENT_PROMPT
+    assert "search_memory(map_name=state.map_name)" in PLANNING_AGENT_PROMPT
+    assert "map:<map_name>" in PLANNING_AGENT_PROMPT
+    assert "verified world-coordinate routes" in PLANNING_AGENT_PROMPT
+    assert "navigation.reachable_targets" in PLANNING_AGENT_PROMPT
+    assert "state.controls_locked" in PLANNING_AGENT_PROMPT
+    assert "wait_for_scripted_transition" in PLANNING_AGENT_PROMPT
+    assert "route: [from_x,from_y] -> [to_x,to_y]" in RESULT_INTERPRETER_PROMPT
+    assert "Merge and deduplicate coordinates" in RESULT_INTERPRETER_PROMPT
+    assert "zero-step move adds no route knowledge" in RESULT_INTERPRETER_PROMPT
+    for field in ("screen_description", "current_location", "thought_summary"):
+        assert f'"{field}"' in RESULT_INTERPRETER_PROMPT
 
 
 def test_planner_and_interpreter_prompts_share_complete_input_and_navigation_contract() -> None:
@@ -237,5 +278,16 @@ def test_planner_and_interpreter_prompts_share_complete_input_and_navigation_con
 
     assert "navigation.reachable_targets" in PLANNING_AGENT_PROMPT
     assert "do not default to an adjacent one-cell target" in PLANNING_AGENT_PROMPT
+    assert "ordered by path length from short to long" in PLANNING_AGENT_PROMPT
+    assert "prefer a purposeful target 6.." in PLANNING_AGENT_PROMPT
+    assert "leaving the room" in PLANNING_AGENT_PROMPT
+    assert "until `state.map_name` changes" in PLANNING_AGENT_PROMPT
+    assert "instead of oscillating back" in PLANNING_AGENT_PROMPT
+    assert "Never output prose labels" in PLANNING_AGENT_PROMPT
+    assert "Do not use Markdown fences" in PLANNING_AGENT_PROMPT
+    assert "concise English" in PLANNING_AGENT_PROMPT
+    assert "concise English" in RESULT_INTERPRETER_PROMPT
+    assert not any("\uac00" <= char <= "\ud7a3" for char in PLANNING_AGENT_PROMPT)
+    assert not any("\uac00" <= char <= "\ud7a3" for char in RESULT_INTERPRETER_PROMPT)
     assert "max_steps_reached" in RESULT_INTERPRETER_PROMPT
     assert "Do not emit an action object" in RESULT_INTERPRETER_PROMPT

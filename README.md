@@ -3,7 +3,7 @@
 This repo is a concrete scaffold for a hierarchical Pokemon Red agent built on
 PyBoy. The design follows the attached plan:
 
-Planner LLM -> bounded ActionPlan -> deterministic repeat/verification loop ->
+Planner LLM -> bounded one-shot ActionPlan -> deterministic verification loop ->
 PyBoy -> Memory/Screen readers -> World State -> Memory DB.
 
 The first milestone is not end-to-end game completion. It is a reliable control
@@ -157,17 +157,13 @@ pytest
 `http://127.0.0.1:8765` by default. The page displays the actual PyBoy frame,
 RAM-derived game state, current goal/action/result, visible world cells and
 path, party, inventory, agent pipeline, recent memory, and a bounded structured
-event log. It is an observer only; closing or reloading the page does not pause
-PyBoy or the agent.
+event log. Gemini's official thinking summaries are streamed into the
+`THINKING SUMMARY` inspector and recorded once per completed model call in the
+event log. A summary can remain empty when Gemini does not return one. The page
+is an observer only; closing or reloading it does not pause PyBoy or the agent.
 
 ```powershell
 .\.venv\Scripts\pokemon-adk.exe
-```
-
-For a quota-free runtime check using the deterministic planner:
-
-```powershell
-.\.venv\Scripts\pokemon-adk.exe --no-adk-model --no-control-ui --steps 1000
 ```
 
 Use `--no-dashboard` to disable the web server, or `--dashboard-host` and
@@ -278,16 +274,13 @@ For the executor, `move.target` is always a current map/world coordinate, matchi
 the collision overlay labels and `state.position`. One `move` action is bounded
 to at most 8 Dijkstra path steps.
 
-The Google ADK planner returns one of those actions directly. It may add a
-`repeat_until` RAM condition and `max_repeats` limit. Python reuses the same
-validated action without another planner call until the condition is met, the
-limit is reached, or execution is interrupted.
+The Google ADK planner returns one of those actions directly. Every plan is
+executed once, followed by a fresh RAM/GameState observation and a new planner
+call. Repeated button input is written explicitly in one ordered button array.
 
 ```json
 {
-  "action":{"type":"buttons","buttons":["a","wait"],"reason":"advance_dialog"},
-  "repeat_until":{"path":"dialog_open","equals":false},
-  "max_repeats":8
+  "action":{"type":"buttons","buttons":["a","wait","a","wait","a"],"reason":"advance_dialog_three_times"}
 }
 ```
 
@@ -326,9 +319,9 @@ $env:POKEMON_AGENT_ADK_MODEL="gemini-2.5-flash"
 
 The default ADK runner sends the latest screenshot and collision overlay to the
 planner. The model returns direct `buttons` or world-coordinate `move` JSON with
-an optional bounded repeat policy. Invalid responses fall back to one rule-based
-action. Use `--no-adk-vision` to disable image input or `--no-adk-model` to use
-deterministic action planning.
+an explicit one-shot input sequence. Invalid or unavailable LLM responses stop
+the loop with `planning_failed` without sending game input. Use
+`--no-adk-vision` to disable image input.
 
 Each ADK execution action is also written as JSONL grouped by local date:
 `logs\actions\YYYYMMDD\actions.jsonl`. Use `--action-log-dir <path>` to change
@@ -337,13 +330,12 @@ the directory or `--no-action-log` to disable this file log.
 The CLI also writes all ADK planner/interpreter events to the shared SQLite DB
 `data\adk_sessions.db`. Model context remains bounded: every five completed
 planner turns are compacted with one turn of overlap, while the result interpreter is stateless. Planner
-calls occur per action plan, while repeated actions reuse the active plan.
-Interpreter calls occur only at repeat boundaries, failures, Goal completion,
+calls occur once per executed action.
+Interpreter calls occur only at failures, Goal completion,
 or durable events; a 20-entry history limit does not
 trigger LLM calls. The complete DB trace remains available to ADK Dev UI.
-Structured `current_goal`, `active_action_plan`, `action_outcome`, `state_diff`,
-`action_history`, and the human-readable `session_dialog` are updated atomically in
-`data\adk_runtime_state.json` for Dev UI status tools.
+Structured `current_goal`, `active_action_plan`, `action_outcome`, `state_diff`, and
+`action_history` are updated atomically in `data\adk_runtime_state.json` for Dev UI status tools.
 
 For live UI refresh, realtime ticking, LLM planning, and vision together:
 
@@ -360,20 +352,19 @@ Run the ADK Web UI with Pokemon game tools:
 This starts Dev UI with the same `data\adk_sessions.db` used by
 `pokemon-adk.exe`. Open `http://localhost:8000`, select the `adk_agent` app and
 user `user`. The CLI sessions are
-`pokemon-red-safe-loop` and
+`pokemon-red-planner` and
 `pokemon-red-result-interpreter`; refresh the session list/event view while the
 CLI runs to load newly persisted model events.
 
-The root agent also exposes `agent_runtime_status`, `recent_agent_actions`, and
-`recent_session_dialog`. In Dev UI, try:
+The root agent also exposes `agent_runtime_status` and `recent_agent_actions`. In Dev UI, try:
 
 ```text
-Show the separately running CLI agent status, recent actions, and recent session dialog.
+Show the separately running CLI agent status and recent actions.
 ```
 
 ADK Web will show tool calls such as `start_game`, `observe_game`,
-`save_current_screenshot`, `move`, `buttons`, `run_rule_based_step`, and
-`recent_game_commands` in the event history. Screenshot base64 is omitted from
+`save_current_screenshot`, `move`, `buttons`, and `recent_game_commands` in the
+event history. Screenshot base64 is omitted from
 tool results by default; ask for `save_current_screenshot()` to write a PNG to
 `captures\YYYYMMDD\adk_web_HHMMSS_mmm.png`, or ask for
 `observe_game(include_screenshot_base64=true)` when you need to inspect the raw
@@ -382,9 +373,10 @@ image payload.
 ## Design Notes
 
 - The Google ADK planner produces one bounded `buttons` or `move` ActionPlan.
-- Python validates actions and owns bounded repetition, collision checks, and pathfinding.
-- RAM-derived GameState deterministically decides repeat completion and Goal success.
-- The result interpreter explains verified boundaries and proposes durable memory only.
+- Python validates each action once and owns collision checks and pathfinding.
+- RAM-derived GameState deterministically verifies action results and Goal success.
+- The Planner reads only the current map's memory through `search_memory(map_name)`.
+- The result interpreter uses `search_memory` and `save_memory`; persisted keys are always `map:<map_name>`.
 - Navigation is deterministic A* over a walkability grid.
 - Battle and dialog are isolated because they use different observations and
   menu timing than overworld movement.

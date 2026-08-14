@@ -1,27 +1,44 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Bug,
+  BrainCircuit,
+  ChevronDown,
   Gamepad2,
-  Layers3,
   ListFilter,
   MemoryStick,
   Search,
-  Waypoints,
 } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useLiveRuntime } from "./live";
 import { getGen1SpriteUrl } from "./sprites";
-import type { LiveEvent, LiveState, PartyMember, PipelineStatus, Point } from "./types";
+import type { LiveEvent, LiveState, PartyMember, Point } from "./types";
 
-const EVENT_FILTERS = ["ALL", "PLAN", "ACTION", "STATE", "VERIFY", "MEMORY", "ERROR"];
+const EVENT_FILTERS = [
+  { value: "ALL", label: "전체" },
+  { value: "PLAN", label: "계획" },
+  { value: "THINKING", label: "생각" },
+  { value: "ACTION", label: "행동" },
+  { value: "STATE", label: "상태" },
+  { value: "VERIFY", label: "검증" },
+  { value: "MEMORY", label: "기억" },
+  { value: "ERROR", label: "오류" },
+];
 
 export default function App() {
   const { state, events, connection } = useLiveRuntime();
-  const [showOverlay, setShowOverlay] = useState(false);
   const [debugMode, setDebugMode] = useState(false);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("ALL");
-  const [selectedId, setSelectedId] = useState<number | null>(null);
 
   const filteredEvents = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -32,44 +49,29 @@ export default function App() {
     });
   }, [events, filter, query]);
 
-  useEffect(() => {
-    if (!filteredEvents.length) {
-      if (selectedId !== null) setSelectedId(null);
-      return;
-    }
-    if (selectedId === null || !filteredEvents.some((event) => event.id === selectedId)) {
-      setSelectedId(filteredEvents[filteredEvents.length - 1].id);
-    }
-  }, [filteredEvents, selectedId]);
-
-  const selectedEvent = events.find((event) => event.id === selectedId) ?? null;
-
   return (
     <div className="app-shell">
       <Header state={state} connection={connection} debugMode={debugMode} setDebugMode={setDebugMode} />
       <main className="workbench">
         <div className="primary-column">
-          <GameViewport state={state} showOverlay={showOverlay} setShowOverlay={setShowOverlay} />
-          <div className="lower-inspectors">
-            <WorldMapPanel state={state} />
-            <PartyPanel state={state} />
-            <InventoryPanel state={state} />
-          </div>
+          <GameViewport state={state} />
         </div>
-        <aside className="inspector-column" aria-label="Runtime inspector">
-          <StatePanel state={state} />
-          <TaskPanel state={state} />
-          <ActionPanel state={state} />
-          <PipelinePanel state={state} />
-          <MemoryPanel state={state} />
-          {debugMode && <DebugPanel state={state} />}
+        <aside className="inspector-column" aria-label="실행 상태 점검">
+          <Card className="inspector-card">
+            <ScrollArea className="inspector-scroll">
+              <CardContent className="inspector-content">
+                <StatePanel state={state} />
+                <ActionPanel state={state} />
+                <ThinkingPanel state={state} />
+                <MemoryPanel state={state} />
+                {debugMode && <DebugPanel state={state} />}
+              </CardContent>
+            </ScrollArea>
+          </Card>
         </aside>
       </main>
       <EventWorkbench
         events={filteredEvents}
-        selectedEvent={selectedEvent}
-        selectedId={selectedId}
-        onSelect={setSelectedId}
         query={query}
         setQuery={setQuery}
         filter={filter}
@@ -97,22 +99,26 @@ function Header({
       <div className="brand-block">
         <span className="brand-mark" aria-hidden="true">R</span>
         <div>
-          <h1>POKEMON RED</h1>
-          <span>RUNTIME DEBUGGER</span>
+          <h1>포켓몬 레드</h1>
+          <span>실시간 디버거</span>
         </div>
       </div>
       <div className="header-readouts">
-        <Readout label="MAP" value={state?.game.map_name ?? "NO SIGNAL"} />
-        <Readout label="EMULATOR" value={emulatorStatus.toUpperCase()} tone={emulatorStatus === "running" ? "ok" : "warn"} />
-        <Readout label="RUNTIME" value={runtime} />
-        <Readout label="LINK" value={connection.toUpperCase()} tone={connection === "connected" ? "ok" : "error"} />
+        <Readout label="지도" value={state?.game.map_name ?? "신호 없음"} />
+        <Readout label="에뮬레이터" value={statusText(emulatorStatus)} tone={emulatorStatus === "running" ? "ok" : "warn"} />
+        <Readout label="실행 시간" value={runtime} />
+        <Readout label="연결" value={statusText(connection)} tone={connection === "connected" ? "ok" : "error"} />
       </div>
-      <div className="mode-control" aria-label="Inspector mode">
-        <button className={!debugMode ? "active" : ""} onClick={() => setDebugMode(false)}>LIVE</button>
-        <button className={debugMode ? "active" : ""} onClick={() => setDebugMode(true)}>
-          <Bug size={14} aria-hidden="true" /> DEBUG
-        </button>
-      </div>
+      <Tabs
+        value={debugMode ? "debug" : "live"}
+        onValueChange={(value) => setDebugMode(value === "debug")}
+        className="mode-tabs"
+      >
+        <TabsList aria-label="점검 모드">
+          <TabsTrigger value="live">실시간</TabsTrigger>
+          <TabsTrigger value="debug"><Bug aria-hidden="true" /> 디버그</TabsTrigger>
+        </TabsList>
+      </Tabs>
     </header>
   );
 }
@@ -121,87 +127,79 @@ function Readout({ label, value, tone = "neutral" }: { label: string; value: str
   return (
     <div className={`readout ${tone}`}>
       <span>{label}</span>
-      <strong>{value}</strong>
+      <Badge variant="outline" className="readout-value">{value}</Badge>
     </div>
   );
 }
 
-function GameViewport({
-  state,
-  showOverlay,
-  setShowOverlay,
-}: {
-  state: LiveState | null;
-  showOverlay: boolean;
-  setShowOverlay: (value: boolean) => void;
-}) {
-  const frame = showOverlay ? state?.game.overlay : state?.game.screenshot;
-  const imageUrl = frame ? `data:image/${frame.format};base64,${frame.base64}` : null;
+export function GameViewport({ state }: { state: LiveState | null }) {
+  const screenshotUrl = imageUrl(state?.game.screenshot);
+  const overlayUrl = imageUrl(state?.game.overlay);
   return (
-    <section className="panel viewport-panel">
-      <PanelHeader icon={<Gamepad2 size={15} />} title="GAME" meta={state ? `FRAME ${pad(state.emulator.frame_index, 8)}` : "WAITING"}>
-        <button
-          className={`icon-command ${showOverlay ? "selected" : ""}`}
-          onClick={() => setShowOverlay(!showOverlay)}
-          aria-pressed={showOverlay}
-          title="Toggle collision and coordinate overlay"
-        >
-          <Layers3 size={16} aria-hidden="true" />
-          <span>OVERLAY</span>
-        </button>
-      </PanelHeader>
-      <div className="viewport-stage">
-        <div className="viewport-ruler ruler-x"><span>00</span><span>08</span><span>16</span><span>20</span></div>
-        <div className="viewport-ruler ruler-y"><span>00</span><span>06</span><span>12</span><span>18</span></div>
-        <div className="game-frame">
-          {imageUrl ? (
-            <img src={imageUrl} alt="Live Pokemon Red PyBoy frame" width={160} height={144} />
-          ) : (
-            <div className="no-frame"><span>NO VIDEO SIGNAL</span><small>Waiting for PokemonSession</small></div>
-          )}
+    <Card className="panel viewport-panel">
+      <PanelHeader icon={<Gamepad2 size={15} />} title="게임 화면" meta={state ? `프레임 ${pad(state.emulator.frame_index, 8)}` : "대기 중"} />
+      <div className="viewport-stage viewport-stage-dual">
+        <ViewportFeed label="현재 화면" imageUrl={screenshotUrl} alt="실시간 포켓몬 레드 게임 화면" />
+        <div className="viewport-side-column">
+          <ViewportFeed compact label="충돌 영역 + 월드 좌표" imageUrl={overlayUrl} alt="실시간 충돌 영역과 월드 좌표 오버레이" />
+          <PartyPanel state={state} />
         </div>
       </div>
-      <div className="viewport-footer">
-        <span>160 x 144</span>
-        <span>NEAREST-NEIGHBOR</span>
-        <span>{showOverlay ? "COLLISION OVERLAY" : "RAW FRAME"}</span>
+    </Card>
+  );
+}
+
+function ViewportFeed({
+  label,
+  imageUrl,
+  alt,
+  compact = false,
+}: {
+  label: string;
+  imageUrl: string | null;
+  alt: string;
+  compact?: boolean;
+}) {
+  return (
+    <div className={`viewport-feed${compact ? " viewport-feed-compact" : ""}`}>
+      <div className="viewport-feed-label"><span>{label}</span><i aria-hidden="true" /></div>
+      <div className="game-frame">
+        {imageUrl ? (
+          <img src={imageUrl} alt={alt} width={160} height={144} />
+        ) : (
+          <div className="no-frame"><span>게임 화면 신호 없음</span><small>PokemonSession을 기다리는 중</small></div>
+        )}
       </div>
-    </section>
+    </div>
   );
 }
 
-function StatePanel({ state }: { state: LiveState | null }) {
+export function StatePanel({ state }: { state: LiveState | null }) {
   const game = state?.game;
+  const cells: Array<[string, unknown]> = [
+    ["지도", game?.map_name],
+    ["지도 ID", game?.map_id],
+    ["현재 좌표", pointText(game?.position)],
+    ["바라보는 방향", directionText(game?.facing)],
+    ["게임 모드", modeText(game?.mode)],
+    ["대화", game?.dialog_open ? "열림" : "닫힘"],
+    ["전투", game?.in_battle ? "진행 중" : "없음"],
+    ["파티", `${game?.party.length ?? 0} / 6`],
+    ["배지", `${game?.badges?.length ?? 0} / 8`],
+  ];
   return (
-    <InspectorSection title="STATE">
-      <DataRows rows={[
-        ["MAP", game?.map_name],
-        ["MAP ID", game?.map_id],
-        ["POSITION", pointText(game?.position)],
-        ["FACING", game?.facing],
-        ["MODE", game?.mode],
-        ["DIALOG", game?.dialog_open ? "OPEN" : "CLOSED"],
-        ["BATTLE", game?.in_battle ? "ACTIVE" : "NONE"],
-      ]} />
-      {game?.dialog_open && game.dialog_text && <div className="dialog-readout">{game.dialog_text}</div>}
-    </InspectorSection>
-  );
-}
-
-function TaskPanel({ state }: { state: LiveState | null }) {
-  const task = state?.agent.task;
-  return (
-    <InspectorSection title="TASK" accent>
-      {task ? (
-        <>
-          <div className="task-name">{task.description || task.id}</div>
-          <DataRows rows={[
-            ["STATUS", task.status],
-            ["ATTEMPT", task.attempt],
-            ["STEP", task.max_steps ? `${task.step} / ${task.max_steps}` : task.step],
-          ]} />
-        </>
-      ) : <EmptyLine value="No active task" />}
+    <InspectorSection title="현재 상태">
+      <dl className="state-grid">
+        {cells.map(([label, value]) => (
+          <div className="state-cell" key={label}>
+            <dt>{label}</dt>
+            <dd>{displayValue(value)}</dd>
+          </div>
+        ))}
+      </dl>
+      {game?.dialog_open && game.dialog_text && (
+        <div className="dialog-readout"><Badge variant="outline">대화</Badge>{game.dialog_text}</div>
+      )}
     </InspectorSection>
   );
 }
@@ -212,83 +210,52 @@ function ActionPanel({ state }: { state: LiveState | null }) {
   const actionType = String(action?.type ?? "IDLE").toUpperCase();
   const actionValue = actionType === "MOVE" ? pointText(action?.target) : listText(action?.buttons);
   return (
-    <InspectorSection title="ACTION">
-      <div className="action-command"><span>{actionType}</span><strong>{actionValue}</strong></div>
+    <InspectorSection title="현재 행동">
+      <div className="action-command">
+        <Badge variant="secondary">{actionTypeText(actionType)}</Badge>
+        <strong>{actionValue}</strong>
+      </div>
       <DataRows rows={[
-        ["RESULT", result?.status ?? result?.stop_reason ?? "WAITING"],
-        ["REASON", action?.reason],
+        ["결과", statusText(String(result?.status ?? result?.stop_reason ?? "waiting"))],
+        ["이유", action?.reason],
       ]} />
     </InspectorSection>
   );
 }
 
-function PipelinePanel({ state }: { state: LiveState | null }) {
-  const pipeline = state?.agent.pipeline ?? {};
-  const stages = ["planner", "executor", "verifier", "interpreter", "memory"];
+export function ThinkingPanel({ state }: { state: LiveState | null }) {
+  const thinking = state?.agent.thinking;
+  const hasSummary = Boolean(thinking?.summary);
   return (
-    <InspectorSection title="PIPELINE">
-      <div className="pipeline">
-        {stages.map((stage) => <PipelineStage key={stage} name={stage} status={pipeline[stage] ?? "idle"} />)}
-      </div>
-      <div className="metric-strip">
-        <span>P <b>{state?.agent.planner_calls ?? 0}</b></span>
-        <span>E <b>{state?.agent.executor_actions ?? 0}</b></span>
-        <span>I <b>{state?.agent.interpreter_calls ?? 0}</b></span>
-      </div>
+    <InspectorSection title="생각 요약" icon={<BrainCircuit size={14} />}>
+      {hasSummary ? (
+        <div className="thinking-summary">
+          <div className="thinking-summary-meta">
+            <Badge variant="outline">{agentText(thinking?.agent)}</Badge>
+            <Badge variant={thinking?.status === "streaming" ? "secondary" : "outline"}>
+              {statusText(thinking?.status ?? "idle")}
+            </Badge>
+          </div>
+          <ScrollArea className="thinking-summary-scroll">
+            <p>{thinking?.summary}</p>
+          </ScrollArea>
+        </div>
+      ) : <EmptyLine value="아직 Gemini 생각 요약이 없습니다" />}
     </InspectorSection>
   );
 }
 
-function PipelineStage({ name, status }: { name: string; status: PipelineStatus }) {
-  return (
-    <div className={`pipeline-stage ${status}`}>
-      <span className="pipeline-symbol">{status === "complete" ? "✓" : status === "active" ? "●" : "○"}</span>
-      <span>{name.toUpperCase()}</span>
-    </div>
-  );
-}
-
-function WorldMapPanel({ state }: { state: LiveState | null }) {
-  const rows = state?.navigation.visible_cells ?? [];
-  const player = state?.navigation.player;
-  const target = state?.navigation.target;
-  const path = new Set((state?.navigation.path ?? []).map(pointKey));
-  const hasCells = rows.some((row) => row.length > 0);
-  return (
-    <section className="panel compact-panel map-panel">
-      <PanelHeader icon={<Waypoints size={15} />} title="WORLD MAP" meta={state?.game.map_name ?? "NO MAP"} />
-      {hasCells ? (
-        <div className="world-grid" style={{ gridTemplateColumns: `repeat(${Math.max(...rows.map((row) => row.length))}, 1fr)` }}>
-          {rows.flat().map((cell) => {
-            const isPlayer = samePoint(cell, player);
-            const isTarget = samePoint(cell, target);
-            const onPath = path.has(pointKey(cell));
-            return (
-              <div
-                key={`${cell.x}:${cell.y}`}
-                className={`world-cell ${cell.walkable ? "walkable" : "blocked"} ${onPath ? "path" : ""} ${isPlayer ? "player" : ""} ${isTarget ? "target" : ""}`}
-                title={`World (${cell.x}, ${cell.y}) ${cell.walkable ? "walkable" : "blocked"}`}
-              >
-                {isPlayer ? "P" : isTarget ? "T" : onPath ? "·" : ""}
-              </div>
-            );
-          })}
-        </div>
-      ) : <EmptyLine value="Map data unavailable" />}
-      <div className="map-legend"><span><i className="player-key" /> PLAYER</span><span><i className="target-key" /> TARGET</span><span><i className="path-key" /> PATH</span></div>
-    </section>
-  );
-}
-
-function PartyPanel({ state }: { state: LiveState | null }) {
+export function PartyPanel({ state }: { state: LiveState | null }) {
   const party = state?.game.party ?? [];
   return (
-    <section className="panel compact-panel party-panel">
-      <PanelHeader title="PARTY" meta={`${party.length} / 6`} />
-      <div className="party-list">
-        {party.length ? party.map((member, index) => <PartyRow member={member} key={`${member.species_id}:${index}`} />) : <EmptyLine value="Party data unavailable" />}
+    <section className="party-panel" aria-label="파티 정보">
+      <div className="party-panel-header">
+        <strong>파티</strong>
+        <Badge variant="outline">{party.length} / 6</Badge>
       </div>
-      <div className="sprite-credit">SPRITES: POKEAPI GEN I RED/BLUE</div>
+      <div className="party-list">
+        {party.length ? party.map((member, index) => <PartyRow member={member} key={`${member.species_id}:${index}`} />) : <EmptyLine value="파티 데이터가 없습니다" />}
+      </div>
     </section>
   );
 }
@@ -300,28 +267,14 @@ export function PartyRow({ member }: { member: PartyMember }) {
   return (
     <div className="party-row">
       <div className="sprite-box">
-        {sprite ? <img src={sprite} alt={`${member.species} Generation I sprite`} onError={() => setFailed(true)} /> : <span>?</span>}
+        {sprite ? <img src={sprite} alt={`${member.species} 1세대 스프라이트`} onError={() => setFailed(true)} /> : <span>?</span>}
       </div>
       <div className="party-data">
-        <div><strong>{member.nickname || member.species}</strong><span>Lv {member.level ?? "?"}</span></div>
-        <div className="hp-line"><span>HP {member.hp ?? "?"} / {member.max_hp ?? "?"}</span><span>{member.status || "OK"}</span></div>
-        <div className="hp-track"><i style={{ width: `${hpPercent}%` }} /></div>
+        <div><strong>{member.nickname || member.species}</strong><span>레벨 {member.level ?? "?"}</span></div>
+        <div className="hp-line"><span>체력 {member.hp ?? "?"} / {member.max_hp ?? "?"}</span><span>{member.status || "정상"}</span></div>
+        <Progress className="hp-track" value={hpPercent} aria-label={`${member.nickname || member.species} 체력`} />
       </div>
     </div>
-  );
-}
-
-function InventoryPanel({ state }: { state: LiveState | null }) {
-  const items = state?.game.items ?? [];
-  return (
-    <section className="panel compact-panel inventory-panel">
-      <PanelHeader title="INVENTORY" meta={`${items.length} SLOTS`} />
-      <div className="inventory-list">
-        {items.length ? items.map((item, index) => (
-          <div className="inventory-row" key={`${item.item_id}:${index}`}><span>{item.name}</span><strong>x{item.quantity}</strong></div>
-        )) : <EmptyLine value="No items read" />}
-      </div>
-    </section>
   );
 }
 
@@ -329,12 +282,14 @@ function MemoryPanel({ state }: { state: LiveState | null }) {
   const recent = state?.memory.recent ?? [];
   const activity = state?.memory.last_activity;
   return (
-    <InspectorSection title="MEMORY" icon={<MemoryStick size={14} />}>
-      {activity && <div className="memory-activity"><span>{activity.type.toUpperCase()}</span>{activity.keys.join(", ")}</div>}
+    <InspectorSection title="장기 기억" icon={<MemoryStick size={14} />}>
+      {activity && (
+        <div className="memory-activity"><Badge variant="secondary">{memoryActivityText(activity.type)}</Badge>{activity.keys.join(", ")}</div>
+      )}
       <div className="memory-list">
         {recent.length ? recent.slice(0, 3).map((item) => (
           <div key={item.key}><strong>{item.key}</strong><span>{formatMemoryValue(item.value)}</span></div>
-        )) : <EmptyLine value="No memory activity" />}
+        )) : <EmptyLine value="기억 활동이 없습니다" />}
       </div>
     </InspectorSection>
   );
@@ -342,88 +297,87 @@ function MemoryPanel({ state }: { state: LiveState | null }) {
 
 function DebugPanel({ state }: { state: LiveState | null }) {
   return (
-    <InspectorSection title="DEBUG" icon={<Bug size={14} />}>
-      <details open><summary>STATE DIFF</summary><JsonBlock value={state?.debug.state_diff} /></details>
-      <details><summary>ACTION OUTCOME</summary><JsonBlock value={state?.debug.action_outcome} /></details>
-      <details><summary>RAM</summary><JsonBlock value={state?.debug.ram} /></details>
-      <details><summary>SCREEN</summary><JsonBlock value={state?.debug.screenshot_metadata} /></details>
+    <InspectorSection title="디버그" icon={<Bug size={14} />}>
+      <DebugDisclosure label="상태 변화" value={state?.debug.state_diff} defaultOpen />
+      <DebugDisclosure label="행동 결과" value={state?.debug.action_outcome} />
+      <DebugDisclosure label="RAM" value={state?.debug.ram} />
+      <DebugDisclosure label="화면 정보" value={state?.debug.screenshot_metadata} />
     </InspectorSection>
+  );
+}
+
+function DebugDisclosure({ label, value, defaultOpen = false }: { label: string; value: unknown; defaultOpen?: boolean }) {
+  return (
+    <Collapsible defaultOpen={defaultOpen} className="debug-disclosure">
+      <CollapsibleTrigger asChild>
+        <Button variant="ghost" size="sm" className="debug-trigger">
+          {label}<ChevronDown aria-hidden="true" />
+        </Button>
+      </CollapsibleTrigger>
+      <CollapsibleContent><JsonBlock value={value} /></CollapsibleContent>
+    </Collapsible>
   );
 }
 
 function EventWorkbench({
   events,
-  selectedEvent,
-  selectedId,
-  onSelect,
   query,
   setQuery,
   filter,
   setFilter,
 }: {
   events: LiveEvent[];
-  selectedEvent: LiveEvent | null;
-  selectedId: number | null;
-  onSelect: (id: number) => void;
   query: string;
   setQuery: (value: string) => void;
   filter: string;
   setFilter: (value: string) => void;
 }) {
   return (
-    <section className="event-workbench">
+    <Card className="event-workbench">
       <div className="event-console">
         <div className="event-toolbar">
-          <div className="event-title"><ListFilter size={15} /> EVENT LOG <span>{events.length}</span></div>
-          <label className="search-control"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter events" /></label>
-          <select value={filter} onChange={(event) => setFilter(event.target.value)} aria-label="Event type filter">
-            {EVENT_FILTERS.map((value) => <option key={value}>{value}</option>)}
-          </select>
+          <div className="event-title">
+            <ListFilter size={15} />
+            이벤트 기록
+            <Badge variant="secondary">{events.length}</Badge>
+          </div>
+          <label className="search-control"><Search size={14} /><Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="이벤트 검색" /></label>
+          <Select value={filter} onValueChange={setFilter}>
+            <SelectTrigger size="sm" aria-label="이벤트 유형 필터"><SelectValue /></SelectTrigger>
+            <SelectContent>{EVENT_FILTERS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+          </Select>
         </div>
-        <div className="event-columns event-columns-header"><span>TIME</span><span>TYPE</span><span>MESSAGE</span><span>SOURCE</span></div>
-        <div className="event-scroll" role="log" aria-live="polite">
+        <div className="event-columns event-columns-header"><span>시간</span><span>유형</span><span>메시지</span><span>출처</span></div>
+        <ScrollArea className="event-scroll" role="log" aria-live="polite">
           {events.length ? events.map((event) => (
-            <button key={event.id} className={`event-columns event-row ${selectedId === event.id ? "selected" : ""}`} onClick={() => onSelect(event.id)}>
+            <div key={event.id} className="event-columns event-row">
               <time>{formatTime(event.timestamp)}</time>
-              <span className={`event-type ${eventGroup(event.type).toLowerCase()}`}>{event.type}</span>
-              <span>{event.message}</span>
-              <span>{event.source}</span>
-            </button>
-          )) : <div className="event-empty">Waiting for structured runtime events.</div>}
-        </div>
+              <Badge variant="outline" className={`event-type ${eventGroup(event.type).toLowerCase()}`} title={event.type}>{eventTypeText(event.type)}</Badge>
+              <span title={event.message}>{eventMessageText(event.message)}</span>
+              <span title={event.source}>{sourceText(event.source)}</span>
+            </div>
+          )) : <div className="event-empty">구조화된 실행 이벤트를 기다리는 중입니다.</div>}
+        </ScrollArea>
       </div>
-      <div className="event-detail">
-        <div className="detail-header"><span>EVENT DETAIL</span>{selectedEvent && <strong>#{pad(selectedEvent.id, 4)}</strong>}</div>
-        {selectedEvent ? (
-          <>
-            <DataRows rows={[
-              ["TIMESTAMP", formatTime(selectedEvent.timestamp, true)],
-              ["TYPE", selectedEvent.type],
-              ["SOURCE", selectedEvent.source],
-              ["MESSAGE", selectedEvent.message],
-            ]} />
-            <JsonBlock value={selectedEvent.payload} />
-          </>
-        ) : <EmptyLine value="Select an event" />}
-      </div>
-    </section>
+    </Card>
   );
 }
 
 function PanelHeader({ icon, title, meta, children }: { icon?: ReactNode; title: string; meta?: string; children?: ReactNode }) {
   return (
-    <div className="panel-header">
-      <div>{icon}{title}</div>
-      <div className="panel-header-actions">{meta && <span>{meta}</span>}{children}</div>
-    </div>
+    <CardHeader className="panel-header">
+      <CardTitle>{icon}{title}</CardTitle>
+      <CardAction className="panel-header-actions">{meta && <Badge variant="outline">{meta}</Badge>}{children}</CardAction>
+    </CardHeader>
   );
 }
 
-function InspectorSection({ title, icon, accent = false, children }: { title: string; icon?: ReactNode; accent?: boolean; children: ReactNode }) {
+function InspectorSection({ title, icon, children }: { title: string; icon?: ReactNode; children: ReactNode }) {
   return (
-    <section className={`inspector-section ${accent ? "accent" : ""}`}>
+    <section className="inspector-section">
       <h2>{icon}{title}</h2>
       {children}
+      <Separator className="inspector-separator" />
     </section>
   );
 }
@@ -433,18 +387,22 @@ function DataRows({ rows }: { rows: Array<[string, unknown]> }) {
 }
 
 function JsonBlock({ value }: { value: unknown }) {
-  return <pre className="json-block">{value ? JSON.stringify(value, null, 2) : "NO DATA"}</pre>;
+  return <pre className="json-block">{value ? JSON.stringify(value, null, 2) : "데이터 없음"}</pre>;
 }
 
 function EmptyLine({ value }: { value: string }) {
   return <div className="empty-line">{value}</div>;
 }
 
+function imageUrl(frame: { format: string; base64: string } | null | undefined): string | null {
+  return frame ? `data:image/${frame.format};base64,${frame.base64}` : null;
+}
+
 function displayValue(value: unknown): string {
   if (value === null || value === undefined || value === "") return "--";
-  if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
+  if (typeof value === "boolean") return value ? "예" : "아니요";
   if (typeof value === "object") return JSON.stringify(value);
-  return String(value).toUpperCase();
+  return String(value);
 }
 
 function pointText(value: unknown): string {
@@ -457,7 +415,7 @@ function pointText(value: unknown): string {
 }
 
 function listText(value: unknown): string {
-  return Array.isArray(value) ? value.map(String).join(" ").toUpperCase() : "--";
+  return Array.isArray(value) ? value.map((button) => buttonText(String(button))).join(" · ") : "--";
 }
 
 function formatMemoryValue(value: unknown): string {
@@ -465,15 +423,160 @@ function formatMemoryValue(value: unknown): string {
   return String(value ?? "");
 }
 
-function pointKey(value: Point): string {
-  return `${value.x}:${value.y}`;
+function buttonText(value: string): string {
+  const labels: Record<string, string> = {
+    a: "A",
+    b: "B",
+    start: "START",
+    select: "SELECT",
+    up: "위",
+    down: "아래",
+    left: "왼쪽",
+    right: "오른쪽",
+    wait: "기다리기",
+  };
+  return labels[value.toLowerCase()] ?? value;
 }
 
-function samePoint(a: Point | null | undefined, b: Point | null | undefined): boolean {
-  return Boolean(a && b && a.x === b.x && a.y === b.y);
+function actionTypeText(value: string): string {
+  const labels: Record<string, string> = {
+    MOVE: "이동",
+    BUTTONS: "버튼",
+    WAIT: "기다리기",
+    IDLE: "대기",
+  };
+  return labels[value] ?? value;
+}
+
+function directionText(value: string | null | undefined): string {
+  const labels: Record<string, string> = {
+    up: "위",
+    down: "아래",
+    left: "왼쪽",
+    right: "오른쪽",
+  };
+  return value ? labels[value.toLowerCase()] ?? value : "--";
+}
+
+function modeText(value: string | null | undefined): string {
+  const labels: Record<string, string> = {
+    explore: "탐색",
+    overworld: "필드",
+    dialog: "대화",
+    battle: "전투",
+    menu: "메뉴",
+    unknown: "알 수 없음",
+  };
+  return value ? labels[value.toLowerCase()] ?? value : "--";
+}
+
+function statusText(value: string): string {
+  const labels: Record<string, string> = {
+    active: "진행 중",
+    complete: "완료",
+    connected: "연결됨",
+    connecting: "연결 중",
+    disconnected: "연결 끊김",
+    failed: "실패",
+    idle: "대기",
+    interrupted_battle: "전투로 중단",
+    interrupted_dialog: "대화로 중단",
+    interrupted_menu: "메뉴로 중단",
+    movement_blocked: "이동 불가",
+    movement_progress: "이동 중",
+    no_path: "경로 없음",
+    planned_path_exhausted: "경로 실행 완료",
+    realtime_ticker_stopped: "실시간 틱 중단",
+    running: "실행 중",
+    single_action_complete: "행동 완료",
+    stopped: "중지됨",
+    streaming: "생성 중",
+    success: "성공",
+    target_reached: "목표 도착",
+    waiting: "대기 중",
+  };
+  return labels[value.toLowerCase()] ?? value.replaceAll("_", " ");
+}
+
+function agentText(value: "planner" | "interpreter" | null | undefined): string {
+  if (value === "planner") return "플래너";
+  if (value === "interpreter") return "결과 해석기";
+  return "모델";
+}
+
+function memoryActivityText(value: string): string {
+  const labels: Record<string, string> = {
+    read: "읽기",
+    search: "검색",
+    search_memory: "검색",
+    save: "저장",
+    save_memory: "저장",
+    write: "저장",
+  };
+  return labels[value.toLowerCase()] ?? value;
+}
+
+function eventTypeText(type: string): string {
+  const exact: Record<string, string> = {
+    THINKING_SUMMARY: "생각 요약",
+    PLANNING_ERROR: "계획 오류",
+    EXECUTION_ERROR: "실행 오류",
+    INTERPRETATION_ERROR: "해석 오류",
+  };
+  if (exact[type]) return exact[type];
+  const labels: Record<string, string> = {
+    PLAN: "계획",
+    THINKING: "생각",
+    ACTION: "행동",
+    STATE: "상태",
+    VERIFY: "검증",
+    MEMORY: "기억",
+    ERROR: "오류",
+  };
+  return labels[eventGroup(type)] ?? type;
+}
+
+function eventMessageText(message: string): string {
+  if (message.startsWith("Verifier: ")) {
+    return `검증: ${statusText(message.slice("Verifier: ".length).replaceAll(" ", "_"))}`;
+  }
+  const replacements: Array<[RegExp, string]> = [
+    [/^Plan MOVE to /, "이동 계획: "],
+    [/^Plan BUTTONS /, "버튼 계획: "],
+    [/^Executed MOVE to /, "이동 실행: "],
+    [/^Executed BUTTONS /, "버튼 실행: "],
+    [/^Goal completed: /, "목표 완료: "],
+    [/^Action result interpreted$/, "행동 결과 해석 완료"],
+    [/^Planner thinking summary$/, "플래너 생각 요약"],
+    [/^Interpreter thinking summary$/, "결과 해석기 생각 요약"],
+    [/^Dashboard listening at /, "대시보드 실행 중: "],
+  ];
+  for (const [pattern, replacement] of replacements) {
+    if (pattern.test(message)) return message.replace(pattern, replacement);
+  }
+  const memoryRead = message.match(/^Read (\d+) relevant memory entr(?:y|ies)$/);
+  if (memoryRead) return `관련 기억 ${memoryRead[1]}개 읽음`;
+  const memoryUpdated = message.match(/^Updated (\d+) memory entr(?:y|ies)$/);
+  if (memoryUpdated) return `기억 ${memoryUpdated[1]}개 갱신`;
+  return message;
+}
+
+function sourceText(source: string): string {
+  const labels: Record<string, string> = {
+    agent: "에이전트",
+    dashboard: "대시보드",
+    executor: "실행기",
+    game: "게임",
+    interpreter: "결과 해석기",
+    memory: "기억",
+    planner: "플래너",
+    verifier: "검증기",
+  };
+  return labels[source.toLowerCase()] ?? source;
 }
 
 function eventGroup(type: string): string {
+  if (type.includes("THINKING")) return "THINKING";
   if (type.includes("PLAN") || type.includes("TASK") || type.includes("GOAL")) return "PLAN";
   if (type.includes("ACTION") || type.includes("BUTTON") || type.includes("MOVE")) return "ACTION";
   if (type.includes("VERIFICATION")) return "VERIFY";
