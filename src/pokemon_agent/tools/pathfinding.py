@@ -65,6 +65,8 @@ def dijkstra(
     start: GridPoint,
     goal: GridPoint,
     walkable_grid: Sequence[Sequence[int]],
+    *,
+    blocked_edges: set[tuple[GridPoint, GridPoint]] | None = None,
 ) -> list[GridPoint]:
     width = len(walkable_grid[0]) if walkable_grid else 0
     height = len(walkable_grid)
@@ -97,6 +99,8 @@ def dijkstra(
         for neighbor in neighbors(current, width, height):
             if not is_walkable(neighbor):
                 continue
+            if blocked_edges is not None and (current, neighbor) in blocked_edges:
+                continue
             new_cost = cost_so_far[current] + 1
             if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
                 cost_so_far[neighbor] = new_cost
@@ -113,6 +117,8 @@ def dijkstra(
 def reachable_distances(
     start: GridPoint,
     walkable_grid: Sequence[Sequence[int]],
+    *,
+    blocked_edges: set[tuple[GridPoint, GridPoint]] | None = None,
 ) -> dict[GridPoint, int]:
     width = len(walkable_grid[0]) if walkable_grid else 0
     height = len(walkable_grid)
@@ -135,6 +141,8 @@ def reachable_distances(
 
         for neighbor in neighbors(current, width, height):
             if not walkable_grid[neighbor.y][neighbor.x]:
+                continue
+            if blocked_edges is not None and (current, neighbor) in blocked_edges:
                 continue
             new_cost = current_cost + 1
             if neighbor not in distances or new_cost < distances[neighbor]:

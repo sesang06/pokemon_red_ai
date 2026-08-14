@@ -114,6 +114,12 @@ def summarize_result(result: Any) -> str:
     if not isinstance(result, dict):
         return type(result).__name__
 
+    if "waited" in result:
+        return _trim(
+            f"waited={result.get('waited')}, elapsed_ms={result.get('elapsed_ms')}, "
+            f"stop_reason={result.get('stop_reason')}"
+        )
+
     if "stop_reason" in result:
         actions = _action_buttons(result.get("executed_actions"))
         return _trim(

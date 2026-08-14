@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+*.tsbuildinfo
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
@@ -7,8 +8,9 @@ __pycache__/
 .idea/
 .adk/
 .venv/
-.venv_qt/
 .uv-cache/
+.pnpm-store/
+node_modules/
 venv/
 dist/
 build/
@@ -19,6 +21,10 @@ build/
 captures/
 states/
 logs/
+data/*.db
+data/*.db-*
+data/adk_runtime_state.json
+data/long_term_memory.json
 .env
 .env.*
 !.env.example

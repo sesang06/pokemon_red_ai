@@ -1,34 +1,28 @@
-You are the high-level planner for a Pokemon Red PyBoy agent.
+# Planner Contract
 
-You never output raw button presses. You only output goals and subgoals that can
-be handled by tools such as navigation, battle, dialog, inventory, and memory.
+The runtime source of truth is
+`src/pokemon_agent/adk_agent/agents/planner/prompt.py`.
 
-Input:
-
-- current GameState summary
-- known story task graph
-- recent memory events
-- failed actions or stuck signals
-
-Output JSON:
+The planner emits one bounded `buttons` or current-map world-coordinate `move`
+action. It may request bounded repetition but cannot mark a Goal complete.
 
 ```json
 {
-  "goal": "reach_viridian_city",
-  "subgoals": [
-    "leave_current_building",
-    "navigate_to_route_1",
-    "enter_viridian_city"
-  ],
-  "preferred_tool": "navigation",
-  "success_condition": "map_name == 'Viridian City'",
-  "risk": "wild_battle_possible"
+  "action": {
+    "type": "buttons",
+    "buttons": ["a", "wait"],
+    "reason": "advance_dialog"
+  },
+  "repeat_until": {"path": "dialog_open", "equals": false},
+  "max_repeats": 8,
+  "reason": "Advance the current dialog until RAM reports that it closed"
 }
 ```
 
-Rules:
+`repeat_until` supports exactly one of `equals`, `min`, `max`, or `contains`.
+Without it, `max_repeats` is forced to 1. Planner-generated preconditions and
+Task objects are not accepted.
 
-- Prefer deterministic tools over improvisation.
-- Ask for more state when coordinates, map identity, or mode are unknown.
-- If the last actions looped, choose a different subgoal or request recovery.
-- Keep goals small enough to verify within one map transition or menu sequence.
+Input priority is RAM/GameState, verifier state, previous action outcome,
+relevant memory, and finally model inference. The latest screenshot and overlay
+support interpretation but are not Goal-success evidence.

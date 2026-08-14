@@ -1,11 +1,39 @@
 from __future__ import annotations
 
-from pokemon_agent.adk_agent.adk_planner import _event_text, _parse_json_object
-from pokemon_agent.adk_agent.planning import sanitize_planned_action
+import asyncio
+import json
+
+from pokemon_agent.adk_agent.agents.planner.agent import (
+    GoogleAdkPlanner,
+    _strip_prior_media_from_session_service,
+)
+from pokemon_agent.adk_agent.agents.interpreter.agent import GoogleAdkResultInterpreter
+from pokemon_agent.adk_agent.agents.planner.schema import (
+    compact_state_for_prompt,
+    normalize_action_plan,
+    rule_based_plan,
+    sanitize_planned_action,
+    select_walkable_world_target,
+)
+from pokemon_agent.adk_agent.agents.shared import (
+    event_finish_reason,
+    event_text,
+    invalid_response_error,
+    parse_json_object,
+)
+from pokemon_agent.adk_agent.runtime.history import RESULT_INTERPRETER_PRIOR_TURNS
+from pokemon_agent.adk_agent.runtime.session import (
+    ADK_WEB_APP_NAME,
+    DEFAULT_COMPACTION_INTERVAL,
+    DEFAULT_COMPACTION_OVERLAP_SIZE,
+    ContextFilteringSqliteSessionService,
+    build_events_compaction_config,
+)
+from pokemon_agent.input_contract import MAX_BUTTONS_PER_ACTION, MAX_MOVE_PATH_STEPS
 
 
 class FakePart:
-    text = '{"type":"step_frames","frames":5}'
+    text = '{"type":"buttons","buttons":["wait"]}'
 
 
 class FakeContent:
@@ -17,33 +45,699 @@ class FakeEvent:
 
 
 def test_adk_event_text_extracts_content_parts() -> None:
-    assert _event_text(FakeEvent()) == '{"type":"step_frames","frames":5}'
+    assert event_text(FakeEvent()) == '{"type":"buttons","buttons":["wait"]}'
 
 
 def test_adk_parse_json_object_handles_markdown_fence() -> None:
-    assert _parse_json_object('```json\n{"type":"press_button","button":"a"}\n```') == {
-        "type": "press_button",
-        "button": "a",
+    assert parse_json_object('```json\n{"type":"buttons","buttons":["a"]}\n```') == {
+        "type": "buttons",
+        "buttons": ["a"],
     }
 
 
-def test_sanitize_planned_action_rejects_out_of_bounds_target() -> None:
-    assert sanitize_planned_action({"type": "move_to_screen_tile", "target_x": 40, "target_y": 8}) is None
+def test_adk_planner_budget_and_truncation_diagnostics() -> None:
+    class TruncatedEvent:
+        finish_reason = "MAX_TOKENS"
+
+    assert GoogleAdkPlanner.max_output_tokens == 4096
+    assert event_finish_reason(TruncatedEvent()) == "MAX_TOKENS"
+    assert invalid_response_error('{"goal":"safe_loop"', finish_reason="MAX_TOKENS") == (
+        "invalid_json_response (finish_reason=MAX_TOKENS, chars=19)"
+    )
 
 
-def test_sanitize_planned_action_limits_execute_actions() -> None:
-    action = sanitize_planned_action(
+def test_adk_planner_uses_sse_streaming_by_default() -> None:
+    planner = GoogleAdkPlanner()
+
+    assert planner.stream_output is True
+    assert planner.run_config.streaming_mode.value == "sse"
+    assert planner.runner.app is planner.app
+    assert planner.app.events_compaction_config.compaction_interval == 5
+    assert planner.app.events_compaction_config.overlap_size == 1
+    assert planner.app.events_compaction_config.token_threshold is None
+
+
+def test_adk_planner_prints_partial_tokens_and_parses_final_json(capsys) -> None:
+    class StreamPart:
+        def __init__(self, text: str):
+            self.text = text
+
+    class StreamContent:
+        def __init__(self, text: str):
+            self.parts = [StreamPart(text)]
+
+    class StreamEvent:
+        def __init__(self, text: str, *, partial: bool, finish_reason=None):
+            self.content = StreamContent(text)
+            self.partial = partial
+            self.finish_reason = finish_reason
+
+        def is_final_response(self):
+            return not self.partial
+
+    class StreamRunner:
+        async def run_async(self, **kwargs):
+            assert kwargs["run_config"] == "sse-config"
+            yield StreamEvent('{"goal":"safe', partial=True)
+            yield StreamEvent('_loop"}', partial=True)
+            yield StreamEvent('{"goal":"safe_loop"}', partial=False, finish_reason="STOP")
+
+    planner = GoogleAdkPlanner.__new__(GoogleAdkPlanner)
+    planner._session_created = True
+    planner.session_service = type("SessionService", (), {"sessions": {}})()
+    planner.app_name = "app"
+    planner.user_id = "user"
+    planner.session_id = "session"
+    planner.include_screenshot = False
+    planner.stream_output = True
+    planner.run_config = "sse-config"
+    planner.runner = StreamRunner()
+
+    result = asyncio.run(planner.plan_async({"observation": {"state": {}}}))
+
+    assert result == {"goal": "safe_loop", "source": "adk"}
+    assert capsys.readouterr().out == '[llm-stream pokemon_red_planner] {"goal":"safe_loop"}\n'
+
+
+def test_adk_planner_strips_prior_session_images_but_keeps_text() -> None:
+    async def build_session():
+        from google.adk.events import Event
+        from google.adk.sessions import InMemorySessionService
+        from google.genai import types
+
+        service = InMemorySessionService()
+        session = await service.create_session(app_name="app", user_id="user", session_id="session")
+        event = Event(
+            author="user",
+            content=types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(text="previous observation text"),
+                    types.Part.from_bytes(data=b"old-screenshot", mime_type="image/png"),
+                    types.Part.from_bytes(data=b"old-overlay", mime_type="image/png"),
+                ],
+            ),
+        )
+        await service.append_event(session=session, event=event)
+        return service
+
+    service = asyncio.run(build_session())
+
+    removed = _strip_prior_media_from_session_service(
+        service,
+        app_name="app",
+        user_id="user",
+        session_id="session",
+    )
+
+    session = service.sessions["app"]["user"]["session"]
+    parts = session.events[0].content.parts
+    assert removed == 2
+    assert [part.text for part in parts if getattr(part, "text", None)] == [
+        "previous observation text",
+        "[2 prior media images omitted from this request. Use only the latest screenshot and overlay attached to the current user message.]",
+    ]
+    assert all(getattr(part, "inline_data", None) is None for part in parts)
+
+
+def test_turn_compaction_runs_at_five_turn_intervals_with_one_turn_overlap() -> None:
+    async def exercise_compaction():
+        from google.adk.agents import Agent
+        from google.adk.apps.app import App
+        from google.adk.apps.compaction import _run_compaction_for_sliding_window
+        from google.adk.events import Event
+        from google.adk.events.event_actions import EventActions, EventCompaction
+        from google.adk.sessions import InMemorySessionService
+        from google.genai import types
+
+        class RecordingSummarizer:
+            def __init__(self) -> None:
+                self.ranges: list[list[str]] = []
+
+            async def maybe_summarize_events(self, *, events):
+                invocation_ids = list(dict.fromkeys(event.invocation_id for event in events))
+                self.ranges.append(invocation_ids)
+                return Event(
+                    author="user",
+                    invocation_id=Event.new_id(),
+                    timestamp=events[-1].timestamp + 0.1,
+                    actions=EventActions(
+                        compaction=EventCompaction(
+                            start_timestamp=events[0].timestamp,
+                            end_timestamp=events[-1].timestamp,
+                            compacted_content=types.Content(
+                                role="model",
+                                parts=[types.Part.from_text(text="summary")],
+                            ),
+                        )
+                    ),
+                )
+
+        summarizer = RecordingSummarizer()
+        config = build_events_compaction_config()
+        config.summarizer = summarizer
+        app = App(
+            name="test_app",
+            root_agent=Agent(name="test_agent", model="gemini-2.5-flash"),
+            events_compaction_config=config,
+        )
+        service = InMemorySessionService()
+        session = await service.create_session(app_name="test_app", user_id="user", session_id="session")
+
+        async def add_turn(turn: int) -> None:
+            invocation_id = f"inv-{turn}"
+            await service.append_event(
+                session,
+                Event(
+                    author="user",
+                    invocation_id=invocation_id,
+                    timestamp=float(turn * 10),
+                    content=types.Content(role="user", parts=[types.Part.from_text(text=f"user-{turn}")]),
+                ),
+            )
+            await service.append_event(
+                session,
+                Event(
+                    author="test_agent",
+                    invocation_id=invocation_id,
+                    timestamp=float(turn * 10 + 1),
+                    content=types.Content(role="model", parts=[types.Part.from_text(text=f"agent-{turn}")]),
+                ),
+            )
+
+        async def compact():
+            events = [
+                event
+                async for event in _run_compaction_for_sliding_window(
+                    app,
+                    session,
+                    service,
+                )
+            ]
+            for event in events:
+                await service.append_event(session, event)
+            return events
+
+        for turn in range(1, 5):
+            await add_turn(turn)
+        before_interval = await compact()
+        await add_turn(5)
+        first = await compact()
+        for turn in range(6, 10):
+            await add_turn(turn)
+        before_second_interval = await compact()
+        await add_turn(10)
+        second = await compact()
+        return summarizer.ranges, before_interval, first, before_second_interval, second
+
+    ranges, before_interval, first, before_second_interval, second = asyncio.run(exercise_compaction())
+
+    assert DEFAULT_COMPACTION_INTERVAL == 5
+    assert DEFAULT_COMPACTION_OVERLAP_SIZE == 1
+    assert before_interval == []
+    assert before_second_interval == []
+    assert len(first) == 1
+    assert len(second) == 1
+    assert ranges == [
+        ["inv-1", "inv-2", "inv-3", "inv-4", "inv-5"],
+        ["inv-5", "inv-6", "inv-7", "inv-8", "inv-9", "inv-10"],
+    ]
+
+
+def test_result_interpreter_does_not_retain_prior_session_turns() -> None:
+    assert GoogleAdkResultInterpreter.prior_session_turns == RESULT_INTERPRETER_PRIOR_TURNS == 0
+
+
+def test_shared_sqlite_preserves_full_trace_and_filters_prior_media(tmp_path) -> None:
+    async def exercise_services():
+        from google.adk.events import Event
+        from google.adk.sessions.sqlite_session_service import SqliteSessionService
+        from google.genai import types
+
+        database_path = tmp_path / "adk_sessions.db"
+        filtered = ContextFilteringSqliteSessionService(database_path, prior_turn_limit=None)
+        session = await filtered.create_session(app_name=ADK_WEB_APP_NAME, user_id="user", session_id="planner")
+        for turn in range(6):
+            await filtered.append_event(
+                session,
+                Event(
+                    author="user",
+                    content=types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_text(text=f"user-{turn}"),
+                            types.Part.from_bytes(data=f"image-{turn}".encode(), mime_type="image/png"),
+                        ],
+                    ),
+                ),
+            )
+            await filtered.append_event(
+                session,
+                Event(
+                    author="planner",
+                    content=types.Content(role="model", parts=[types.Part.from_text(text=f"agent-{turn}")]),
+                ),
+            )
+
+        filtered_session = await filtered.get_session(app_name=ADK_WEB_APP_NAME, user_id="user", session_id="planner")
+        stateless = ContextFilteringSqliteSessionService(database_path, prior_turn_limit=0)
+        stateless_session = await stateless.get_session(
+            app_name=ADK_WEB_APP_NAME,
+            user_id="user",
+            session_id="planner",
+        )
+        dev_ui_reader = SqliteSessionService(str(database_path))
+        full_session = await dev_ui_reader.get_session(app_name=ADK_WEB_APP_NAME, user_id="user", session_id="planner")
+        return filtered_session, stateless_session, full_session
+
+    filtered_session, stateless_session, full_session = asyncio.run(exercise_services())
+    assert len([event for event in filtered_session.events if event.author == "user"]) == 6
+    assert stateless_session.events == []
+    assert len([event for event in full_session.events if event.author == "user"]) == 6
+    assert not any(
+        getattr(part, "inline_data", None)
+        for event in filtered_session.events
+        for part in (event.content.parts if event.content else [])
+    )
+    assert any(
+        getattr(part, "inline_data", None)
+        for event in full_session.events
+        for part in (event.content.parts if event.content else [])
+    )
+
+
+def test_planner_payload_keeps_only_two_transitions_and_excludes_duplicate_histories() -> None:
+    payload = compact_state_for_prompt(
         {
-            "type": "execute_actions",
-            "actions": [
-                {"button": "a", "frames": 4},
-                {"button": "b", "frames": 4},
-                {"button": "left", "frames": 4},
-                {"button": "right", "frames": 4},
-                {"button": "start", "frames": 4},
-            ],
+            "history_summary": "Earlier progress summary",
+            "action_history": [{"step": step} for step in range(10)],
+            "transition_history": [{"step": step} for step in range(10)],
+            "session_dialog": [{"step": step, "content": "UI only"} for step in range(10)],
+            "interpretation": {"summary": "Duplicate task result"},
+            "observation": {"state": {}, "state_events": []},
         }
     )
 
-    assert action is not None
-    assert len(action["actions"]) == 4
+    assert payload["recent_state_transitions"] == [{"step": 8}, {"step": 9}]
+    assert "recent_actions" not in payload
+    assert "history_summary" not in payload
+    assert "last_interpretation" not in payload
+    assert "state_events" not in payload
+    assert "available_story_tasks" not in payload
+    assert "safe_neighbor_world_cells" not in payload
+    assert "recent_session_dialog" not in payload
+
+
+def test_planner_payload_removes_observation_blobs_from_history() -> None:
+    observation_blob = {
+        "state": {"map_name": "Oak's Lab", "position": {"x": 5, "y": 6}},
+        "screenshot": {"base64": "x" * 100_000},
+        "visible_world_cells": [[{"x": x, "y": y, "walkable": True} for x in range(10)] for y in range(9)],
+    }
+    payload = compact_state_for_prompt(
+        {
+            "observation": {
+                "state": {"map_name": "Oak's Lab", "position": {"x": 6, "y": 6}},
+                "walk_area_collision": [[1 for _ in range(10)] for _ in range(9)],
+            },
+            "transition_history": [
+                {
+                    "step": 7,
+                    "task_id": "explore",
+                    "action": {"type": "move", "target": [6, 6], "reason": "explore"},
+                    "before": observation_blob["state"],
+                    "after": observation_blob["state"],
+                    "state_changes": ["position_changed"],
+                    "action_status": "continue",
+                }
+            ],
+            "execution_report": {
+                "task_id": "explore",
+                "action": {"type": "move", "target": [6, 6]},
+                "before_state": observation_blob,
+                "after_state": observation_blob,
+                "result": {"stop_reason": "target_reached", "after_observation": observation_blob},
+            },
+        }
+    )
+
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    assert len(serialized) < 10_000
+    assert "base64" not in serialized
+    assert "before_observation" not in serialized
+    assert "after_observation" not in serialized
+    assert payload["recent_state_transitions"][0]["after"]["position"] == {"x": 5, "y": 6}
+
+
+def test_planner_payload_compacts_last_action_plan_and_outcome() -> None:
+    payload = compact_state_for_prompt(
+        {
+            "observation": {"state": {"map_name": "Oak's Lab", "position": {"x": 8, "y": 4}}},
+            "active_action_plan": {
+                "action": {"type": "move", "target": [8, 4], "reason": "approach_starter"},
+                "repeat_until": {"path": "position", "equals": {"x": 8, "y": 4}},
+                "repeat_count": 2,
+                "max_repeats": 3,
+                "status": "condition_met",
+            },
+            "action_outcome": {
+                "status": "condition_met",
+                "action_result": "success",
+                "state_changes": ["position_changed"],
+                "goal_completed": False,
+                "reason": "repeat_condition_met",
+            },
+            "state_diff": {"meaningful": True},
+        }
+    )
+
+    assert payload["last_action_plan"] == {
+        "action": {"type": "move", "target": [8, 4]},
+        "repeat_until": {"path": "position", "equals": {"x": 8, "y": 4}},
+        "repeat_count": 2,
+        "max_repeats": 3,
+        "status": "condition_met",
+    }
+    assert payload["last_action_outcome"] == {
+        "status": "condition_met",
+        "action_result": "success",
+        "state_changed": True,
+        "state_changes": ["position_changed"],
+        "goal_completed": False,
+        "reason": "repeat_condition_met",
+    }
+    assert "current_task" not in json.dumps(payload)
+    assert "task_result" not in json.dumps(payload)
+
+
+def test_planner_payload_uses_canonical_mode_dependent_game_state() -> None:
+    base_state = {
+        "map_id": 40,
+        "map_name": "Oak's Lab",
+        "position": {"x": 8, "y": 4},
+        "position_detail": {"tile": {"x": 8, "y": 4}},
+        "summary": "duplicate summary",
+        "dialog_open": False,
+        "in_battle": False,
+        "dialog": {"open": False, "text": None},
+        "battle": {"active": False, "turns": 64},
+        "menu": {"active": False, "selection": 1},
+        "map": {"id": 40, "name": "Oak's Lab", "collision_ptr": 1234},
+        "counts": {"party": 0, "items": 0, "badges": 0, "warps": 2},
+        "items": [],
+        "party": [],
+        "badges": [],
+        "money": 3000,
+        "flags": {"oak_asked_to_choose_mon": True, "got_starter": False, "has_warps": True},
+    }
+    payload = compact_state_for_prompt({"mode": "overworld", "observation": {"state": base_state}})
+    compact = payload["state"]
+
+    assert compact == {
+        "map_id": 40,
+        "map_name": "Oak's Lab",
+        "position": {"x": 8, "y": 4},
+        "mode": "overworld",
+        "dialog_open": False,
+        "in_battle": False,
+        "menu_open": False,
+        "counts": {"party": 0, "items": 0, "badges": 0},
+        "money": 3000,
+        "flags": {"oak_asked_to_choose_mon": True, "got_starter": False},
+    }
+
+    dialog_state = dict(base_state)
+    dialog_state.update(
+        {
+            "dialog_open": True,
+            "dialog_text": "Choose a Pokemon.",
+            "dialog": {"open": True, "text": "Choose a Pokemon.", "box_detected": True},
+        }
+    )
+    dialog_payload = compact_state_for_prompt({"mode": "dialog", "observation": {"state": dialog_state}})
+    assert dialog_payload["state"]["dialog"] == {"text": "Choose a Pokemon.", "box_detected": True}
+    assert "battle" not in dialog_payload["state"]
+    assert "menu" not in dialog_payload["state"]
+
+    battle_state = dict(base_state)
+    battle_state.update(
+        {
+            "in_battle": True,
+            "battle": {"active": True, "kind": 1, "type": 2, "turns": 3},
+            "party": [{"species": "Bulbasaur", "level": 5, "hp": 19, "max_hp": 19}],
+        }
+    )
+    battle_payload = compact_state_for_prompt({"mode": "battle", "observation": {"state": battle_state}})
+    assert battle_payload["state"]["battle"] == {
+        "kind": 1,
+        "type": 2,
+        "turns": 3,
+        "party": [{"species": "Bulbasaur", "level": 5, "hp": 19, "max_hp": 19}],
+    }
+    assert "dialog" not in battle_payload["state"]
+    assert "menu" not in battle_payload["state"]
+
+    menu_state = dict(base_state)
+    menu_state["menu"] = {"active": True, "selection": 2, "start_menu_cursor": 1}
+    menu_payload = compact_state_for_prompt({"mode": "menu", "observation": {"state": menu_state}})
+    assert menu_payload["state"]["menu"] == {"selection": 2, "start_menu_cursor": 1}
+    assert "dialog" not in menu_payload["state"]
+    assert "battle" not in menu_payload["state"]
+
+
+def test_planner_payload_limits_memory_and_navigation_context() -> None:
+    memory = {
+        "keys": ["goal:main", "map:Oak's Lab", "failure:move_to_starter", "failure:unrelated"],
+        "items": {
+            "goal:main": {"value": "safe_loop in Oak's Lab", "updated_at": "2026-08-10T00:00:00Z"},
+            "map:Oak's Lab": {"value": "Starter table is nearby.", "updated_at": "2026-08-11T00:00:00Z"},
+            "failure:move_to_starter": {"value": "move_to_starter was blocked once", "updated_at": "2026-08-12T00:00:00Z"},
+            "strategy:move_to_starter": {"value": "Approach from below", "updated_at": "2026-08-13T00:00:00Z"},
+            "failure:unrelated": {"value": "Route 22 rival battle", "updated_at": "2026-08-14T00:00:00Z"},
+        },
+    }
+    observation = {
+        "state": {"map_name": "Oak's Lab", "map_id": 40, "position": {"x": 8, "y": 5}},
+        "walk_area_collision": [[1 for _ in range(10)] for _ in range(9)],
+        "world_map": {
+            "map_id": 40,
+            "map_name": "Oak's Lab",
+            "known_tiles": 60,
+            "walkable_tiles": 20,
+            "visited_tiles": 4,
+            "frontier_tiles": [{"x": index, "y": 4, "distance": index} for index in range(10)],
+            "nearest_screen_tile": {"world_x": 9, "world_y": 4, "distance": 1},
+        },
+    }
+    non_navigation = compact_state_for_prompt(
+        {
+            "objective": "safe_loop",
+            "mode": "dialog",
+            "observation": observation,
+            "active_action_plan": {
+                "action": {"type": "buttons", "buttons": ["a", "wait"], "reason": "complete_dialog"},
+                "status": "active",
+            },
+            "long_term_memory": memory,
+        }
+    )
+    assert "world_map" not in non_navigation
+    assert "visible_walk_area" not in non_navigation
+
+    navigation = compact_state_for_prompt(
+        {
+            "objective": "safe_loop",
+            "mode": "overworld",
+            "observation": observation,
+            "active_action_plan": {
+                "action": {"type": "move", "target": [8, 4], "reason": "move_to_starter"},
+                "status": "active",
+            },
+            "long_term_memory": memory,
+        }
+    )
+    selected_memory = navigation["long_term_memory"]["items"]
+    assert len(selected_memory) == 3
+    assert "map:Oak's Lab" in selected_memory
+    assert "failure:unrelated" not in selected_memory
+    assert len(navigation["world_map"]["frontier_tiles"]) == 4
+    assert navigation["world_map"]["nearest_frontier_world_cell"] == {"x": 9, "y": 4, "distance": 1}
+    assert navigation["navigation"]["coordinate_system"] == "current_map_world"
+    assert navigation["navigation"]["player"] == [8, 5]
+    assert navigation["navigation"]["visible_world_bounds"] == {
+        "min_x": 4,
+        "max_x": 13,
+        "min_y": 1,
+        "max_y": 9,
+    }
+    assert navigation["navigation"]["max_path_steps_per_move"] == MAX_MOVE_PATH_STEPS
+    assert [12, 9, 8] in navigation["navigation"]["reachable_targets"]
+    assert [13, 9, 9] not in navigation["navigation"]["reachable_targets"]
+    assert all(
+        target[2] <= MAX_MOVE_PATH_STEPS
+        for target in navigation["navigation"]["reachable_targets"]
+    )
+    assert "visible_walk_area" not in navigation
+    assert "safe_neighbor_world_cells" not in navigation
+
+
+def test_adk_planner_content_attaches_only_current_screenshot_and_overlay() -> None:
+    import base64
+
+    planner = GoogleAdkPlanner.__new__(GoogleAdkPlanner)
+    planner.include_screenshot = True
+    state = {
+        "observation": {
+            "state": {"position": {"x": 5, "y": 6}},
+            "screenshot": {"base64": base64.b64encode(b"current-screen").decode("ascii")},
+            "screenshot_overlay": {"base64": base64.b64encode(b"current-overlay").decode("ascii")},
+        },
+    }
+
+    content = planner._content_for_state(state)
+    media_parts = [part for part in content.parts if getattr(part, "inline_data", None)]
+
+    assert len(media_parts) == 2
+    assert media_parts[0].inline_data.data == b"current-screen"
+    assert media_parts[1].inline_data.data == b"current-overlay"
+    assert "\n  " not in content.parts[0].text
+
+
+def test_sanitize_planned_action_rejects_out_of_bounds_target() -> None:
+    assert sanitize_planned_action({"type": "move", "target": [256, 4]}) is None
+
+
+def test_sanitize_planned_action_accepts_button_arrays() -> None:
+    action = sanitize_planned_action(
+        {
+            "type": "buttons",
+            "buttons": ["a", "wait"],
+        }
+    )
+
+    assert action == {
+        "type": "buttons",
+        "buttons": ["a", "wait"],
+        "reason": "adk_buttons_a",
+    }
+
+
+def test_sanitize_planned_action_rejects_unsupported_action_shapes() -> None:
+    assert sanitize_planned_action({"type": "unsupported_action", "button": "a"}) is None
+    assert sanitize_planned_action({"type": "buttons", "buttons": [{"button": "a"}]}) is None
+    assert sanitize_planned_action({"type": "move", "target": {"x": 1, "y": 3}}) is None
+
+
+def test_sanitize_planned_action_rejects_oversized_button_arrays_instead_of_truncating() -> None:
+    buttons = ["wait"] * (MAX_BUTTONS_PER_ACTION + 1)
+
+    assert sanitize_planned_action({"type": "buttons", "buttons": buttons}) is None
+
+
+def test_sanitize_planned_action_accepts_move_target() -> None:
+    assert sanitize_planned_action({"type": "move", "target": [1, 3]}) == {
+        "type": "move",
+        "target": [1, 3],
+        "reason": "adk_move",
+    }
+
+
+def test_normalize_action_plan_accepts_bounded_repeat_contract() -> None:
+    plan = normalize_action_plan(
+        {
+            "action": {"type": "buttons", "buttons": ["a", "wait"], "reason": "advance_dialog"},
+            "repeat_until": {"path": "dialog_open", "equals": False},
+            "max_repeats": 8,
+        }
+    )
+
+    assert plan == {
+        "action": {"type": "buttons", "buttons": ["a", "wait"], "reason": "advance_dialog"},
+        "repeat_until": {"path": "dialog_open", "equals": False},
+        "max_repeats": 8,
+        "repeat_count": 0,
+        "status": "active",
+    }
+
+
+def test_normalize_action_plan_rejects_task_and_unknown_condition_operator() -> None:
+    assert normalize_action_plan({"task": {"task_id": "legacy"}}) is None
+    assert normalize_action_plan(
+        {
+            "action": {"type": "buttons", "buttons": ["a"]},
+            "repeat_until": {"path": "dialog_open", "not_equals": True},
+            "max_repeats": 4,
+        }
+    ) is None
+
+
+def test_select_walkable_world_target_prefers_visible_walkability() -> None:
+    observation = {
+        "state": {"position": {"x": 5, "y": 6}},
+        "walk_area_collision": [[0 for _ in range(10)] for _ in range(9)],
+        "game_area_collision": [[0 for _ in range(20)] for _ in range(18)],
+    }
+    observation["walk_area_collision"][4][4] = 1
+    observation["walk_area_collision"][4][5] = 1
+
+    target = select_walkable_world_target(observation, step_count=0)
+
+    assert target == {"x": 6, "y": 6, "direction": "right", "distance": 1}
+
+
+def test_select_walkable_world_target_prefers_far_visible_target() -> None:
+    observation = {
+        "state": {"position": {"x": 5, "y": 6}},
+        "walk_area_collision": [[1 for _ in range(10)] for _ in range(9)],
+    }
+
+    target = select_walkable_world_target(observation, step_count=0)
+
+    assert target == {"x": 10, "y": 6, "direction": "right", "distance": 5}
+
+
+def test_select_walkable_world_target_avoids_immediate_backtracking() -> None:
+    observation = {
+        "state": {"position": {"x": 5, "y": 6}},
+        "walk_area_collision": [[1 for _ in range(10)] for _ in range(9)],
+    }
+
+    target = select_walkable_world_target(
+        observation,
+        step_count=12,
+        recent_positions=[(5, 6), (10, 6), (5, 6)],
+    )
+
+    assert (target["x"], target["y"]) != (10, 6)
+
+
+def test_rule_based_plan_does_not_retry_recent_failed_move_target() -> None:
+    state = {
+        "mode": "overworld",
+        "step_count": 4,
+        "stuck_score": 1,
+        "observation": {
+            "state": {"position": {"x": 5, "y": 6}},
+            "walk_area_collision": [[1 for _ in range(10)] for _ in range(9)],
+        },
+        "action_history": [
+            {
+                "action": {"type": "move", "target": [10, 6]},
+                "result": {"stop_reason": "no_path"},
+            }
+        ],
+    }
+
+    action = rule_based_plan(state)["planned_action"]
+
+    assert action["type"] == "move"
+    assert action["target"] != [10, 6]
+
+
+def test_select_walkable_world_target_does_not_fallback_to_game_area_collision() -> None:
+    observation = {
+        "state": {"position": {"x": 5, "y": 6}},
+        "game_area_collision": [[1 for _ in range(20)] for _ in range(18)],
+    }
+
+    assert select_walkable_world_target(observation, step_count=0) is None

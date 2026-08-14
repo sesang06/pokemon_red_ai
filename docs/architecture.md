@@ -1,135 +1,203 @@
 # Architecture
 
-## System Shape
+## Control Loop
 
 ```text
-Planner LLM
-    |
-    v
-Task Manager
-    |
-    +--> Navigation Agent --+
-    +--> Battle Agent -----+--> Action Executor --> PyBoy
-    +--> Dialog Agent -----+
-    +--> Inventory Agent --+
-                              |
-                              v
-                 Memory Reader + Screen/Tile Reader
-                              |
-                              v
-                        World State
-                              |
-                              v
-                    Long-Term Memory Store
+Goal
+  -> Action Planner (Google ADK LLM, only when planning is required)
+  -> bounded ActionPlan: action + optional repeat_until + max_repeats
+  -> Python action validator/repeater
+  -> buttons/move MCP action
+  -> PokemonSession.observe() (RAM + vision)
+  -> deterministic StateDiff and action/Goal verifier
+       -> continue: reuse the same action without an LLM call
+       -> condition met/limit/error/interruption: replan
+  -> Result Interpreter (LLM only at an action-cycle boundary or durable event)
+  -> Memory Consolidator
 ```
+
+The optional web debugger receives the same live objects without polling PyBoy:
+
+```text
+PokemonSession cached observation -> latest-only listener -> LiveEventHub
+ADK runtime/trace callbacks -------------------------------> LiveEventHub
+LiveEventHub -> state deltas + typed events -> WebSocket -> React debugger
+```
+
+The session listener only replaces one pending observation. PNG serialization,
+state/event normalization, and WebSocket fan-out run outside the emulator lock.
+If the dashboard server or browser disconnects, the ticker and coordinator keep
+running. Reconnecting starts with a current state snapshot plus at most 500
+recent events.
+
+The LLM chooses **one direct bounded action and repeat policy**. Python validates
+and executes it, and structured game state decides **whether repetition should
+stop and whether the Goal actually succeeded**.
+
+## ADK Package Layout
+
+```text
+adk_agent/
+  agents/
+    planner/       # ADK planner, prompt, action/state contract
+    executor/      # deterministic MCP executor and execution result contract
+    interpreter/   # ADK result interpreter, prompt, memory contract
+    shared.py      # shared streaming, JSON response, idle-pump, and trace helpers
+  coordinator/
+    loop.py        # Planning -> Execution -> Verification -> Interpretation
+    action_cycle.py
+  runtime/
+    history.py
+    logging.py
+    session.py
+    state.py
+    trace.py
+  web/
+    app.py         # ADK Dev UI root/sub-agent definitions
+    prompt.py
+    tools.py
+  client.py
+  runner.py
+dashboard/
+  models.py       # LiveState serialization from real observations/runtime state
+  events.py       # thread-safe state/event hub and bounded subscriber queues
+  server.py       # optional FastAPI/WebSocket service and packaged frontend
+  static/         # Vite production build included in the Python package
+```
+
+Role packages own their prompts and contracts. `coordinator` only orders the
+roles, `runtime` owns persistence and diagnostics, and `web` contains the Dev UI
+surface. The package root lazily exposes `app` and `root_agent` for ADK loading.
+
+## Authority Order
+
+```text
+Actual RAM / GameState
+> deterministic verifier
+> active ActionPlan
+> long-term memory
+> LLM inference
+```
+
+Dialog text or a screenshot may help planning, but neither can prove that an
+item, Pokemon, badge, or story reward was received.
+
+## Runtime State
+
+The coordinator keeps these state groups separate:
+
+- `current_goal`: long-running objective and machine-verifiable conditions
+- `active_action_plan`: direct action, optional RAM stop condition, repeat count/limit
+- `planned_action`: the validated `buttons` or `move` action used this cycle
+- `state_diff`: structured before/after changes and event types
+- `action_outcome`: `continue`, `condition_met`, `single_action_complete`,
+  `max_repeats_reached`, `interrupted`, or `execution_error`
+- `transition_history`: recent structured state transitions
+- `history_summary`: deterministic overflow summary
 
 ## Layer Responsibilities
 
-### PyBoy Environment
+### PyBoy and PokemonSession
 
-`PyBoyEnvironment` is the only module that owns a live PyBoy instance. It wraps
-frame ticking, button input, RAM access, screen buffers, tile maps, game wrapper
-access, and save-state IO.
+`PyBoyEnv` owns a live PyBoy instance. `PokemonSession` exposes RAM-derived
+state, screenshots, collision, world-coordinate navigation, realtime ticking,
+and save states. A dedicated ticker thread owns runtime frame advancement;
+actions only schedule input and wait for elapsed time or RAM state changes.
+The ticker advances one frame per deadline. When the process is delayed it
+drops the missed deadline instead of batching frames, preventing dialog and
+battle animation jumps.
 
-### World State
+The same emulator thread applies queued buttons and performs runtime save/load
+operations. It publishes RAM-derived state after every frame and refreshes the
+screenshot, overlay, game area, and collision cache at 30 Hz. `observe()` only
+copies the latest immutable snapshot, so planner and image-processing latency do
+not hold the PyBoy lock or pause emulation. Qt pumping reads this cache and never
+advances frames.
 
-`GameState` is the contract consumed by planners and agents. It should be small,
-stable, and easy to log:
+### Observation
 
-```text
-map_id
-map_name
-position
-facing
-mode
-in_battle
-dialog_open
-money
-party
-items
-nearby_npcs
-nearby_exits
-flags
-raw
+`PokemonSession.observe()` is the observation source of truth. It returns:
+
+- structured `GameState` and RAM values
+- state events such as map/warp/dialog/battle/menu/item/party changes
+- screenshot and collision overlay
+- 20x18 game area/collision and internal 10x9 walk collision
+- visible current-map world coordinates
+
+### Action Planner
+
+The Google ADK planner returns one direct action with an optional repeat policy:
+
+```json
+{
+  "action":{"type":"buttons","buttons":["a","wait"],"reason":"advance_dialog"},
+  "repeat_until":{"path":"dialog_open","equals":false},
+  "max_repeats":8
+}
 ```
 
-The LLM never sees pixels as its primary input. It receives a summary derived
-from this state.
+Supported repeat operators are `equals`, `min`, `max`, and `contains`.
+Unsupported condition shapes reject the whole model response and trigger one
+rule-based fallback action. There are no planner-generated preconditions or
+Task objects.
 
-### Memory Reader
+### Action Executor
 
-`PokemonRedMemoryReader` reads known RAM addresses and builds `GameState`.
-Addresses are centralized in `PokemonRedRamMap` so that Red/Blue/Yellow
-variants can be swapped later.
+The executor validates the planner's direct action and calls MCP/PokemonSession.
+If `repeat_until` is still false, it reuses the same validated action on the
+next cycle without calling the planner. Repetition stops at `max_repeats`, on
+condition success, or on an execution interruption.
 
-The current defaults seed only stable early fields:
+```json
+{"type":"buttons","buttons":["a","wait"]}
+{"type":"move","target":[9,3]}
+```
 
-- current map id
-- player x/y
-- collision pointer
-- grass tile
-- tileset type
+Movement targets are current-map world coordinates. Collision conversion and
+Dijkstra routing remain internal to the navigation/session layer.
 
-Party, inventory, flags, and battle parsing should be added incrementally with
-tests against save states.
+The public action tools are intentionally small:
 
-### Vision and Tile Parsing
+```text
+press_buttons(buttons)
+wait()
+move_to_world_cell(target_x, target_y)
+```
 
-Vision is a support layer. For Pokemon Red, tile maps and sprites are usually
-more reliable than image OCR. The screen reader exposes:
+`press_buttons` accepts button names and the `wait` token. Each token is
+serialized, and the call returns after the action has completed with a final
+observation. Frame counts, button timing, path limits, nearest-target handling,
+and walk-cell coordinates are private session details.
 
-- RGB frame copies for logging or optional computer vision
-- background/window tile maps
-- PyBoy Pokemon Gen1 collision grid when available
+### StateDiff and Verifier
 
-### Planner
+Every action compares before and after structured observations. The verifier
+checks repeat and Goal conditions without an LLM. Supported evidence includes
+inventory, party, Pokedex, badges, money, map, position, flags, dialog, battle,
+warp, event types, and action results.
 
-The planner converts `GameState` into a high-level `Goal`. The initial
-implementation is a scripted planner with a replaceable `Planner` interface.
-An LLM planner can be added behind the same interface once state summaries are
-stable.
+For example, `obtain_pokeballs` completes only when RAM-derived inventory
+contains at least one Poke Ball. Opening or closing Oak dialog is insufficient.
 
-### Task Manager
+### Result Interpreter and Memory
 
-The task manager is the state machine. It chooses which specialized agent gets
-control on each tick:
+The interpreter is not a 20-turn history compressor. It is called only for an
+action-cycle boundary that needs interpretation or a durable/unexpected event, and it may explain verified facts or
+propose memory candidates. It cannot override deterministic outcomes.
 
-- battle state -> battle agent
-- dialog/menu state -> dialog agent
-- active target position -> navigation agent
-- no active task -> planner
+Memory consolidation is a separate component. Long-term keys use:
 
-### Navigation
+```text
+map:* event:* npc:* item:* goal:* strategy:* failure:* episode:*
+```
 
-Navigation does not need an LLM. It uses A* over a walkability grid and turns
-the route into direction button actions. This keeps movement reproducible and
-easy to test.
+Full actions remain in date-grouped JSONL and ADK SQLite. The model receives a
+short state-transition context, while deterministic compression bounds recent
+transition history to 20 entries.
 
-### Battle
+## Process Boundary
 
-The starter battle agent is intentionally conservative. It can be expanded from
-menu heuristics into type-aware rule logic, then into a learned policy for this
-module only.
-
-### Dialog
-
-The starter dialog agent advances text with `A`. Later it should OCR text boxes
-or parse text buffers from RAM and emit quest flag updates.
-
-### Save State Manager
-
-Save states are checkpoints. Use them before risky transitions such as trainer
-battles, caves, long grass routes, and major menu sequences.
-
-## Milestones
-
-1. Boot ROM and produce logged `GameState` frames.
-2. Start from a save state in Pallet Town and move to a target coordinate.
-3. Detect dialog and advance it safely.
-4. Detect battle mode and repeatedly choose valid fight actions.
-5. Parse local collision and use A* within one map.
-6. Load static map metadata from `pret/pokered`-derived data.
-7. Add a route graph for the main story.
-8. Add LLM planning for subgoal selection and stuck recovery.
-9. Add persistent memory for visited maps, talked NPCs, and failed routes.
-10. Add retry policies around save states.
+The CLI currently uses `InProcessPokemonMcpClient`; ADK CLI and ADK Web still
+own separate PyBoy processes. They share SQLite/runtime files for visibility,
+not the live emulator object. A single remote MCP/PyBoy service remains a
+separate deployment improvement.

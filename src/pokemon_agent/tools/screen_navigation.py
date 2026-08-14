@@ -28,6 +28,7 @@ def plan_screen_path(
     *,
     start: GridPoint = PLAYER_WALK_CELL,
     accept_nearest: bool = True,
+    blocked_edges: set[tuple[GridPoint, GridPoint]] | None = None,
 ) -> ScreenPathPlan:
     collision_rows = matrix_to_rows(collision_matrix)
     _validate_target(target_x, target_y, collision_rows)
@@ -43,6 +44,7 @@ def plan_screen_path(
         requested_walk_cell,
         mutable_grid,
         accept_nearest=accept_nearest,
+        blocked_edges=blocked_edges,
     )
 
     if resolved_walk_cell is None:
@@ -56,7 +58,7 @@ def plan_screen_path(
             stop_reason="no_path",
         )
 
-    path = dijkstra(start, resolved_walk_cell, mutable_grid)
+    path = dijkstra(start, resolved_walk_cell, mutable_grid, blocked_edges=blocked_edges)
     stop_reason = "path_found" if path else "no_path"
     return ScreenPathPlan(
         requested_screen_tile=GridPoint(target_x, target_y),
@@ -114,23 +116,59 @@ def walk_cell_to_screen_tile(point: GridPoint) -> GridPoint:
     return GridPoint(point.x * WALK_CELL_SIZE, point.y * WALK_CELL_SIZE)
 
 
+def screen_tile_to_map_position(
+    tile_x: int,
+    tile_y: int,
+    player_position: GridPoint,
+    *,
+    player_walk_cell: GridPoint = PLAYER_WALK_CELL,
+) -> GridPoint:
+    walk_cell = screen_tile_to_walk_cell(tile_x, tile_y)
+    return walk_cell_to_map_position(walk_cell, player_position, player_walk_cell=player_walk_cell)
+
+
+def walk_cell_to_map_position(
+    walk_cell: GridPoint,
+    player_position: GridPoint,
+    *,
+    player_walk_cell: GridPoint = PLAYER_WALK_CELL,
+) -> GridPoint:
+    return GridPoint(
+        player_position.x + walk_cell.x - player_walk_cell.x,
+        player_position.y + walk_cell.y - player_walk_cell.y,
+    )
+
+
+def map_position_to_walk_cell(
+    map_position: GridPoint,
+    player_position: GridPoint,
+    *,
+    player_walk_cell: GridPoint = PLAYER_WALK_CELL,
+) -> GridPoint:
+    return GridPoint(
+        player_walk_cell.x + map_position.x - player_position.x,
+        player_walk_cell.y + map_position.y - player_position.y,
+    )
+
+
 def resolve_walk_target(
     start: GridPoint,
     goal: GridPoint,
     walk_grid: Sequence[Sequence[int]],
     *,
     accept_nearest: bool,
+    blocked_edges: set[tuple[GridPoint, GridPoint]] | None = None,
 ) -> GridPoint | None:
     if not _in_bounds(goal, walk_grid):
         return None
 
-    if _is_walkable(goal, walk_grid):
+    if _is_walkable(goal, walk_grid) and dijkstra(start, goal, walk_grid, blocked_edges=blocked_edges):
         return goal
 
     if not accept_nearest:
         return None
 
-    distances = reachable_distances(start, walk_grid)
+    distances = reachable_distances(start, walk_grid, blocked_edges=blocked_edges)
     if not distances:
         return None
 

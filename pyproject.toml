@@ -1,26 +1,22 @@
 [project]
 name = "pokemon-red-agent"
 version = "0.1.0"
-description = "A hierarchical PyBoy-based agent scaffold for Pokemon Red."
+description = "A PyBoy, MCP, and Google ADK agent runtime for Pokemon Red."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.115,<1",
     "google-adk>=2,<3",
     "mcp[cli]>=2,<3",
     "pillow>=10.0",
     "pyside6>=6.7",
     "pyboy>=2.0",
+    "uvicorn>=0.30,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-]
-memory = [
-    "qdrant-client>=1.9",
-]
-vision = [
-    "numpy>=1.26",
 ]
 
 [project.scripts]
@@ -35,6 +31,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"pokemon_agent.dashboard" = ["static/index.html", "static/assets/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

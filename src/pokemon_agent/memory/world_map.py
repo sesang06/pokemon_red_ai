@@ -6,6 +6,7 @@ from typing import Any
 from pokemon_agent.tools.screen_navigation import (
     PLAYER_WALK_CELL,
     compress_collision_to_walk_grid,
+    walk_cell_to_map_position,
     walk_cell_to_screen_tile,
 )
 
@@ -153,10 +154,15 @@ class WorldMapTracker:
         self.current_map_id = world_map.map_id
 
         walk_grid = compress_collision_to_walk_grid(collision)
+        player_position = type(PLAYER_WALK_CELL)(px, py)
         for walk_y, row in enumerate(walk_grid):
             for walk_x, walkable in enumerate(row):
-                world_x = px + walk_x - PLAYER_WALK_CELL.x
-                world_y = py + walk_y - PLAYER_WALK_CELL.y
+                world_position = walk_cell_to_map_position(
+                    type(PLAYER_WALK_CELL)(walk_x, walk_y),
+                    player_position,
+                )
+                world_x = world_position.x
+                world_y = world_position.y
                 world_map.mark_tile(world_x, world_y, bool(walkable))
 
         return world_map.summary()

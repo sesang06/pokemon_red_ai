@@ -29,7 +29,7 @@ class _MissingFastMCP:
         return decorator
 
     def run(self, *args: Any, **kwargs: Any) -> None:
-        raise RuntimeError('Install MCP support first: python -m pip install -e ".[dev,vision,memory]"')
+        raise RuntimeError('Install MCP support first: python -m pip install -e ".[dev]"')
 
 
 mcp = MCPServer("pokemon-red-pyboy") if MCPServer is not None else _MissingFastMCP()
@@ -40,9 +40,12 @@ _SESSION.set_mcp_log_provider(lambda: _CALL_LOG.format_recent())
 
 def set_session_for_tests(session: PokemonSession) -> None:
     global _SESSION
+    previous = _SESSION
     _CALL_LOG.clear()
     _SESSION = session
     _SESSION.set_mcp_log_provider(lambda: _CALL_LOG.format_recent())
+    if previous is not session and previous.started:
+        previous.stop(save_final=False)
 
 
 def get_session() -> PokemonSession:
@@ -84,41 +87,30 @@ def stop_session(save_final: bool = False) -> dict[str, Any]:
 
 @mcp.tool()
 def observe() -> dict[str, Any]:
-    """Observe RAM, screen tiles, collision, and a PNG base64 screenshot."""
+    """Observe RAM, screen tiles, collision, PNG screenshot, and collision overlay screenshot."""
 
     return _run_logged_tool("observe", {}, lambda: get_session().observe())
 
 
 @mcp.tool()
-def press_button(button: str, frames: int = 4, after_frames: int = 8) -> dict[str, Any]:
-    """Press one Game Boy button and return the new observation."""
+def press_buttons(buttons: list[str]) -> dict[str, Any]:
+    """Execute Game Boy button or ``wait`` tokens through the realtime ticker."""
 
     return _run_logged_tool(
-        "press_button",
-        {"button": button, "frames": frames, "after_frames": after_frames},
-        lambda: get_session().press_button(button=button, frames=frames, after_frames=after_frames),
+        "press_buttons",
+        {"buttons": buttons},
+        lambda: get_session().press_buttons(buttons=buttons),
     )
 
 
 @mcp.tool()
-def execute_actions(actions: list[dict[str, Any]]) -> dict[str, Any]:
-    """Execute a bounded list of button actions."""
+def wait() -> dict[str, Any]:
+    """Wait 300 milliseconds while the realtime ticker advances the emulator."""
 
     return _run_logged_tool(
-        "execute_actions",
-        {"actions": actions},
-        lambda: get_session().execute_actions(actions),
-    )
-
-
-@mcp.tool()
-def step_frames(frames: int = 1, render: bool = False) -> dict[str, Any]:
-    """Advance the emulator without pressing buttons."""
-
-    return _run_logged_tool(
-        "step_frames",
-        {"frames": frames, "render": render},
-        lambda: get_session().step_frames(frames=frames, render=render),
+        "wait",
+        {},
+        lambda: get_session().wait(),
     )
 
 
@@ -152,27 +144,18 @@ def reset_to_fixed() -> dict[str, Any]:
 
 
 @mcp.tool()
-def move_to_screen_tile(
+def move_to_world_cell(
     target_x: int,
     target_y: int,
-    max_steps: int = 8,
-    accept_nearest: bool = True,
 ) -> dict[str, Any]:
-    """Move toward a current-screen game_area tile using collision-aware Dijkstra routing."""
+    """Move toward a current-map/world coordinate through the realtime ticker."""
 
     return _run_logged_tool(
-        "move_to_screen_tile",
-        {
-            "target_x": target_x,
-            "target_y": target_y,
-            "max_steps": max_steps,
-            "accept_nearest": accept_nearest,
-        },
-        lambda: get_session().move_to_screen_tile(
+        "move_to_world_cell",
+        {"target_x": target_x, "target_y": target_y},
+        lambda: get_session().move_to_world_cell(
             target_x=target_x,
             target_y=target_y,
-            max_steps=max_steps,
-            accept_nearest=accept_nearest,
         ),
     )
 
@@ -197,17 +180,15 @@ def recent_mcp_commands(limit: int = 50) -> dict[str, Any]:
 def set_realtime_ticks(
     enabled: bool = True,
     fps: float = 60.0,
-    max_frames_per_pump: int = 12,
 ) -> dict[str, Any]:
-    """Enable or disable non-planner realtime emulator ticks."""
+    """Enable or disable the fixed-step realtime emulator ticker."""
 
     return _run_logged_tool(
         "set_realtime_ticks",
-        {"enabled": enabled, "fps": fps, "max_frames_per_pump": max_frames_per_pump},
+        {"enabled": enabled, "fps": fps},
         lambda: get_session().set_realtime_ticking(
             enabled=enabled,
             fps=fps,
-            max_frames_per_pump=max_frames_per_pump,
         ),
     )
 
@@ -273,7 +254,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-auto-start", action="store_true", help="Start only the MCP transport and wait for start_session.")
     parser.add_argument("--realtime-ticks", action="store_true", help="Tick the emulator continuously outside planner/tool actions.")
     parser.add_argument("--realtime-fps", type=float, default=60.0, help="Game frames per second for --realtime-ticks.")
-    parser.add_argument("--ui-refresh-hz", type=float, default=30.0, help="How often to pump realtime ticks and the control panel.")
+    parser.add_argument("--ui-refresh-hz", type=float, default=30.0, help="How often to refresh the control panel from cached snapshots.")
     parser.add_argument(
         "--transport",
         default="stdio",

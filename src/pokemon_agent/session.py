@@ -1,34 +1,53 @@
 from __future__ import annotations
 
 import base64
+import copy
 import re
+import threading
 import time
-from dataclasses import dataclass
+import weakref
+from collections import deque
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol, cast
+from typing import Any, Callable, Iterator, Literal, Protocol
 
-from pokemon_agent.agent.actions import Button, ButtonAction
 from pokemon_agent.emulator.pyboy_env import PyBoyEnvironment
+from pokemon_agent.input_contract import (
+    BUTTON_TOKENS,
+    MAX_BUTTONS_PER_ACTION,
+    MAX_MOVE_PATH_STEPS,
+)
 from pokemon_agent.memory.memory_reader import PokemonRedMemoryReader
 from pokemon_agent.memory.ram_map import format_ram_watch
 from pokemon_agent.memory.world_map import WorldMapTracker
 from pokemon_agent.memory.world_state import GameMode, GameState, Position
-from pokemon_agent.tools.pathfinding import directions_from_path
+from pokemon_agent.tools.pathfinding import GridPoint, directions_from_path
 from pokemon_agent.tools.screen_navigation import (
     PLAYER_SCREEN_TILE,
     PLAYER_WALK_CELL,
+    compress_collision_to_walk_grid,
     grid_point_dict,
     matrix_to_rows,
     plan_screen_path,
+    map_position_to_walk_cell,
+    walk_cell_to_map_position,
+    walk_cell_to_screen_tile,
 )
 from pokemon_agent.vision.game_area import format_game_area_collision_watch, format_game_area_watch
+from pokemon_agent.vision.overlay import overlay_metadata, render_collision_overlay
 
 ButtonName = Literal["a", "b", "start", "select", "left", "right", "up", "down"]
 StateKind = Literal["fixed", "snapshot", "last"]
 
-VALID_BUTTONS: set[str] = {"a", "b", "start", "select", "left", "right", "up", "down"}
+VALID_BUTTON_TOKENS = frozenset(BUTTON_TOKENS)
+DEFAULT_REALTIME_FPS = 60.0
+DEFAULT_SNAPSHOT_HZ = 30.0
+BUTTON_HOLD_FRAMES = 4
+ACTION_WAIT_SECONDS = 0.3
+MOVE_STEP_TIMEOUT_SECONDS = 1.0
 
 
 class PokemonEnvironment(Protocol):
@@ -68,6 +87,36 @@ class PokemonSessionPaths:
     last_state: Path
 
 
+@dataclass
+class _EmulatorCommand:
+    kind: str
+    args: tuple[Any, ...] = ()
+    completed: threading.Event = field(default_factory=threading.Event)
+    result: Any = None
+    error: BaseException | None = None
+
+
+class _FifoActionGate:
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._next_ticket = 0
+        self._serving = 0
+
+    @contextmanager
+    def turn(self) -> Iterator[None]:
+        with self._condition:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            while ticket != self._serving:
+                self._condition.wait()
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._serving += 1
+                self._condition.notify_all()
+
+
 def default_session_paths() -> PokemonSessionPaths:
     source_root = Path(__file__).resolve().parents[2]
     project_root = Path.cwd() if (Path.cwd() / "src" / "pokered.gb").exists() else source_root
@@ -96,13 +145,32 @@ class PokemonSession:
         self.control_panel: Any | None = None
         self.mcp_log_provider: Callable[[], str] | None = None
         self._last_control_panel_update = 0.0
-        self.realtime_ticks_enabled = False
-        self.realtime_tick_fps = 60.0
-        self.realtime_max_frames_per_pump = 12
-        self._last_realtime_tick_at = 0.0
+        self.realtime_ticks_enabled = True
+        self.realtime_tick_fps = DEFAULT_REALTIME_FPS
+        self.snapshot_refresh_hz = DEFAULT_SNAPSHOT_HZ
+        self._next_realtime_tick_at = 0.0
+        self._next_visual_snapshot_at = 0.0
+        self._last_reported_frame_index = 0
+        self._env_lock = threading.RLock()
+        self._frame_condition = threading.Condition(self._env_lock)
+        self._snapshot_condition = threading.Condition(threading.RLock())
+        self._action_gate = _FifoActionGate()
+        self._emulator_commands: deque[_EmulatorCommand] = deque()
+        self._realtime_thread: threading.Thread | None = None
+        self._realtime_stop_event = threading.Event()
+        self._realtime_running = True
+        self._realtime_error: str | None = None
+        self._closing = False
+        self._latest_observation: dict[str, Any] | None = None
+        self._latest_ui_payload: dict[str, Any] | None = None
+        self._pending_state_events: deque[dict[str, Any]] = deque(maxlen=256)
+        self._observation_listeners: list[Callable[[dict[str, Any]], None]] = []
         self.window = "null"
         self.tool_step_index = 0
         self.frame_index = 0
+        self._previous_state_snapshot: dict[str, Any] | None = None
+        self._blocked_world_edges: dict[int, dict[tuple[tuple[int, int], tuple[int, int]], int]] = {}
+        self._navigation_attempt_index = 0
 
     @property
     def started(self) -> bool:
@@ -126,15 +194,33 @@ class PokemonSession:
             raise FileNotFoundError(f"ROM not found: {self.paths.rom}")
 
         self.paths.state_dir.mkdir(parents=True, exist_ok=True)
-        self.window = window
-        self.env = self._env_factory(self.paths.rom, window)
+        with self._env_lock:
+            self.window = window
+            self.env = self._env_factory(self.paths.rom, window)
+            self._previous_state_snapshot = None
+            self._blocked_world_edges.clear()
+            self._navigation_attempt_index = 0
+            self._realtime_running = True
+            self._realtime_error = None
+            self._closing = False
+            self.realtime_ticks_enabled = True
+            self._next_realtime_tick_at = time.monotonic()
+            self._next_visual_snapshot_at = 0.0
+            self._last_reported_frame_index = self.frame_index
+            self._emulator_commands.clear()
+            self._latest_observation = None
+            self._latest_ui_payload = None
+            self._pending_state_events.clear()
 
-        if load_fixed:
-            if not self.paths.fixed_state.exists():
+            if load_fixed:
+                if not self.paths.fixed_state.exists():
+                    self._tick(1, render=True)
+                    self.env.save_state(self.paths.fixed_state)
+                self.env.load_state(self.paths.fixed_state)
                 self._tick(1, render=True)
-                self.env.save_state(self.paths.fixed_state)
-            self.env.load_state(self.paths.fixed_state)
-            self._tick(1, render=True)
+
+        self._capture_cached_observation(force_visual=True)
+        self._start_realtime_worker()
 
         if control_ui:
             self._ensure_control_panel()
@@ -153,48 +239,58 @@ class PokemonSession:
     def set_mcp_log_provider(self, provider: Callable[[], str] | None) -> None:
         self.mcp_log_provider = provider
 
+    def add_observation_listener(self, listener: Callable[[dict[str, Any]], None]) -> None:
+        with self._snapshot_condition:
+            if listener not in self._observation_listeners:
+                self._observation_listeners.append(listener)
+
+    def remove_observation_listener(self, listener: Callable[[dict[str, Any]], None]) -> None:
+        with self._snapshot_condition:
+            if listener in self._observation_listeners:
+                self._observation_listeners.remove(listener)
+
+    def peek_observation(self) -> dict[str, Any]:
+        with self._snapshot_condition:
+            if self._latest_observation is None:
+                raise RuntimeError("The realtime ticker has not produced an observation yet.")
+            return copy.deepcopy(self._latest_observation)
+
     def set_realtime_ticking(
         self,
         enabled: bool,
         *,
         fps: float = 60.0,
-        max_frames_per_pump: int = 12,
     ) -> dict[str, Any]:
         fps = _bounded_float(fps, minimum=1.0, maximum=240.0, name="fps")
-        max_frames_per_pump = _bounded_int(max_frames_per_pump, minimum=1, maximum=120, name="max_frames_per_pump")
-        self.realtime_ticks_enabled = bool(enabled)
-        self.realtime_tick_fps = fps
-        self.realtime_max_frames_per_pump = max_frames_per_pump
-        self._last_realtime_tick_at = time.monotonic()
+        with self._frame_condition:
+            self.realtime_ticks_enabled = bool(enabled)
+            self.realtime_tick_fps = fps
+            self._next_realtime_tick_at = time.monotonic()
+            self._realtime_error = None
+            self._realtime_running = self.env is not None
+            self._frame_condition.notify_all()
+        if enabled:
+            self._start_realtime_worker()
         self._refresh_control_panel(force=True)
         return self.realtime_tick_status()
 
     def realtime_tick_status(self) -> dict[str, Any]:
-        return {
-            "started": self.started,
-            "enabled": self.realtime_ticks_enabled,
-            "fps": self.realtime_tick_fps,
-            "max_frames_per_pump": self.realtime_max_frames_per_pump,
-            "frame_index": self.frame_index,
-        }
+        with self._env_lock:
+            return {
+                "started": self.started,
+                "enabled": self.realtime_ticks_enabled,
+                "fps": self.realtime_tick_fps,
+                "snapshot_hz": self.snapshot_refresh_hz,
+                "frame_index": self.frame_index,
+                "ticker_alive": self._realtime_thread is not None and self._realtime_thread.is_alive(),
+                "ticker_error": self._realtime_error,
+            }
 
-    def pump_realtime(self, *, now: float | None = None) -> dict[str, Any]:
-        if self.env is None:
-            return {**self.realtime_tick_status(), "frames_ticked": 0, "running": False}
-
-        current = time.monotonic() if now is None else now
-        frames = 0
-        running = True
-        if self.realtime_ticks_enabled:
-            if self._last_realtime_tick_at <= 0:
-                self._last_realtime_tick_at = current
-            else:
-                elapsed = max(0.0, current - self._last_realtime_tick_at)
-                frames = min(int(elapsed * self.realtime_tick_fps), self.realtime_max_frames_per_pump)
-                if frames > 0:
-                    running = self._tick(frames, render=True)
-                    self._last_realtime_tick_at = current
-
+    def pump_realtime(self) -> dict[str, Any]:
+        with self._env_lock:
+            frames = max(0, self.frame_index - self._last_reported_frame_index)
+            self._last_reported_frame_index = self.frame_index
+            running = self.env is not None and self._realtime_running
         self._refresh_control_panel()
         return {
             **self.realtime_tick_status(),
@@ -202,112 +298,491 @@ class PokemonSession:
             "running": running,
         }
 
+    def _wait_for_snapshot_after(self, frame_index: int, timeout: float = 0.25) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._snapshot_condition:
+            while True:
+                latest_frame = int((self._latest_observation or {}).get("frame_index", -1))
+                if latest_frame > frame_index:
+                    return True
+                if self._closing or self._realtime_error or not self.realtime_ticks_enabled:
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._snapshot_condition.wait(timeout=min(0.05, remaining))
+
+    def _start_realtime_worker(self) -> None:
+        with self._frame_condition:
+            if self._realtime_thread is not None and self._realtime_thread.is_alive():
+                return
+            self._realtime_stop_event = threading.Event()
+            session_ref = weakref.ref(self)
+            thread = threading.Thread(
+                target=PokemonSession._realtime_worker_main,
+                args=(session_ref, self._realtime_stop_event),
+                name="pokemon-realtime-ticker",
+                daemon=True,
+            )
+            self._realtime_thread = thread
+            thread.start()
+
+    def _stop_realtime_worker(self) -> None:
+        with self._frame_condition:
+            thread = self._realtime_thread
+            self.realtime_ticks_enabled = False
+            self._realtime_stop_event.set()
+            self._frame_condition.notify_all()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        with self._frame_condition:
+            if self._realtime_thread is thread:
+                self._realtime_thread = None
+
+    @staticmethod
+    def _realtime_worker_main(
+        session_ref: "weakref.ReferenceType[PokemonSession]",
+        stop_event: threading.Event,
+    ) -> None:
+        while not stop_event.is_set():
+            session = session_ref()
+            if session is None:
+                return
+            try:
+                delay = session._advance_realtime_once()
+            except Exception as exc:
+                with session._frame_condition:
+                    session._realtime_error = f"{type(exc).__name__}: {exc}"
+                    session._realtime_running = False
+                    session.realtime_ticks_enabled = False
+                    session._fail_pending_commands(exc)
+                    session._frame_condition.notify_all()
+                with session._snapshot_condition:
+                    session._snapshot_condition.notify_all()
+                return
+            del session
+            stop_event.wait(delay)
+
+    def _advance_realtime_once(self) -> float:
+        command = None
+        with self._frame_condition:
+            if self._emulator_commands:
+                command = self._emulator_commands.popleft()
+            if command is None and (self.env is None or not self.realtime_ticks_enabled):
+                return 0.01
+
+        if command is not None:
+            self._execute_emulator_command(command)
+            return 0.0
+
+        with self._frame_condition:
+            if self.env is None or not self.realtime_ticks_enabled:
+                return 0.01
+            now = time.monotonic()
+            interval = 1.0 / self.realtime_tick_fps
+            if self._next_realtime_tick_at <= 0:
+                self._next_realtime_tick_at = now
+            if now < self._next_realtime_tick_at:
+                return min(0.01, max(0.001, self._next_realtime_tick_at - now))
+
+            self._realtime_running = self._tick(1, render=True)
+            self._next_realtime_tick_at += interval
+            if self._next_realtime_tick_at <= now:
+                self._next_realtime_tick_at = now + interval
+            if not self._realtime_running:
+                self.realtime_ticks_enabled = False
+
+        self._capture_cached_observation(force_visual=now >= self._next_visual_snapshot_at)
+        return min(0.01, max(0.001, self._next_realtime_tick_at - time.monotonic()))
+
+    def _submit_emulator_command(self, kind: str, *args: Any) -> Any:
+        command = _EmulatorCommand(kind=kind, args=tuple(args))
+        with self._frame_condition:
+            if self.env is None:
+                raise RuntimeError("Pokemon session is not started. Call start_session first.")
+            if self._realtime_error:
+                raise RuntimeError(f"Realtime ticker failed: {self._realtime_error}")
+            self._emulator_commands.append(command)
+            self._frame_condition.notify_all()
+        self._start_realtime_worker()
+
+        while not command.completed.wait(timeout=0.05):
+            with self._frame_condition:
+                thread_alive = self._realtime_thread is not None and self._realtime_thread.is_alive()
+                if self._realtime_error or not thread_alive:
+                    raise RuntimeError(self._realtime_error or "Realtime ticker stopped before processing a command.")
+        if command.error is not None:
+            raise command.error
+        return command.result
+
+    def _execute_emulator_command(self, command: _EmulatorCommand) -> None:
+        try:
+            with self._env_lock:
+                env = self._require_env()
+                if command.kind == "button":
+                    env.button(str(command.args[0]), frames=int(command.args[1]))
+                elif command.kind == "save_state":
+                    env.save_state(command.args[0])
+                elif command.kind == "load_state":
+                    env.load_state(command.args[0])
+                    self._previous_state_snapshot = None
+                    with self._snapshot_condition:
+                        self._pending_state_events.clear()
+                    self._next_visual_snapshot_at = 0.0
+                elif command.kind == "stop":
+                    env.stop(save=False)
+                    self.env = None
+                    self._realtime_running = False
+                    self.realtime_ticks_enabled = False
+                else:
+                    raise ValueError(f"unknown emulator command: {command.kind}")
+
+            if command.kind == "load_state":
+                self._capture_cached_observation(force_visual=True)
+            command.result = True
+        except BaseException as exc:
+            command.error = exc
+        finally:
+            command.completed.set()
+
+    def _fail_pending_commands(self, exc: BaseException) -> None:
+        while self._emulator_commands:
+            command = self._emulator_commands.popleft()
+            command.error = exc
+            command.completed.set()
+
+    def _ensure_realtime_ticking(self) -> None:
+        with self._frame_condition:
+            if self.env is None:
+                raise RuntimeError("Pokemon session is not started. Call start_session first.")
+            if self._closing:
+                raise RuntimeError("Pokemon session is stopping.")
+            if not self.realtime_ticks_enabled:
+                self.realtime_ticks_enabled = True
+                self._next_realtime_tick_at = time.monotonic()
+                self._realtime_running = True
+                self._realtime_error = None
+                self._frame_condition.notify_all()
+        self._start_realtime_worker()
+
+    def _wait_realtime(self, seconds: float, *, start_frame: int | None = None) -> bool:
+        deadline = time.monotonic() + max(0.0, seconds)
+        with self._frame_condition:
+            while True:
+                if self._closing or self.env is None or self._realtime_error or not self.realtime_ticks_enabled:
+                    return False
+                now = time.monotonic()
+                frame_progressed = start_frame is None or self.frame_index > start_frame
+                if now >= deadline and frame_progressed:
+                    return True
+                self._frame_condition.wait(timeout=max(0.001, min(0.05, deadline - now if now < deadline else 0.01)))
+
+    def _realtime_stop_reason(self) -> str:
+        return "realtime_ticker_stopped"
+
     def stop(self, save_final: bool = False) -> dict[str, Any]:
-        env = self.env
-        if env is None:
-            return {"stopped": True, "already_stopped": True}
+        with self._frame_condition:
+            self._closing = True
+            self._frame_condition.notify_all()
+        with self._action_gate.turn():
+            if self.env is None:
+                self._stop_realtime_worker()
+                return {"stopped": True, "already_stopped": True}
 
-        saved_path = None
-        if save_final:
-            env.save_state(self.paths.last_state)
-            saved_path = self.paths.last_state
-            self._notify_control_panel_saved(self.paths.last_state)
+            saved_path = None
+            ticker_alive = self._realtime_thread is not None and self._realtime_thread.is_alive()
+            if self._realtime_error or not ticker_alive:
+                with self._env_lock:
+                    env = self._require_env()
+                    if save_final:
+                        env.save_state(self.paths.last_state)
+                        saved_path = self.paths.last_state
+                    env.stop(save=False)
+                    self.env = None
+                    self._realtime_running = False
+                    self.realtime_ticks_enabled = False
+            else:
+                if save_final:
+                    self._submit_emulator_command("save_state", self.paths.last_state)
+                    saved_path = self.paths.last_state
+                self._submit_emulator_command("stop")
+            if saved_path is not None:
+                self._notify_control_panel_saved(saved_path)
+            self._stop_realtime_worker()
+            self._previous_state_snapshot = None
+            self._close_control_panel()
+            return {
+                "stopped": True,
+                "already_stopped": False,
+                "saved_path": None if saved_path is None else str(saved_path),
+            }
 
-        env.stop(save=False)
-        self.env = None
-        self._close_control_panel()
-        return {
-            "stopped": True,
-            "already_stopped": False,
-            "saved_path": None if saved_path is None else str(saved_path),
-        }
-
-    def observe(self) -> dict[str, Any]:
-        env = self._require_env()
-        state = self.reader.read(env.memory)
-        game_area = matrix_to_rows(env.game_area())
-        collision = matrix_to_rows(env.game_area_collision())
-        screenshot = self._screenshot()
-        observation = {
-            "tool_step_index": self.tool_step_index,
-            "frame_index": self.frame_index,
-            "state": _game_state_dict(state),
-            "ram": state.raw,
-            "ram_watch": format_ram_watch(env.memory),
-            "game_area": game_area,
-            "game_area_collision": collision,
-            "player_screen_tile": grid_point_dict(PLAYER_SCREEN_TILE),
-            "player_walk_cell": grid_point_dict(PLAYER_WALK_CELL),
-            "screenshot": screenshot,
-            "control_ui": self.control_panel is not None,
-        }
-        observation["world_map"] = self.world_map_tracker.update_from_observation(observation)
-        self._refresh_control_panel(state)
-
+    def observe(self, *, refresh_control_panel: bool = True) -> dict[str, Any]:
+        if self.env is None:
+            raise RuntimeError("Pokemon session is not started. Call start_session first.")
+        tool_step_index = self.tool_step_index
+        with self._snapshot_condition:
+            if self._latest_observation is None:
+                raise RuntimeError("The realtime ticker has not produced an observation yet.")
+            observation = copy.deepcopy(self._latest_observation)
+            state_events = [dict(event) for event in self._pending_state_events]
+            self._pending_state_events.clear()
+        observation["state_events"] = state_events
+        observation["state"]["events"] = state_events
+        observation["tool_step_index"] = tool_step_index
+        if refresh_control_panel:
+            self._refresh_control_panel()
         return observation
 
-    def press_button(
-        self,
-        button: str,
-        frames: int = 4,
-        after_frames: int = 8,
-    ) -> dict[str, Any]:
-        action = self._coerce_action({"button": button, "frames": frames, "after_frames": after_frames})
-        self._execute_action(action)
-        self.tool_step_index += 1
-        return {"executed_actions": [_action_dict(action)], "after_observation": self.observe()}
+    def _capture_cached_observation(self, *, force_visual: bool = False) -> None:
+        with self._env_lock:
+            env = self._require_env()
+            state = self.reader.read(env.memory)
+            state_dict = _game_state_dict(state)
+            state_events = _state_events(self._previous_state_snapshot, state_dict)
+            self._previous_state_snapshot = _state_snapshot(state_dict)
+            state_dict["events"] = state_events
 
-    def execute_actions(self, actions: list[dict[str, Any]]) -> dict[str, Any]:
-        coerced = [self._coerce_action(action) for action in actions]
-        if len(coerced) > 16:
-            raise ValueError("execute_actions accepts at most 16 actions")
+            with self._snapshot_condition:
+                previous = self._latest_observation
+                previous_ui = self._latest_ui_payload
+            refresh_visual = force_visual or previous is None
+            if refresh_visual:
+                game_area = matrix_to_rows(env.game_area())
+                collision = matrix_to_rows(env.game_area_collision())
+                walk_area_collision = compress_collision_to_walk_grid(collision)
+                screen_image = env.screen_image()
+                if hasattr(screen_image, "copy"):
+                    screen_image = screen_image.copy()
+                screenshot = self._png_payload(screen_image)
+                overlay_image = render_collision_overlay(screen_image, collision, player_position=state.position)
+                screenshot_overlay = self._png_payload(
+                    overlay_image,
+                    extra=overlay_metadata(overlay_image, player_position=state.position),
+                )
+                observation = {
+                    "ram_watch": format_ram_watch(env.memory, state),
+                    "game_area": game_area,
+                    "game_area_collision": collision,
+                    "walk_area_collision": walk_area_collision,
+                    "player_screen_tile": grid_point_dict(PLAYER_SCREEN_TILE),
+                    "player_walk_cell": grid_point_dict(PLAYER_WALK_CELL),
+                    "screenshot": screenshot,
+                    "screenshot_overlay": screenshot_overlay,
+                }
+                ui_payload = {
+                    "screen_image": screen_image,
+                    "overlay_image": overlay_image,
+                    "ram_text": observation["ram_watch"],
+                    "game_area_text": format_game_area_watch(env),
+                    "collision_text": format_game_area_collision_watch(env),
+                }
+                self._next_visual_snapshot_at = time.monotonic() + 1.0 / self.snapshot_refresh_hz
+            else:
+                observation = dict(previous)
+                walk_area_collision = observation.get("walk_area_collision", [])
+                ui_payload = dict(previous_ui or {})
 
-        for action in coerced:
-            self._execute_action(action)
-        self.tool_step_index += 1
-        return {"executed_actions": [_action_dict(action) for action in coerced], "after_observation": self.observe()}
+            observation.update(
+                {
+                    "tool_step_index": self.tool_step_index,
+                    "frame_index": self.frame_index,
+                    "state": state_dict,
+                    "state_events": state_events,
+                    "ram": state.raw,
+                    "visible_world_cells": _visible_world_cells(state.position, walk_area_collision),
+                    "safe_neighbor_world_cells": _safe_neighbor_world_cells(state.position, walk_area_collision),
+                    "control_ui": self.control_panel is not None,
+                }
+            )
+            observation["world_map"] = self.world_map_tracker.update_from_observation(observation)
+            ui_payload["state"] = state
+            ui_payload["world_map_text"] = self.world_map_tracker.current_ascii()
 
-    def step_frames(self, frames: int = 1, render: bool = False) -> dict[str, Any]:
-        frames = _bounded_int(frames, minimum=1, maximum=600, name="frames")
-        running = self._tick(frames, render=render)
-        self.tool_step_index += 1
-        return {"running": running, "frames": frames, "after_observation": self.observe()}
+        with self._snapshot_condition:
+            for event in state_events:
+                self._pending_state_events.append(dict(event))
+            self._latest_observation = observation
+            self._latest_ui_payload = ui_payload
+            listeners = tuple(self._observation_listeners)
+            self._snapshot_condition.notify_all()
+        with self._frame_condition:
+            self._frame_condition.notify_all()
+        for listener in listeners:
+            try:
+                listener(observation)
+            except Exception:
+                continue
+
+    def press_buttons(self, buttons: list[str]) -> dict[str, Any]:
+        if not isinstance(buttons, list):
+            raise ValueError("press_buttons expects a list of buttons")
+        if not buttons:
+            raise ValueError("press_buttons requires at least one button")
+        if len(buttons) > MAX_BUTTONS_PER_ACTION:
+            raise ValueError(f"press_buttons accepts at most {MAX_BUTTONS_PER_ACTION} buttons")
+
+        validated = [str(button).strip().lower() for button in buttons]
+        if any(token not in VALID_BUTTON_TOKENS for token in validated):
+            invalid = next(token for token in validated if token not in VALID_BUTTON_TOKENS)
+            raise ValueError(f"unknown button: {invalid}")
+
+        with self._action_gate.turn():
+            self._ensure_realtime_ticking()
+            started_at = time.monotonic()
+            executed_actions: list[dict[str, Any]] = []
+            stop_reason = "buttons_complete"
+            for token in validated:
+                with self._env_lock:
+                    start_frame = self.frame_index
+                if token != "wait":
+                    try:
+                        self._submit_emulator_command("button", token, BUTTON_HOLD_FRAMES)
+                    except RuntimeError:
+                        if self._realtime_error:
+                            stop_reason = self._realtime_stop_reason()
+                            break
+                        raise
+                if not self._wait_realtime(ACTION_WAIT_SECONDS, start_frame=start_frame):
+                    stop_reason = self._realtime_stop_reason()
+                    break
+                executed_actions.append({"button": token})
+            self.tool_step_index += 1
+            return {
+                "requested_buttons": validated,
+                "executed_actions": executed_actions,
+                "steps_taken": len(executed_actions),
+                "stop_reason": stop_reason,
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                "after_observation": self.observe(refresh_control_panel=False),
+            }
+
+    def wait(self) -> dict[str, Any]:
+        with self._action_gate.turn():
+            self._ensure_realtime_ticking()
+            started_at = time.monotonic()
+            with self._env_lock:
+                start_frame = self.frame_index
+            completed = self._wait_realtime(ACTION_WAIT_SECONDS, start_frame=start_frame)
+            self.tool_step_index += 1
+            return {
+                "waited": completed,
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                "stop_reason": "wait_complete" if completed else self._realtime_stop_reason(),
+                "after_observation": self.observe(refresh_control_panel=False),
+            }
 
     def save_state(self, kind: str = "snapshot", path: str | None = None) -> dict[str, Any]:
-        env = self._require_env()
-        state_path = self._resolve_state_path(kind, path, for_save=True)
-        env.save_state(state_path)
-        self._notify_control_panel_saved(state_path)
-        return {"saved": True, "kind": kind, "path": str(state_path)}
+        with self._action_gate.turn():
+            state_path = self._resolve_state_path(kind, path, for_save=True)
+            self._submit_emulator_command("save_state", state_path)
+            self._notify_control_panel_saved(state_path)
+            return {"saved": True, "kind": kind, "path": str(state_path)}
 
     def load_state(self, kind: str = "fixed", path: str | None = None) -> dict[str, Any]:
-        env = self._require_env()
-        state_path = self._resolve_state_path(kind, path, for_save=False)
-        if not state_path.exists():
-            raise FileNotFoundError(f"state not found: {state_path}")
-        env.load_state(state_path)
-        self._notify_control_panel_loaded(state_path)
-        self.tool_step_index += 1
-        return {"loaded": True, "kind": kind, "path": str(state_path), "after_observation": self.observe()}
+        with self._action_gate.turn():
+            state_path = self._resolve_state_path(kind, path, for_save=False)
+            if not state_path.exists():
+                raise FileNotFoundError(f"state not found: {state_path}")
+            self._submit_emulator_command("load_state", state_path)
+            with self._frame_condition:
+                self._next_realtime_tick_at = time.monotonic()
+            self._notify_control_panel_loaded(state_path)
+            self.tool_step_index += 1
+            return {
+                "loaded": True,
+                "kind": kind,
+                "path": str(state_path),
+                "after_observation": self.observe(refresh_control_panel=False),
+            }
 
     def reset_to_fixed(self) -> dict[str, Any]:
         return self.load_state(kind="fixed")
 
-    def move_to_screen_tile(
+    def move_to_world_cell(
         self,
         target_x: int,
         target_y: int,
-        max_steps: int = 8,
-        accept_nearest: bool = True,
     ) -> dict[str, Any]:
-        max_steps = _bounded_int(max_steps, minimum=0, maximum=64, name="max_steps")
-        before = self.observe()
+        target_x = _bounded_int(target_x, minimum=0, maximum=255, name="target_x")
+        target_y = _bounded_int(target_y, minimum=0, maximum=255, name="target_y")
+        with self._action_gate.turn():
+            self._ensure_realtime_ticking()
+            with self._snapshot_condition:
+                cached_frame = int((self._latest_observation or {}).get("frame_index", -1))
+            self._wait_for_snapshot_after(cached_frame)
+            current_observation = self.observe(refresh_control_panel=False)
+            current_position = _position_from_observation(current_observation)
+            if current_position is None:
+                raise ValueError("current player position is unknown")
+
+            player_position = type(PLAYER_WALK_CELL)(current_position.x, current_position.y)
+            requested_world_cell = type(PLAYER_WALK_CELL)(target_x, target_y)
+            requested_walk_cell = map_position_to_walk_cell(requested_world_cell, player_position)
+            target_walk_cell = requested_walk_cell
+            target_out_of_visible_area = not _walk_cell_in_visible_area(target_walk_cell)
+            if target_out_of_visible_area:
+                target_walk_cell = _clamp_walk_cell_to_visible_area(target_walk_cell)
+
+            result = self._move_to_walk_cell(target_walk_cell.x, target_walk_cell.y)
+            result["requested_world_cell"] = {"x": target_x, "y": target_y}
+            if target_out_of_visible_area:
+                result["target_out_of_visible_area"] = True
+
+            after_position = _position_from_observation(result.get("after_observation", {}))
+            if (
+                result.get("stop_reason") == "target_reached"
+                and not result.get("executed_actions")
+                and after_position != requested_world_cell
+            ):
+                result["stop_reason"] = "no_path"
+
+            resolved_walk = result.get("resolved_target", {}).get("walk_cell")
+            if isinstance(resolved_walk, dict):
+                resolved_world = walk_cell_to_map_position(
+                    type(PLAYER_WALK_CELL)(int(resolved_walk["x"]), int(resolved_walk["y"])),
+                    player_position,
+                )
+                result["resolved_world_cell"] = grid_point_dict(resolved_world)
+            result["planned_path"] = [
+                grid_point_dict(
+                    walk_cell_to_map_position(
+                        type(PLAYER_WALK_CELL)(int(point["x"]), int(point["y"])),
+                        player_position,
+                    )
+                )
+                for point in result.get("planned_path", [])
+                if isinstance(point, dict) and point.get("x") is not None and point.get("y") is not None
+            ]
+            result.pop("requested_target", None)
+            result.pop("resolved_target", None)
+            result.pop("planned_screen_path", None)
+            return result
+
+    def _move_to_walk_cell(self, target_x: int, target_y: int) -> dict[str, Any]:
+        target_x = _bounded_int(target_x, minimum=0, maximum=9, name="target_x")
+        target_y = _bounded_int(target_y, minimum=0, maximum=8, name="target_y")
+        screen_tile = walk_cell_to_screen_tile(type(PLAYER_WALK_CELL)(target_x, target_y))
+        result = self._move_to_screen_target(
+            target_x=screen_tile.x,
+            target_y=screen_tile.y,
+        )
+        return result
+
+    def _move_to_screen_target(
+        self,
+        target_x: int,
+        target_y: int,
+    ) -> dict[str, Any]:
+        self._navigation_attempt_index += 1
+        before = self.observe(refresh_control_panel=False)
         plan = plan_screen_path(
             target_x,
             target_y,
             before["game_area_collision"],
             start=PLAYER_WALK_CELL,
-            accept_nearest=accept_nearest,
+            accept_nearest=True,
+            blocked_edges=self._screen_blocked_edges(before),
         )
 
         requested_target = {
@@ -328,8 +803,8 @@ class PokemonSession:
             directions = directions_from_path(plan.path)
             stop_reason = "target_reached" if not directions else "planned_path_exhausted"
 
-            for direction in directions[:max_steps]:
-                current = self.observe()
+            for direction in directions[:MAX_MOVE_PATH_STEPS]:
+                current = self.observe(refresh_control_panel=False)
                 interruption = _interruption_reason(current)
                 if interruption is not None:
                     stop_reason = interruption
@@ -339,15 +814,40 @@ class PokemonSession:
                     stop_reason = "target_reached"
                     break
 
-                action = ButtonAction(cast(Button, direction), frames=4, after_frames=12)
-                self._execute_action(action)
-                executed_actions.append(_action_dict(action))
+                before_step_position = _position_from_observation(current)
+                with self._env_lock:
+                    start_frame = self.frame_index
+                try:
+                    self._submit_emulator_command("button", direction, BUTTON_HOLD_FRAMES)
+                except RuntimeError:
+                    if self._realtime_error:
+                        stop_reason = self._realtime_stop_reason()
+                        break
+                    raise
+                step_stop_reason = self._wait_for_move_step(
+                    before_step_position,
+                    start_frame=start_frame,
+                )
+                executed_actions.append({"button": direction})
                 self.tool_step_index += 1
 
-                after_step = self.observe()
+                after_step = self.observe(refresh_control_panel=False)
                 interruption = _interruption_reason(after_step)
                 if interruption is not None:
                     stop_reason = interruption
+                    break
+                if step_stop_reason is not None:
+                    stop_reason = step_stop_reason
+                    if stop_reason == "movement_blocked":
+                        self._record_blocked_world_edge(current, direction)
+                    break
+                after_step_position = _position_from_observation(after_step)
+                if before_step_position is not None and after_step_position == before_step_position:
+                    if _controls_locked(after_step):
+                        stop_reason = "controls_locked"
+                    else:
+                        self._record_blocked_world_edge(current, direction)
+                        stop_reason = "movement_blocked"
                     break
                 if world_goal is not None and _position_from_observation(after_step) == world_goal:
                     stop_reason = "target_reached"
@@ -358,7 +858,7 @@ class PokemonSession:
                 elif world_goal is None:
                     stop_reason = "planned_path_exhausted"
 
-        after = self.observe()
+        after = self.observe(refresh_control_panel=False)
         return {
             "requested_target": requested_target,
             "resolved_target": resolved_target,
@@ -371,41 +871,96 @@ class PokemonSession:
             "after_observation": after,
         }
 
-    def _execute_action(self, action: ButtonAction) -> None:
-        env = self._require_env()
-        env.button(action.button, frames=action.frames)
-        self._tick(max(action.frames, 1), render=True)
-        if action.after_frames > 0:
-            self._tick(action.after_frames, render=True)
+    def _wait_for_move_step(self, before_position: GridPoint | None, *, start_frame: int) -> str | None:
+        deadline = time.monotonic() + MOVE_STEP_TIMEOUT_SECONDS
+        last_controls_locked = False
+        with self._snapshot_condition:
+            while True:
+                if self._closing or self.env is None or self._realtime_error or not self.realtime_ticks_enabled:
+                    return self._realtime_stop_reason()
+                compact_observation = self._latest_observation or {}
+                state_dict = compact_observation.get("state", {})
+                interruption = _interruption_reason(compact_observation)
+                if interruption is not None:
+                    return interruption
+                position = state_dict.get("position") if isinstance(state_dict, dict) else None
+                current_position = None if not isinstance(position, dict) else GridPoint(
+                    int(position["x"]),
+                    int(position["y"]),
+                )
+                last_controls_locked = _controls_locked(compact_observation)
+                if (
+                    before_position is not None
+                    and current_position != before_position
+                    and int(compact_observation.get("frame_index", 0)) > start_frame
+                    and not last_controls_locked
+                ):
+                    return None
+                now = time.monotonic()
+                if now >= deadline:
+                    return "controls_locked" if last_controls_locked else "movement_blocked"
+                self._snapshot_condition.wait(timeout=min(0.05, deadline - now))
+
+    def _screen_blocked_edges(self, observation: dict[str, Any]) -> set[tuple[GridPoint, GridPoint]]:
+        state = observation.get("state", {})
+        map_id = state.get("map_id")
+        position = _position_from_observation(observation)
+        if map_id is None or position is None:
+            return set()
+
+        player = GridPoint(position.x, position.y)
+        blocked: set[tuple[GridPoint, GridPoint]] = set()
+        map_edges = self._blocked_world_edges.get(int(map_id), {})
+        expired = [edge for edge, recorded_at in map_edges.items() if self._navigation_attempt_index - recorded_at > 8]
+        for edge in expired:
+            map_edges.pop(edge, None)
+        for world_from, world_to in map_edges:
+            screen_from = map_position_to_walk_cell(GridPoint(*world_from), player)
+            screen_to = map_position_to_walk_cell(GridPoint(*world_to), player)
+            if _walk_cell_in_visible_area(screen_from) and _walk_cell_in_visible_area(screen_to):
+                blocked.add((screen_from, screen_to))
+        return blocked
+
+    def _record_blocked_world_edge(self, observation: dict[str, Any], direction: str) -> None:
+        state = observation.get("state", {})
+        map_id = state.get("map_id")
+        position = _position_from_observation(observation)
+        delta = {
+            "right": (1, 0),
+            "left": (-1, 0),
+            "down": (0, 1),
+            "up": (0, -1),
+        }.get(direction)
+        if map_id is None or position is None or delta is None:
+            return
+        source = (position.x, position.y)
+        target = (position.x + delta[0], position.y + delta[1])
+        self._blocked_world_edges.setdefault(int(map_id), {})[(source, target)] = self._navigation_attempt_index
 
     def _tick(self, frames: int, render: bool = False) -> bool:
-        env = self._require_env()
-        running = env.tick(frames, render=render or self._should_render_ticks())
-        self.frame_index += frames
-        return running
+        with self._frame_condition:
+            env = self._require_env()
+            running = env.tick(frames, render=render or self._should_render_ticks())
+            self.frame_index += frames
+            self._frame_condition.notify_all()
+            return running
 
     def _should_render_ticks(self) -> bool:
         return True
 
-    def _screenshot(self) -> dict[str, Any]:
-        image = self._require_env().screen_image()
+    def _png_payload(self, image: Any, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         width, height = image.size
         buffer = BytesIO()
         image.save(buffer, format="PNG")
-        return {
+        payload = {
             "format": "png",
             "width": int(width),
             "height": int(height),
             "base64": base64.b64encode(buffer.getvalue()).decode("ascii"),
         }
-
-    def _coerce_action(self, action: dict[str, Any]) -> ButtonAction:
-        button = str(action.get("button", ""))
-        if button not in VALID_BUTTONS:
-            raise ValueError(f"invalid button: {button}")
-        frames = _bounded_int(action.get("frames", 1), minimum=1, maximum=60, name="frames")
-        after_frames = _bounded_int(action.get("after_frames", 8), minimum=0, maximum=180, name="after_frames")
-        return ButtonAction(cast(Button, button), frames=frames, after_frames=after_frames)
+        if extra:
+            payload.update(extra)
+        return payload
 
     def _resolve_state_path(self, kind: str, path: str | None, *, for_save: bool) -> Path:
         self.paths.state_dir.mkdir(parents=True, exist_ok=True)
@@ -419,7 +974,7 @@ class PokemonSession:
             if not for_save:
                 return self.paths.last_state
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            state_name = _safe_name(self.observe()["state"]["map_name"])
+            state_name = _safe_name(self.observe(refresh_control_panel=False)["state"]["map_name"])
             return self.paths.state_dir / f"snapshot_{timestamp}_{state_name}.state"
         raise ValueError(f"unknown state kind: {kind}")
 
@@ -442,21 +997,26 @@ class PokemonSession:
         self._last_control_panel_update = 0.0
 
     def _refresh_control_panel(self, state: GameState | None = None, *, force: bool = False) -> None:
-        if self.control_panel is None or self.env is None:
+        if self.control_panel is None:
             return
 
         try:
-            if state is None:
-                state = self.reader.read(self.env.memory)
-
-            self.control_panel.update_screen_image(self.env.screen_image())
-
             now = time.monotonic()
-            if force or now - self._last_control_panel_update >= 1.0:
-                self.control_panel.update_ram_text(format_ram_watch(self.env.memory))
-                self.control_panel.update_game_area_text(format_game_area_watch(self.env))
-                self.control_panel.update_collision_text(format_game_area_collision_watch(self.env))
-                self.control_panel.update_world_map_text(self.world_map_tracker.current_ascii())
+            update_details = force or now - self._last_control_panel_update >= 1.0
+            with self._snapshot_condition:
+                payload = dict(self._latest_ui_payload or {})
+            state = payload.get("state")
+            screen_image = payload.get("screen_image")
+            if state is None or screen_image is None:
+                return
+            self.control_panel.update_screen_image(screen_image)
+
+            if update_details:
+                self.control_panel.update_ram_text(str(payload.get("ram_text", "")))
+                self.control_panel.update_game_area_text(str(payload.get("game_area_text", "")))
+                self.control_panel.update_collision_text(str(payload.get("collision_text", "")))
+                self.control_panel.update_overlay_image(payload.get("overlay_image"))
+                self.control_panel.update_world_map_text(str(payload.get("world_map_text", "")))
                 if self.mcp_log_provider is not None:
                     self.control_panel.update_mcp_log_text(self.mcp_log_provider())
                 self._last_control_panel_update = now
@@ -475,16 +1035,33 @@ class PokemonSession:
             if command.action == "save_state":
                 if command.path is None:
                     continue
-                self._require_env().save_state(command.path)
-                self._notify_control_panel_saved(command.path)
+                self.save_state(path=str(command.path))
             elif command.action == "load_state":
                 if command.path is None:
                     continue
                 if not command.path.exists():
                     self._notify_control_panel_error(f"not found: {command.path}")
                     continue
-                self._require_env().load_state(command.path)
-                self._notify_control_panel_loaded(command.path)
+                self.load_state(path=str(command.path))
+            elif command.action == "move":
+                if command.target is None:
+                    self._notify_control_panel_error("move target is missing")
+                    continue
+                try:
+                    result = self.move_to_world_cell(command.target[0], command.target[1])
+                except Exception as exc:
+                    self._notify_control_panel_error(f"move failed: {type(exc).__name__}: {exc}")
+                    continue
+                if self.control_panel is not None:
+                    self.control_panel.notify_move_result(result)
+            elif command.action == "buttons":
+                try:
+                    result = self.press_buttons(list(command.buttons))
+                except Exception as exc:
+                    self._notify_control_panel_error(f"buttons failed: {type(exc).__name__}: {exc}")
+                    continue
+                if self.control_panel is not None:
+                    self.control_panel.notify_buttons_result(result)
             elif command.action == "stop":
                 self.stop(save_final=False)
                 return
@@ -514,31 +1091,283 @@ class PokemonSession:
 
 
 def _game_state_dict(state: GameState) -> dict[str, Any]:
+    raw = dict(state.raw)
+    last_map_id = _int_or_none(raw.get("last_map"))
+    block_position = _position_dict(raw.get("player_x_block"), raw.get("player_y_block"))
+    dialog_text = state.dialog_text
     return {
         "map_id": state.map_id,
         "map_name": state.map_name,
         "position": None if state.position is None else {"x": state.position.x, "y": state.position.y},
+        "block_position": block_position,
         "facing": state.facing,
         "mode": state.mode.value if isinstance(state.mode, GameMode) else str(state.mode),
         "in_battle": state.in_battle,
         "dialog_open": state.dialog_open,
+        "player_name": state.player_name,
+        "rival_name": state.rival_name,
         "money": state.money,
+        "coins": state.coins,
+        "game_time": state.game_time,
+        "tileset": state.tileset,
+        "pokedex_caught": state.pokedex_caught,
+        "badges": list(state.badges),
         "party": [member.__dict__ for member in state.party],
         "items": [item.__dict__ for item in state.items],
+        "warps": [{"x": warp.x, "y": warp.y} for warp in state.warps],
+        "dialog_text": state.dialog_text,
         "nearby_npcs": [npc.__dict__ for npc in state.nearby_npcs],
         "nearby_exits": [exit_observation.__dict__ for exit_observation in state.nearby_exits],
         "flags": dict(state.flags),
-        "raw": dict(state.raw),
+        "map": {
+            "id": state.map_id,
+            "name": state.map_name,
+            "last_map_id": last_map_id,
+            "last_map_name": None if last_map_id is None else _map_name(last_map_id),
+            "width": _int_or_none(raw.get("map_width")),
+            "height": _int_or_none(raw.get("map_height")),
+            "tileset": state.tileset,
+            "tileset_id": _int_or_none(raw.get("tileset")),
+            "tileset_type": _int_or_none(raw.get("tileset_type")),
+            "collision_ptr": _int_or_none(raw.get("collision_ptr")),
+            "grass_tile": _int_or_none(raw.get("grass_tile")),
+        },
+        "position_detail": {
+            "tile": None if state.position is None else {"x": state.position.x, "y": state.position.y},
+            "block": block_position,
+            "facing": state.facing,
+        },
+        "dialog": {
+            "open": state.dialog_open,
+            "text": dialog_text,
+            "box_detected": bool(raw.get("dialog_box_detected")),
+            "has_text": bool(dialog_text),
+            "text_length": 0 if dialog_text is None else len(dialog_text),
+        },
+        "battle": {
+            "active": state.in_battle,
+            "type": _int_or_none(raw.get("battle_type")),
+            "kind": _int_or_none(raw.get("battle_kind")),
+            "turns": _int_or_none(raw.get("battle_turns")),
+        },
+        "menu": {
+            "active": state.mode == GameMode.INVENTORY,
+            "selection": _int_or_none(raw.get("menu_selection")),
+            "start_menu_cursor": _int_or_none(raw.get("start_menu_cursor")),
+        },
+        "counts": {
+            "party": _int_or_none(raw.get("party_count")),
+            "items": _int_or_none(raw.get("item_count")),
+            "warps": _int_or_none(raw.get("warp_count")),
+            "badges": len(state.badges),
+            "pokedex_caught": state.pokedex_caught,
+        },
+        "raw": raw,
         "summary": state.summary(),
     }
 
 
-def _action_dict(action: ButtonAction) -> dict[str, Any]:
+def _visible_world_cells(position: Position | None, walk_area_collision: list[list[int]]) -> list[list[dict[str, Any]]]:
+    if position is None:
+        return []
+    player_position = type(PLAYER_WALK_CELL)(position.x, position.y)
+    rows: list[list[dict[str, Any]]] = []
+    for walk_y, row in enumerate(walk_area_collision):
+        cells: list[dict[str, Any]] = []
+        for walk_x, walkable in enumerate(row):
+            world = walk_cell_to_map_position(type(PLAYER_WALK_CELL)(walk_x, walk_y), player_position)
+            cells.append({"x": world.x, "y": world.y, "walkable": bool(walkable)})
+        rows.append(cells)
+    return rows
+
+
+def _safe_neighbor_world_cells(position: Position | None, walk_area_collision: list[list[int]]) -> list[dict[str, Any]]:
+    if position is None:
+        return []
+    player_position = type(PLAYER_WALK_CELL)(position.x, position.y)
+    candidates = [
+        ("right", 1, 0),
+        ("down", 0, 1),
+        ("left", -1, 0),
+        ("up", 0, -1),
+    ]
+    targets: list[dict[str, Any]] = []
+    for direction, dx, dy in candidates:
+        walk_x = PLAYER_WALK_CELL.x + dx
+        walk_y = PLAYER_WALK_CELL.y + dy
+        if 0 <= walk_y < len(walk_area_collision) and 0 <= walk_x < len(walk_area_collision[walk_y]):
+            if not walk_area_collision[walk_y][walk_x]:
+                continue
+            world = walk_cell_to_map_position(type(PLAYER_WALK_CELL)(walk_x, walk_y), player_position)
+            targets.append({"direction": direction, "x": world.x, "y": world.y})
+    return targets
+
+
+def _state_snapshot(state: dict[str, Any]) -> dict[str, Any]:
     return {
-        "button": action.button,
-        "frames": action.frames,
-        "after_frames": action.after_frames,
+        "map_id": state.get("map_id"),
+        "map_name": state.get("map_name"),
+        "position": state.get("position"),
+        "mode": state.get("mode"),
+        "in_battle": state.get("in_battle"),
+        "dialog_open": state.get("dialog_open"),
+        "dialog_text": state.get("dialog_text"),
+        "money": state.get("money"),
+        "coins": state.get("coins"),
+        "badges": state.get("badges"),
+        "party": state.get("party"),
+        "items": state.get("items"),
+        "pokedex_caught": state.get("pokedex_caught"),
+        "flags": _durable_flags(state.get("flags")),
+        "warps": state.get("warps"),
     }
+
+
+def _state_events(previous: dict[str, Any] | None, current: dict[str, Any]) -> list[dict[str, Any]]:
+    if previous is None:
+        return [{"type": "initial_observation", "summary": current.get("summary")}]
+
+    events: list[dict[str, Any]] = []
+    _append_changed_event(events, "mode_changed", previous, current, "mode")
+
+    if previous.get("map_id") != current.get("map_id"):
+        events.append(
+            {
+                "type": "map_changed",
+                "from": {"id": previous.get("map_id"), "name": previous.get("map_name")},
+                "to": {"id": current.get("map_id"), "name": current.get("map_name")},
+            }
+        )
+        events.append(
+            {
+                "type": "warp",
+                "from": {"id": previous.get("map_id"), "name": previous.get("map_name")},
+                "to": {"id": current.get("map_id"), "name": current.get("map_name")},
+            }
+        )
+
+    if previous.get("position") != current.get("position"):
+        events.append({"type": "position_changed", "from": previous.get("position"), "to": current.get("position")})
+
+    previous_dialog_open = bool(previous.get("dialog_open"))
+    current_dialog_open = bool(current.get("dialog_open"))
+    if not previous_dialog_open and current_dialog_open:
+        events.append({"type": "dialog_opened", "text": current.get("dialog_text")})
+    elif previous_dialog_open and not current_dialog_open:
+        events.append({"type": "dialog_closed", "previous_text": previous.get("dialog_text")})
+    elif current_dialog_open and previous.get("dialog_text") != current.get("dialog_text"):
+        events.append(
+            {
+                "type": "dialog_text_changed",
+                "from": previous.get("dialog_text"),
+                "to": current.get("dialog_text"),
+            }
+        )
+
+    if not bool(previous.get("in_battle")) and bool(current.get("in_battle")):
+        events.append({"type": "battle_started"})
+    elif bool(previous.get("in_battle")) and not bool(current.get("in_battle")):
+        events.append({"type": "battle_ended"})
+
+    previous_menu = previous.get("mode") == "inventory"
+    current_menu = current.get("mode") == "inventory"
+    if not previous_menu and current_menu:
+        events.append({"type": "menu_opened"})
+    elif previous_menu and not current_menu:
+        events.append({"type": "menu_closed"})
+
+    item_deltas = _positive_item_deltas(previous.get("items"), current.get("items"))
+    for item_name, quantity in item_deltas.items():
+        events.append({"type": "item_obtained", "item": item_name, "quantity": quantity})
+    previous_party = previous.get("party") if isinstance(previous.get("party"), list) else []
+    current_party = current.get("party") if isinstance(current.get("party"), list) else []
+    if len(current_party) > len(previous_party):
+        events.append({"type": "pokemon_obtained", "party_size": len(current_party)})
+
+    for key, event_type in (
+        ("money", "money_changed"),
+        ("coins", "coins_changed"),
+        ("badges", "badges_changed"),
+        ("party", "party_changed"),
+        ("items", "items_changed"),
+        ("pokedex_caught", "pokedex_changed"),
+        ("warps", "warps_changed"),
+    ):
+        _append_changed_event(events, event_type, previous, current, key)
+    previous_flags = _durable_flags(previous.get("flags"))
+    current_flags = _durable_flags(current.get("flags"))
+    if previous_flags != current_flags:
+        events.append({"type": "event_flags_changed", "from": previous_flags, "to": current_flags})
+
+    return events
+
+
+def _append_changed_event(
+    events: list[dict[str, Any]],
+    event_type: str,
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    key: str,
+) -> None:
+    if previous.get(key) != current.get(key):
+        events.append({"type": event_type, "from": previous.get(key), "to": current.get(key)})
+
+
+def _positive_item_deltas(previous_items: Any, current_items: Any) -> dict[str, int]:
+    def counts(items: Any) -> dict[str, int]:
+        result: dict[str, int] = {}
+        if not isinstance(items, list):
+            return result
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("item_id") or "unknown")
+            result[name] = result.get(name, 0) + int(item.get("quantity") or 0)
+        return result
+
+    before = counts(previous_items)
+    after = counts(current_items)
+    return {name: quantity - before.get(name, 0) for name, quantity in after.items() if quantity > before.get(name, 0)}
+
+
+def _durable_flags(flags: Any) -> dict[str, Any]:
+    if not isinstance(flags, dict):
+        return {}
+    return {str(key): value for key, value in flags.items() if not str(key).startswith("has_")}
+
+
+def _position_dict(x: Any, y: Any) -> dict[str, int] | None:
+    x_value = _int_or_none(x)
+    y_value = _int_or_none(y)
+    if x_value is None or y_value is None:
+        return None
+    return {"x": x_value, "y": y_value}
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _map_name(map_id: int) -> str:
+    from pokemon_agent.memory.memory_reader import POKEMON_RED_MAP_NAMES
+
+    return POKEMON_RED_MAP_NAMES.get(map_id, f"Map {map_id:#04x}")
+
+
+def _walk_cell_in_visible_area(point: Any) -> bool:
+    return 0 <= int(point.x) <= 9 and 0 <= int(point.y) <= 8
+
+
+def _clamp_walk_cell_to_visible_area(point: Any) -> Any:
+    return type(PLAYER_WALK_CELL)(
+        max(0, min(9, int(point.x))),
+        max(0, min(8, int(point.y))),
+    )
 
 
 def _bounded_int(value: Any, *, minimum: int, maximum: int, name: str) -> int:
@@ -577,10 +1406,8 @@ def _world_goal_from_observation(observation: dict[str, Any], target_walk_cell: 
     position = _position_from_observation(observation)
     if position is None:
         return None
-    return Position(
-        x=position.x + target_walk_cell.x - PLAYER_WALK_CELL.x,
-        y=position.y + target_walk_cell.y - PLAYER_WALK_CELL.y,
-    )
+    map_position = walk_cell_to_map_position(target_walk_cell, type(PLAYER_WALK_CELL)(position.x, position.y))
+    return Position(x=map_position.x, y=map_position.y)
 
 
 def _interruption_reason(observation: dict[str, Any]) -> str | None:
@@ -593,3 +1420,8 @@ def _interruption_reason(observation: dict[str, Any]) -> str | None:
     if mode == "inventory":
         return "interrupted_menu"
     return None
+
+
+def _controls_locked(observation: dict[str, Any]) -> bool:
+    raw = observation.get("state", {}).get("raw", {})
+    return bool(raw.get("controls_locked")) if isinstance(raw, dict) else False

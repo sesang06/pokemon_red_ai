@@ -1,0 +1,1 @@
+"""Pokemon Red agent roles."""

@@ -13,14 +13,11 @@ class PokemonToolClient(Protocol):
     def observe(self) -> dict[str, Any]:
         """Return the latest observation."""
 
-    def press_button(self, button: str, frames: int = 4, after_frames: int = 8) -> dict[str, Any]:
-        """Press one button."""
+    def press_buttons(self, buttons: list[str]) -> dict[str, Any]:
+        """Press a bounded sequence of buttons."""
 
-    def execute_actions(self, actions: list[dict[str, Any]]) -> dict[str, Any]:
-        """Execute primitive button actions."""
-
-    def step_frames(self, frames: int = 1, render: bool = False) -> dict[str, Any]:
-        """Advance frames."""
+    def wait(self) -> dict[str, Any]:
+        """Wait while the realtime ticker advances the game."""
 
     def save_state(self, kind: str = "snapshot", path: str | None = None) -> dict[str, Any]:
         """Save state."""
@@ -31,20 +28,13 @@ class PokemonToolClient(Protocol):
     def reset_to_fixed(self) -> dict[str, Any]:
         """Reset to the fixed state."""
 
-    def move_to_screen_tile(
-        self,
-        target_x: int,
-        target_y: int,
-        max_steps: int = 8,
-        accept_nearest: bool = True,
-    ) -> dict[str, Any]:
-        """Move toward a screen tile."""
+    def move_to_world_cell(self, target_x: int, target_y: int) -> dict[str, Any]:
+        """Move toward a current-map/world coordinate."""
 
     def set_realtime_ticks(
         self,
         enabled: bool = True,
         fps: float = 60.0,
-        max_frames_per_pump: int = 12,
     ) -> dict[str, Any]:
         """Configure realtime ticking outside planner actions."""
 
@@ -73,20 +63,15 @@ class InProcessPokemonMcpClient:
 
         return mcp_server.observe()
 
-    def press_button(self, button: str, frames: int = 4, after_frames: int = 8) -> dict[str, Any]:
+    def press_buttons(self, buttons: list[str]) -> dict[str, Any]:
         from pokemon_agent import mcp_server
 
-        return mcp_server.press_button(button=button, frames=frames, after_frames=after_frames)
+        return mcp_server.press_buttons(buttons=buttons)
 
-    def execute_actions(self, actions: list[dict[str, Any]]) -> dict[str, Any]:
+    def wait(self) -> dict[str, Any]:
         from pokemon_agent import mcp_server
 
-        return mcp_server.execute_actions(actions)
-
-    def step_frames(self, frames: int = 1, render: bool = False) -> dict[str, Any]:
-        from pokemon_agent import mcp_server
-
-        return mcp_server.step_frames(frames=frames, render=render)
+        return mcp_server.wait()
 
     def save_state(self, kind: str = "snapshot", path: str | None = None) -> dict[str, Any]:
         from pokemon_agent import mcp_server
@@ -103,34 +88,24 @@ class InProcessPokemonMcpClient:
 
         return mcp_server.reset_to_fixed()
 
-    def move_to_screen_tile(
-        self,
-        target_x: int,
-        target_y: int,
-        max_steps: int = 8,
-        accept_nearest: bool = True,
-    ) -> dict[str, Any]:
+    def move_to_world_cell(self, target_x: int, target_y: int) -> dict[str, Any]:
         from pokemon_agent import mcp_server
 
-        return mcp_server.move_to_screen_tile(
+        return mcp_server.move_to_world_cell(
             target_x=target_x,
             target_y=target_y,
-            max_steps=max_steps,
-            accept_nearest=accept_nearest,
         )
 
     def set_realtime_ticks(
         self,
         enabled: bool = True,
         fps: float = 60.0,
-        max_frames_per_pump: int = 12,
     ) -> dict[str, Any]:
         from pokemon_agent import mcp_server
 
         return mcp_server.set_realtime_ticks(
             enabled=enabled,
             fps=fps,
-            max_frames_per_pump=max_frames_per_pump,
         )
 
     def realtime_tick_status(self) -> dict[str, Any]:
