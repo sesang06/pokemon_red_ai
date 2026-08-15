@@ -36,6 +36,7 @@ from pokemon_agent.adk_agent.runtime.session import (
 from pokemon_agent.input_contract import (
     MAX_BUTTONS_PER_ACTION,
     MAX_MOVE_PATH_STEPS,
+    MAX_MOVE_WAYPOINTS,
     MAX_WORLD_NAVIGATION_SEGMENTS,
 )
 
@@ -764,6 +765,35 @@ def test_sanitize_planned_action_accepts_move_target() -> None:
         "target": [1, 3],
         "reason": "adk_move",
     }
+
+
+def test_sanitize_planned_action_accepts_ordered_move_waypoints() -> None:
+    assert sanitize_planned_action(
+        {
+            "type": "move",
+            "waypoints": [[4, 5], (8, 9)],
+            "target": [12, 9],
+            "reason": "follow_known_route",
+        }
+    ) == {
+        "type": "move",
+        "waypoints": [[4, 5], [8, 9]],
+        "target": [12, 9],
+        "reason": "follow_known_route",
+    }
+
+
+def test_sanitize_planned_action_rejects_invalid_move_waypoints() -> None:
+    assert sanitize_planned_action(
+        {"type": "move", "waypoints": [[4, 5, 6]], "target": [12, 9]}
+    ) is None
+    assert sanitize_planned_action(
+        {
+            "type": "move",
+            "waypoints": [[index, 5] for index in range(MAX_MOVE_WAYPOINTS + 1)],
+            "target": [12, 9],
+        }
+    ) is None
 
 
 def test_normalize_action_plan_accepts_one_shot_action_contract() -> None:

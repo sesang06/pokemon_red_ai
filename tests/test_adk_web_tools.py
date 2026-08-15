@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
-from pokemon_agent import mcp_server
 from pokemon_agent.adk_agent.agents.planner.prompt import PLANNING_AGENT_PROMPT
 from pokemon_agent.adk_agent.agents.interpreter.prompt import RESULT_INTERPRETER_PROMPT
 from pokemon_agent.adk_agent.agents.shared import MAX_AUTOMATIC_FUNCTION_CALLS
@@ -11,164 +9,29 @@ from pokemon_agent.input_contract import (
     BUTTON_TOKENS,
     MAX_BUTTONS_PER_ACTION,
     MAX_MOVE_PATH_STEPS,
+    MAX_MOVE_WAYPOINTS,
     MAX_WORLD_NAVIGATION_SEGMENTS,
 )
 from pokemon_agent.adk_agent.runtime.state import FileAgentRuntimeState
 from pokemon_agent.adk_agent.agent import app as entrypoint_app
 from pokemon_agent.adk_agent.agent import root_agent as entrypoint_root_agent
 from pokemon_agent.adk_agent.web import tools as web_tools
-from pokemon_agent.adk_agent.web.app import app, build_app, build_root_agent
+from pokemon_agent.adk_agent.web.app import (
+    _McpDashboardHub,
+    _compact_dashboard_runtime_state,
+    app,
+    build_app,
+    build_root_agent,
+)
 from pokemon_agent.adk_agent.web.prompt import WEB_AGENT_PROMPT
 import pokemon_agent.adk_agent.runtime.state as runtime_state_module
-from pokemon_agent.memory.file_memory import FileLongTermMemory
-import pokemon_agent.session as session_module
-from pokemon_agent.session import PokemonSession
-
-from tests.fakes import FakePokemonEnvironment, fake_session_paths
 
 
 def test_adk_dev_ui_entrypoint_exports_the_compacted_team_app() -> None:
     assert entrypoint_app.name == "adk_agent"
     assert entrypoint_app.root_agent is entrypoint_root_agent
-    assert entrypoint_root_agent.name == "pokemon_red_team"
-
-
-def test_adk_web_tools_observe_returns_compact_screenshot(tmp_path: Path) -> None:
-    fake_env = FakePokemonEnvironment()
-    session = PokemonSession(
-        paths=fake_session_paths(tmp_path),
-        env_factory=lambda rom, window: fake_env,
-    )
-    mcp_server.set_session_for_tests(session)
-
-    web_tools.start_game(load_fixed=False, control_ui=False, realtime_ticks=False)
-    observation = web_tools.observe_game(include_screenshot_base64=True)
-
-    assert observation["screenshot"]["format"] == "png"
-    assert observation["screenshot"]["width"] == 160
-    assert observation["screenshot"]["height"] == 144
-    assert observation["screenshot"]["base64"]
-    assert observation["screenshot_overlay"]["format"] == "png"
-    assert observation["screenshot_overlay"]["width"] == 640
-    assert observation["screenshot_overlay"]["height"] == 576
-    assert observation["screenshot_overlay"]["collision_truthy"] == "walkable"
-    assert observation["screenshot_overlay"]["walk_cell_size"] == 2
-    assert observation["screenshot_overlay"]["player_map_position"] == {"x": 5, "y": 6}
-    assert "walk_cell_map_coordinates" in observation["screenshot_overlay"]["overlays"]
-    assert "screen_tile_coordinates" not in observation["screenshot_overlay"]["overlays"]
-    assert observation["screenshot_overlay"]["base64"]
-    assert len(observation["visible_world_cells"]) == 9
-    assert len(observation["visible_world_cells"][0]) == 10
-    assert observation["visible_world_cells"][4][4] == {"x": 5, "y": 6, "walkable": True}
-    assert {"direction": "right", "x": 6, "y": 6} in observation["safe_neighbor_world_cells"]
-    assert observation["state_events"][0]["type"] == "initial_observation"
-    assert observation["state"]["dialog"]["open"] is False
-    assert "battle" not in observation["state"]
-    assert observation["state"]["counts"]["party"] == 0
-    assert "raw" not in observation["state"]
-
-
-def test_adk_web_tools_move_and_command_log(tmp_path: Path) -> None:
-    fake_env = FakePokemonEnvironment()
-    session = PokemonSession(
-        paths=fake_session_paths(tmp_path),
-        env_factory=lambda rom, window: fake_env,
-    )
-    mcp_server.set_session_for_tests(session)
-
-    web_tools.start_game(load_fixed=False, control_ui=False, realtime_ticks=False)
-    result = web_tools.move([6, 6])
-    log = web_tools.recent_game_commands(limit=20)
-
-    assert result["executed_actions"][0]["button"] == "right"
-    assert result["after_observation"]["screenshot"]["base64_length"] > 0
-    assert result["after_observation"]["screenshot_overlay"]["base64_length"] > 0
-    assert "move_to_world_cell" in [entry["tool"] for entry in log["commands"]]
-
-
-def test_adk_web_tools_action_contract_wrappers(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(session_module, "ACTION_WAIT_SECONDS", 0.01)
-    fake_env = FakePokemonEnvironment()
-    session = PokemonSession(
-        paths=fake_session_paths(tmp_path),
-        env_factory=lambda rom, window: fake_env,
-    )
-    mcp_server.set_session_for_tests(session)
-
-    web_tools.start_game(load_fixed=False, control_ui=False, realtime_ticks=False)
-    pressed = web_tools.buttons(["a", "wait"])
-    moved = web_tools.move([6, 6])
-    log = web_tools.recent_game_commands(limit=20)
-
-    assert [action["button"] for action in pressed["executed_actions"]] == ["a", "wait"]
-    assert moved["requested_world_cell"] == {"x": 6, "y": 6}
-    assert "requested_walk_cell" not in moved
-    move_entries = [entry for entry in log["commands"] if entry["tool"] == "move_to_world_cell"]
-    assert move_entries[-1]["args"] == {"target_x": 6, "target_y": 6}
-
-
-def test_adk_web_tools_press_buttons_and_wait(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(session_module, "ACTION_WAIT_SECONDS", 0.01)
-    fake_env = FakePokemonEnvironment()
-    session = PokemonSession(
-        paths=fake_session_paths(tmp_path),
-        env_factory=lambda rom, window: fake_env,
-    )
-    mcp_server.set_session_for_tests(session)
-
-    web_tools.start_game(load_fixed=False, control_ui=False, realtime_ticks=False)
-    pressed = web_tools.buttons(["a"])
-    waited = web_tools.wait()
-    log = web_tools.recent_game_commands(limit=20)
-
-    assert pressed["executed_actions"][0]["button"] == "a"
-    assert waited["waited"] is True
-    assert "press_buttons" in [entry["tool"] for entry in log["commands"]]
-    assert "wait" in [entry["tool"] for entry in log["commands"]]
-
-
-def test_adk_web_tools_save_screenshot_uses_date_folder(tmp_path: Path) -> None:
-    fake_env = FakePokemonEnvironment()
-    session = PokemonSession(
-        paths=fake_session_paths(tmp_path),
-        env_factory=lambda rom, window: fake_env,
-    )
-    mcp_server.set_session_for_tests(session)
-
-    web_tools.start_game(load_fixed=False, control_ui=False, realtime_ticks=False)
-    result = web_tools.save_current_screenshot()
-    saved_path = Path(result["path"])
-
-    assert result["saved"] is True
-    assert saved_path.exists()
-    assert saved_path.parent.parent == tmp_path / "captures"
-    assert saved_path.parent.name.isdigit()
-    assert saved_path.name.startswith("adk_web_")
-    assert saved_path.suffix == ".png"
-
-
-def test_adk_web_memory_tools_support_validated_memory_types(tmp_path: Path, monkeypatch) -> None:
-    store = FileLongTermMemory(tmp_path / "long_term_memory.json")
-    monkeypatch.setattr(web_tools, "_memory_store", lambda: store)
-
-    write_result = web_tools.save_memory(
-        entries=[
-            {"memory_type": "event", "name": "starter_selection", "value": "Bulbasaur was chosen"},
-            {"memory_type": "pokemon", "name": "Bulbasaur", "value": "chosen as starter"},
-        ]
-    )
-    search_result = web_tools.search_memory(
-        queries=[
-            {"memory_type": "event", "name": "starter_selection"},
-            {"memory_type": "pokemon", "name": "Bulbasaur"},
-        ]
-    )
-
-    assert write_result["phase"] == "memory_write"
-    assert write_result["keys"] == ["event:starter_selection", "pokemon:Bulbasaur"]
-    assert search_result["keys"] == ["event:starter_selection", "pokemon:Bulbasaur"]
-    assert search_result["results"][0]["item"]["value"] == "Bulbasaur was chosen"
-    assert set(store.items()) == {"event:starter_selection", "pokemon:Bulbasaur"}
+    assert entrypoint_root_agent.name == "pokemon_red_web_coordinator"
+    assert entrypoint_root_agent.sub_agents[0].name == "pokemon_red_team"
 
 
 def test_adk_web_tools_read_shared_cli_runtime_history(tmp_path: Path, monkeypatch) -> None:
@@ -193,98 +56,49 @@ def test_adk_web_tools_read_shared_cli_runtime_history(tmp_path: Path, monkeypat
     assert actions["actions"] == [{"step": 7}]
 
 
-def test_adk_web_starts_exact_cli_runner_once(tmp_path: Path, monkeypatch) -> None:
-    class FakeProcess:
-        pid = 4242
+def test_adk_web_dashboard_bridge_forwards_compact_agent_updates() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = []
 
-        def poll(self):
-            return None
+        def publish_dashboard_trace(self, trace):
+            self.calls.append(("trace", trace))
 
-    runner_state = web_tools._AgentRunnerProcess()
-    log_path = tmp_path / "runner.log"
-    captured: dict[str, object] = {}
+        def publish_dashboard_runtime(self, state, *, phase):
+            self.calls.append(("runtime", state, phase))
 
-    def fake_popen(command, **kwargs):
-        captured["command"] = command
-        captured["cwd"] = kwargs["cwd"]
-        captured["stderr"] = kwargs["stderr"]
-        captured["stdout_path"] = kwargs["stdout"].name
-        return FakeProcess()
+        def publish_dashboard_memory(self, items, activity=None):
+            self.calls.append(("memory", items, activity))
 
-    monkeypatch.setattr(web_tools, "_AGENT_RUNNER", runner_state)
-    monkeypatch.setattr(web_tools, "_runner_log_path", lambda started_at: log_path)
-    monkeypatch.setattr(web_tools.subprocess, "Popen", fake_popen)
-
-    started = web_tools.start_agent_runner(steps=100)
-    repeated = web_tools.start_agent_runner(steps=200)
-
-    assert captured["command"] == [
-        web_tools.sys.executable,
-        "-m",
-        "pokemon_agent.adk_agent.runner",
-        "--steps",
-        "100",
-        "--objective",
-        "complete_pokemon_red",
-    ]
-    assert captured["cwd"] == str(web_tools.PROJECT_ROOT)
-    assert captured["stderr"] is subprocess.STDOUT
-    assert Path(str(captured["stdout_path"])) == log_path
-    assert started["started"] is True
-    assert started["pid"] == 4242
-    assert started["defaults"] == {
-        "window": "SDL2",
-        "control_ui": True,
-        "realtime_ticks": True,
-        "vision": True,
-        "thinking_budget": -1,
-        "checkpoint_every": 10,
-    }
-    assert repeated["started"] is False
-    assert repeated["already_running"] is True
-    assert repeated["steps"] == 100
-
-
-def test_adk_web_runner_status_reports_progress_and_log(tmp_path: Path, monkeypatch) -> None:
-    class CompletedProcess:
-        pid = 4242
-
-        def poll(self):
-            return 0
-
-    runtime_store = FileAgentRuntimeState(tmp_path / "runtime.json")
-    runtime_store.publish(
-        {
-            "step_count": 100,
-            "mode": "overworld",
-            "done": True,
-            "termination_reason": "max_steps_reached",
+    client = FakeClient()
+    hub = _McpDashboardHub(client)
+    state = {
+        "step_count": 3,
+        "max_steps": 100,
+        "planned_action": {"type": "buttons", "buttons": ["a"]},
+        "action_result": {
+            "stop_reason": "buttons_complete",
+            "before_observation": {"screenshot": {"base64": "large"}},
+            "after_observation": {"screenshot": {"base64": "large"}},
         },
-        phase="completed",
-    )
-    log_path = tmp_path / "runner.log"
-    log_path.write_text("one\ntwo\nthree\n", encoding="utf-8")
-    runner_state = web_tools._AgentRunnerProcess()
-    runner_state.process = CompletedProcess()
-    runner_state.metadata = {
-        "pid": 4242,
-        "steps": 100,
-        "objective": "complete_pokemon_red",
-        "started_at": "2026-08-15T17:00:00",
-        "log_path": str(log_path),
+        "observation": {"screenshot": {"base64": "large"}},
     }
-    monkeypatch.setattr(web_tools, "_AGENT_RUNNER", runner_state)
-    monkeypatch.setattr(web_tools, "_runtime_store", lambda: runtime_store)
 
-    status = web_tools.agent_runner_status(log_lines=2)
+    hub.publish_trace({"phase": "planning_thinking", "thinking_summary": "Read the dialog."})
+    hub.publish_runtime(state, phase="planned")
+    hub.publish_memory_snapshot({"map:Oak's Lab": {"value": "starter table"}})
+    hub.publish_memory_activity(
+        {"map:Oak's Lab": {"value": "starter table"}},
+        {"tool": "search_memory", "keys": ["map:Oak's Lab"]},
+    )
 
-    assert status["status"] == "completed"
-    assert status["running"] is False
-    assert status["return_code"] == 0
-    assert status["progress"]["step_count"] == 100
-    assert status["progress"]["max_steps"] == 100
-    assert status["progress"]["termination_reason"] == "max_steps_reached"
-    assert status["log_tail"] == ["two", "three"]
+    runtime = client.calls[1][1]
+    assert runtime["step_count"] == 3
+    assert runtime["action_result"] == {"stop_reason": "buttons_complete"}
+    assert "observation" not in runtime
+    assert client.calls[0][1]["thinking_summary"] == "Read the dialog."
+    assert client.calls[-1][2]["keys"] == ["map:Oak's Lab"]
+    assert _compact_dashboard_runtime_state(state) == runtime
 
 
 def test_recent_agent_actions_is_capped_at_twenty_turns(tmp_path: Path, monkeypatch) -> None:
@@ -320,47 +134,30 @@ def test_runtime_state_publish_retries_windows_replace_contention(tmp_path: Path
     assert store.read()["step_count"] == 1
 
 
-def test_adk_web_root_agent_exposes_only_llm_decision_sub_agents() -> None:
+def test_adk_web_root_agent_exposes_traceable_runtime_team() -> None:
     root_agent = build_root_agent(model="gemini-3.5-flash")
 
-    assert root_agent.name == "pokemon_red_team"
+    assert root_agent.name == "pokemon_red_web_coordinator"
     assert [agent.name for agent in root_agent.sub_agents] == [
+        "pokemon_red_team",
+    ]
+    team = root_agent.sub_agents[0]
+    assert [agent.name for agent in team.sub_agents] == [
         "pokemon_red_planning_agent",
+        "pokemon_red_execution_agent",
         "pokemon_red_result_interpreter_agent",
     ]
-    planner_tools = {
-        getattr(tool, "name", getattr(tool, "__name__", ""))
-        for tool in root_agent.sub_agents[0].tools
-    }
-    interpreter_tools = {
-        getattr(tool, "name", getattr(tool, "__name__", ""))
-        for tool in root_agent.sub_agents[1].tools
-    }
-    assert "search_memory" in planner_tools
-    assert interpreter_tools == {"observe_game", "recent_game_commands", "save_memory"}
     tool_names = {getattr(tool, "name", getattr(tool, "__name__", "")) for tool in root_agent.tools}
-    assert {
-        "start_agent_runner",
-        "agent_runner_status",
-        "agent_runtime_status",
-        "recent_agent_actions",
-        "buttons",
-        "move",
-        "wait",
-    } <= tool_names
-    assert "start_agent_runner" not in planner_tools
-    assert "agent_runner_status" not in planner_tools
-    assert "run_rule_based_step" not in tool_names
-    assert "run_team_step" not in tool_names
+    assert tool_names == {"agent_runtime_status", "recent_agent_actions"}
 
 
-def test_adk_web_prompt_routes_bounded_play_requests_to_cli_runner() -> None:
+def test_adk_web_prompt_routes_bounded_play_requests_to_runtime_team() -> None:
     assert "in any language" in WEB_AGENT_PROMPT
-    assert "start_agent_runner(steps=<requested count>)" in WEB_AGENT_PROMPT
+    assert 'transfer_to_agent(agent_name="pokemon_red_team")' in WEB_AGENT_PROMPT
     assert "exactly once" in WEB_AGENT_PROMPT
-    assert "pokemon_agent.adk_agent.runner" in WEB_AGENT_PROMPT
-    assert "Do not imitate a multi-step run" in WEB_AGENT_PROMPT
-    assert "agent_runner_status" in WEB_AGENT_PROMPT
+    assert "same ADK invocation" in WEB_AGENT_PROMPT
+    assert "separate SDL2/Qt MCP game worker" in WEB_AGENT_PROMPT
+    assert "do not start the external CLI runner" in WEB_AGENT_PROMPT
 
 
 def test_adk_web_exports_compacted_app() -> None:
@@ -368,16 +165,15 @@ def test_adk_web_exports_compacted_app() -> None:
 
     assert app.root_agent is not None
     assert configured.name == "adk_agent"
-    assert configured.root_agent.name == "pokemon_red_team"
+    assert configured.root_agent.name == "pokemon_red_web_coordinator"
     assert configured.events_compaction_config.compaction_interval == 5
     assert configured.events_compaction_config.overlap_size == 1
     assert configured.events_compaction_config.token_threshold is not None
     assert configured.events_compaction_config.event_retention_size == 8
-    for agent in (configured.root_agent, *configured.root_agent.sub_agents):
-        assert (
-            agent.generate_content_config.automatic_function_calling.maximum_remote_calls
-            == MAX_AUTOMATIC_FUNCTION_CALLS
-        )
+    assert (
+        configured.root_agent.generate_content_config.automatic_function_calling.maximum_remote_calls
+        == MAX_AUTOMATIC_FUNCTION_CALLS
+    )
 
 
 def test_adk_web_planning_prompt_documents_direct_action_contract() -> None:
@@ -409,6 +205,10 @@ def test_adk_web_planning_prompt_documents_direct_action_contract() -> None:
     assert "starter_selection" in RESULT_INTERPRETER_PROMPT
     assert "verified world-coordinate routes" in PLANNING_AGENT_PROMPT
     assert "navigation.reachable_targets" in PLANNING_AGENT_PROMPT
+    assert '"waypoints":[[12,8],[18,8]]' in PLANNING_AGENT_PROMPT
+    assert f"1..{MAX_MOVE_WAYPOINTS}" in PLANNING_AGENT_PROMPT
+    assert "visits each waypoint in array order" in PLANNING_AGENT_PROMPT
+    assert "remaining waypoints and the final target are not attempted" in PLANNING_AGENT_PROMPT
     assert "state.controls_locked" in PLANNING_AGENT_PROMPT
     assert "wait_for_scripted_transition" in PLANNING_AGENT_PROMPT
     assert "Dialog understanding policy" in PLANNING_AGENT_PROMPT
@@ -432,6 +232,7 @@ def test_planner_and_interpreter_prompts_share_complete_input_and_navigation_con
         assert token_list in prompt
         assert f"1..{MAX_BUTTONS_PER_ACTION}" in prompt
         assert str(MAX_MOVE_PATH_STEPS) in prompt
+        assert str(MAX_MOVE_WAYPOINTS) in prompt
         assert "Dijkstra" in prompt
         assert "current-map world coordinate" in prompt
 

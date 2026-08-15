@@ -12,6 +12,10 @@ from pokemon_agent.adk_agent.agents.planner.agent import DEFAULT_ADK_MODEL, Goog
 from pokemon_agent.adk_agent.agents.planner.schema import DEFAULT_MAX_STEPS, DEFAULT_OBJECTIVE
 from pokemon_agent.adk_agent.client import InProcessPokemonMcpClient
 from pokemon_agent.adk_agent.coordinator.loop import PokemonAdkLoop
+from pokemon_agent.adk_agent.coordinator.workflow_agent import (
+    AUTOPLAY_SESSION_ID,
+    run_traced_pokemon_loop,
+)
 from pokemon_agent.adk_agent.runtime.logging import DateGroupedActionLogger
 from pokemon_agent.adk_agent.runtime.session import DEFAULT_ADK_SESSION_DB_PATH
 from pokemon_agent.adk_agent.runtime.state import DEFAULT_RUNTIME_STATE_PATH, FileAgentRuntimeState
@@ -182,6 +186,7 @@ def main() -> None:
             args.runtime_state_path,
             metadata={
                 "session_db": str(args.adk_session_db.resolve()),
+                "autoplay_session_id": AUTOPLAY_SESSION_ID,
                 "planner_session_id": "pokemon-red-planner",
                 "result_interpreter_session_id": "pokemon-red-result-interpreter",
             },
@@ -226,10 +231,14 @@ def main() -> None:
             idle_pump_interval=1.0 / max(1.0, min(float(args.ui_refresh_hz), 120.0)),
             runtime_state_store=runtime_state_store,
         )
-        result = loop.run(
+        result = run_traced_pokemon_loop(
+            loop,
             objective=args.objective,
             max_steps=args.steps,
             checkpoint_every=args.checkpoint_every,
+            session_db_path=str(args.adk_session_db),
+            idle_pump=idle_pump,
+            idle_pump_interval=1.0 / max(1.0, min(float(args.ui_refresh_hz), 120.0)),
         )
         result["adk_thinking_budget"] = args.adk_thinking_budget
         print(json.dumps(summarize_result(result), indent=2, ensure_ascii=False))

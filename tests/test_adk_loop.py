@@ -7,6 +7,13 @@ from pathlib import Path
 
 from pokemon_agent.adk_agent.agents.executor.agent import ExecutionAgent
 from pokemon_agent.adk_agent.coordinator.loop import PokemonAdkLoop
+from pokemon_agent.adk_agent.coordinator.workflow_agent import (
+    AUTOPLAY_SESSION_ID,
+    PokemonRedTeamAgent,
+    _requested_steps,
+    run_traced_pokemon_loop,
+)
+from google.genai import types
 from pokemon_agent.adk_agent.runtime.logging import DateGroupedActionLogger
 from pokemon_agent.adk_agent.runtime.trace import format_trace_event
 from pokemon_agent.memory.file_memory import FileLongTermMemory
@@ -117,6 +124,82 @@ def test_adk_loop_uses_action_planner_when_available(tmp_path: Path) -> None:
     assert result["execution_report"]["agent"] == "pokemon_red_execution_agent"
 
 
+def test_custom_adk_team_traces_all_three_runtime_phases(tmp_path: Path) -> None:
+    loop = PokemonAdkLoop(
+        FakeClient(),
+        action_planner=WaitPlanner(),
+        memory_store=FileLongTermMemory(tmp_path / "memory.json"),
+    )
+    team = PokemonRedTeamAgent(loop=loop, max_steps=1, checkpoint_every=0)
+
+    assert AUTOPLAY_SESSION_ID == "pokemon-red-autoplay"
+    assert [agent.name for agent in team.sub_agents] == [
+        "pokemon_red_planning_agent",
+        "pokemon_red_execution_agent",
+        "pokemon_red_result_interpreter_agent",
+    ]
+    assert all(agent.parent_agent is team for agent in team.sub_agents)
+
+    events = []
+    result = run_traced_pokemon_loop(
+        loop,
+        max_steps=1,
+        checkpoint_every=0,
+        session_db_path=str(tmp_path / "adk_sessions.db"),
+        event_sink=events.append,
+    )
+    authors = [event.author for event in events]
+
+    assert result["done"] is True
+    assert result["step_count"] == 1
+    assert result["termination_reason"] == "max_steps_reached"
+    assert "pokemon_red_team" in authors
+    assert "pokemon_red_planning_agent" in authors
+    assert "pokemon_red_execution_agent" in authors
+    assert "pokemon_red_result_interpreter_agent" in authors
+    output_events = [event for event in events if event.output is not None]
+    assert len(output_events) == 1
+    assert output_events[0].output["phase"] == "completed"
+
+
+def test_custom_adk_team_allows_multiple_steps_with_one_node_output(tmp_path: Path) -> None:
+    loop = PokemonAdkLoop(
+        FakeClient(),
+        action_planner=WaitPlanner(),
+        memory_store=FileLongTermMemory(tmp_path / "memory.json"),
+    )
+    events = []
+
+    result = run_traced_pokemon_loop(
+        loop,
+        max_steps=3,
+        checkpoint_every=0,
+        session_db_path=str(tmp_path / "adk_sessions.db"),
+        event_sink=events.append,
+    )
+
+    assert result["step_count"] == 3
+    assert result["termination_reason"] == "max_steps_reached"
+    output_events = [event for event in events if event.output is not None]
+    assert len(output_events) == 1
+    assert output_events[0].output == {
+        "phase": "completed",
+        "step": 3,
+        "done": True,
+        "termination_reason": "max_steps_reached",
+    }
+
+
+def test_custom_adk_team_reads_requested_step_count_from_user_message() -> None:
+    content = types.Content(
+        role="user",
+        parts=[types.Part.from_text(text="포켓몬을 100스텝 플레이해줘")],
+    )
+
+    assert _requested_steps(content) == 100
+    assert _requested_steps(None) == 100
+
+
 def test_adk_loop_saves_fixed_state_after_every_completed_turn(tmp_path: Path) -> None:
     client = FakeClient()
 
@@ -166,6 +249,85 @@ def test_execution_agent_allows_multi_step_world_moves(tmp_path: Path) -> None:
 
     assert result["planned_action"]["target"] == [10, 6]
     assert client.world_move_calls[-1] == {"target_x": 10, "target_y": 6}
+
+
+def test_execution_agent_visits_waypoints_before_final_world_target(tmp_path: Path) -> None:
+    class MovePlanner:
+        def plan(self, state):
+            return action_plan(
+                {
+                    "type": "move",
+                    "waypoints": [[6, 6], [8, 6]],
+                    "target": [10, 6],
+                    "reason": "follow_known_route",
+                },
+            )
+
+    client = FakeClient()
+    result = PokemonAdkLoop(
+        client,
+        action_planner=MovePlanner(),
+        memory_store=FileLongTermMemory(tmp_path / "memory.json"),
+    ).run(max_steps=1, checkpoint_every=0)
+
+    execution = result["action_result"]
+    assert client.world_move_calls == [
+        {"target_x": 6, "target_y": 6},
+        {"target_x": 8, "target_y": 6},
+        {"target_x": 10, "target_y": 6},
+    ]
+    assert execution["completed_waypoints"] == 2
+    assert execution["final_target_attempted"] is True
+    assert execution["final_target_reached"] is True
+    assert [entry["kind"] for entry in execution["route_results"]] == [
+        "waypoint",
+        "waypoint",
+        "target",
+    ]
+    assert execution["steps_taken"] == 3
+
+
+def test_execution_agent_stops_route_at_failed_waypoint(tmp_path: Path) -> None:
+    class BlockedWaypointClient(FakeClient):
+        def move_to_world_cell(self, target_x: int, target_y: int):
+            if (target_x, target_y) == (8, 6):
+                self.world_move_calls.append({"target_x": target_x, "target_y": target_y})
+                return {
+                    "stop_reason": "movement_blocked",
+                    "steps_taken": 0,
+                    "requested_world_cell": {"x": target_x, "y": target_y},
+                    "executed_actions": [],
+                    "after_observation": self._observation(),
+                }
+            return super().move_to_world_cell(target_x, target_y)
+
+    class MovePlanner:
+        def plan(self, state):
+            return action_plan(
+                {
+                    "type": "move",
+                    "waypoints": [[6, 6], [8, 6]],
+                    "target": [10, 6],
+                    "reason": "follow_blocked_route",
+                },
+            )
+
+    client = BlockedWaypointClient()
+    result = PokemonAdkLoop(
+        client,
+        action_planner=MovePlanner(),
+        memory_store=FileLongTermMemory(tmp_path / "memory.json"),
+    ).run(max_steps=1, checkpoint_every=0)
+
+    execution = result["action_result"]
+    assert client.world_move_calls == [
+        {"target_x": 6, "target_y": 6},
+        {"target_x": 8, "target_y": 6},
+    ]
+    assert execution["completed_waypoints"] == 1
+    assert execution["final_target_attempted"] is False
+    assert execution["final_target_reached"] is False
+    assert execution["stop_reason"] == "movement_blocked"
 
 
 def test_execution_agent_records_move_errors_without_crashing(tmp_path: Path) -> None:

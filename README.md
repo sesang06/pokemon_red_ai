@@ -260,19 +260,21 @@ RAM-derived state is refreshed every frame; screenshots and overlays refresh at
 
 The session converts the visible collision data internally and routes with
 Dijkstra before scheduling D-pad buttons. Agents and ADK Web use only
-`move_to_world_cell` or `{"type":"move","target":[x,y]}` with current
-map/world coordinates.
+`move_to_world_cell` or a `move` action with current map/world coordinates.
 
 The Python executor retains two action schemas:
 
 ```json
 {"type":"buttons","buttons":["a","wait"]}
 {"type":"move","target":[1,3]}
+{"type":"move","waypoints":[[6,3],[12,3]],"target":[18,7]}
 ```
 
-For the executor, `move.target` is always a current map/world coordinate, matching
-the collision overlay labels and `state.position`. One `move` action is bounded
-to at most 8 Dijkstra path steps.
+For the executor, `move.target` and optional ordered `move.waypoints` are always
+current map/world coordinates, matching the collision overlay labels and
+`state.position`. The executor visits each waypoint before the final target.
+Each destination is traversed through bounded 8-step Dijkstra segments with
+fresh observations between segments.
 
 The Google ADK planner returns one of those actions directly. Every plan is
 executed once, followed by a fresh RAM/GameState observation and a new planner
@@ -344,7 +346,7 @@ For live UI refresh, realtime ticking, LLM planning, and vision together:
 .\.venv\Scripts\pokemon-adk.exe
 ```
 
-Run the ADK Web UI with Pokemon game tools:
+Run the ADK Web UI with the traceable Pokemon runtime team:
 
 ```powershell
 .\run_adk_web.ps1
@@ -363,18 +365,17 @@ The root agent also exposes `agent_runtime_status` and `recent_agent_actions`. I
 Show the separately running CLI agent status and recent actions.
 ```
 
-To launch the exact `pokemon-adk` runner from Dev UI, ask `Play Pokemon for 100 steps.` The root agent calls
-`start_agent_runner(steps=100)`, which starts the normal SDL2/Qt control UI, vision-enabled planner/interpreter loop,
-checkpoints, action logs, shared SQLite sessions, and the dashboard at `http://127.0.0.1:8765/`. Ask for runner status
-to call `agent_runner_status` and inspect its current step or recent log output.
+To run autoplay from Dev UI, ask `Play Pokemon for 100 steps.` The web coordinator transfers the same invocation to
+`pokemon_red_team`, which starts an SDL2/Qt MCP worker and runs the vision-enabled planner, deterministic executor,
+result interpreter, checkpoints, action logs, and dashboard at `http://127.0.0.1:8765/`. The current Dev UI Trace shows
+`pokemon_red_web_coordinator -> pokemon_red_team -> planning -> execution -> result interpretation`, including nested
+model and tool spans. The dedicated `pokemon-red-planner` and `pokemon-red-result-interpreter` sessions also retain the
+model conversation events.
 
-ADK Web will show tool calls such as `start_game`, `observe_game`,
-`save_current_screenshot`, `move`, `buttons`, and `recent_game_commands` in the
-event history. Screenshot base64 is omitted from
-tool results by default; ask for `save_current_screenshot()` to write a PNG to
-`captures\YYYYMMDD\adk_web_HHMMSS_mmm.png`, or ask for
-`observe_game(include_screenshot_base64=true)` when you need to inspect the raw
-image payload.
+ADK Web records the coordinator transfer and each runtime phase in the current
+event history. The planner's latest game screenshot and collision overlay are
+attached to its model request; older image payloads are omitted from subsequent
+model context.
 
 ## Design Notes
 

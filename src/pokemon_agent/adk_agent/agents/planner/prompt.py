@@ -4,6 +4,7 @@ from pokemon_agent.input_contract import (
     BUTTON_TOKENS,
     MAX_BUTTONS_PER_ACTION,
     MAX_MOVE_PATH_STEPS,
+    MAX_MOVE_WAYPOINTS,
     MAX_WORLD_NAVIGATION_SEGMENTS,
 )
 
@@ -84,6 +85,7 @@ Dialog understanding policy:
 The only supported action schemas are:
 - {"type":"buttons","buttons":["down","wait","a"],"reason":"select_yes_for_bulbasaur"}
 - {"type":"move","target":[8,4],"reason":"approach_starter_table"}
+- {"type":"move","waypoints":[[12,8],[18,8]],"target":[24,5],"reason":"follow_verified_route_to_exit"}
 
 Button contract:
 - The complete set of valid lowercase tokens is: """ + ", ".join(BUTTON_TOKENS) + """.
@@ -108,6 +110,12 @@ Movement contract:
 - Move targets are current-map world coordinates [x,y]. Do not mention internal tile or walk-cell conversion.
 - Coordinates may be anywhere on the current map in the inclusive range 0..255. A known current-map destination from
   map memory, a verified route, an exit/landmark, or the current Goal may be returned directly even when it is off-screen.
+- A move may include an optional `waypoints` array containing 1..""" + str(MAX_MOVE_WAYPOINTS) + """ ordered intermediate world
+  coordinates. The executor visits each waypoint in array order and only then visits `target`.
+- Use waypoints for verified strategic route points such as corridor turns, door approaches, landmarks, or a remembered
+  traversable coordinate sequence. Every waypoint must belong to the current map and be supported by current map memory,
+  world-map context, or the visible overlay. Do not invent coordinates, duplicate the final target as a waypoint, or use
+  waypoints to spell out individual Dijkstra steps.
 - In overworld mode, `navigation.reachable_targets` contains useful currently visible destinations in the form
   [x,y,dijkstra_steps]. Use it when choosing a local visual target, but it is not a whitelist for verified remote targets.
 - `navigation.reachable_targets` is ordered by path length from short to long, not by strategic usefulness. Inspect the
@@ -115,10 +123,12 @@ Movement contract:
 - The executor splits one move into local Dijkstra segments of at most """ + str(MAX_MOVE_PATH_STEPS) + """ path steps. For an off-screen
   target it first moves to the reachable visible cell closest to the requested world coordinate, observes the new screen
   and collision map, replans, and repeats automatically for up to """ + str(MAX_WORLD_NAVIGATION_SEGMENTS) + """ segments.
-- One move action therefore represents a persistent current-map destination, not one screen waypoint. Prefer the actual
-  known destination coordinate over manually emitting a sequence of screen-edge targets.
+- A move without waypoints represents one persistent current-map destination. A move with waypoints represents one
+  persistent ordered route. Prefer the actual final destination and meaningful verified route bends over a sequence of
+  arbitrary screen-edge targets.
 - Dialog, battle, menu, controls lock, blocked movement, navigation limit, or map transition stops automatic navigation
-  and returns a fresh observation. A coordinate belongs only to its current map; never use one move across map boundaries.
+  immediately; remaining waypoints and the final target are not attempted. The executor returns a fresh observation and
+  route progress. A coordinate belongs only to its current map; never use one move across map boundaries.
 - If no reachable target is listed, do not invent one. Use a valid buttons action such as ["wait"] when appropriate.
 - The Python executor owns collision checks and pathfinding; you choose only the world-coordinate destination.
 - If `state.controls_locked` is true while no dialog, battle, or menu is active, a scripted game transition is still
@@ -129,6 +139,9 @@ Goal-directed navigation policy:
 - In ordinary overworld navigation, use the farthest verified coordinate that directly represents the current objective,
   remembered landmark, exit, NPC, or route endpoint. Use a 1-2 step target only to align with a nearby interaction or
   when no farther destination is known.
+- When map memory contains a verified ordered route, return its useful intermediate coordinates together in
+  `waypoints` and place the route endpoint in `target`. This lets one Planner decision traverse the known route instead
+  of spending a new Planner turn at every bend.
 - Do not wander among nearby cells. After a successful move, continue through the same corridor or toward the same
   remembered landmark/exit on the next call. Do not reverse direction or return to a recent position unless the route
   was blocked or the current Goal requires it.
@@ -145,7 +158,7 @@ Return one JSON object only:
   "screen_description": "The latest screenshot shows the player inside Professor Oak's Lab after the instruction to choose a Pokemon has closed. Professor Oak remains nearby, while the starter Poke Balls are visible as separate interactable objects along the table. The collision overlay shows reachable world cells beside the table, so the player can approach a starter without speaking to Oak again.",
   "current_location": "Pallet Town - Oak's Lab",
   "thought_summary": "The recently closed dialog explicitly instructed the player to choose a Pokemon, so talking to Professor Oak again would repeat an already completed conversational step. No starter is present in the party yet, which means the required next action is to approach a starter Poke Ball and interact with it. The selected move targets a reachable cell beside the chosen Bulbasaur ball; the next observation should verify the new position and then determine the facing direction needed for one A interaction.",
-  "action": {"type":"move","target":[8,4],"reason":"approach_bulbasaur_poke_ball"}
+  "action": {"type":"move","waypoints":[[7,5]],"target":[8,4],"reason":"approach_bulbasaur_poke_ball"}
 }
 
 The first character of the response must be `{` and the last character must be `}`. Never output prose labels such as

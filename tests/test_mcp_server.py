@@ -1,5 +1,6 @@
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 from pokemon_agent import mcp_server
 import pokemon_agent.session as session_module
@@ -76,3 +77,42 @@ def test_mcp_realtime_tick_controls_current_session(tmp_path: Path) -> None:
     assert result["fps"] == 30
     assert status["enabled"] is True
     assert status["snapshot_hz"] == 30
+
+
+def test_mcp_dashboard_bridge_forwards_trace_runtime_and_memory(monkeypatch) -> None:
+    class FakeHub:
+        def __init__(self) -> None:
+            self.traces = []
+            self.runtime = []
+            self.memory = []
+
+        def publish_trace(self, trace):
+            self.traces.append(trace)
+
+        def publish_runtime(self, state, *, phase):
+            self.runtime.append((state, phase))
+
+        def publish_memory_snapshot(self, items):
+            self.memory.append((items, None))
+
+        def publish_memory_activity(self, items, activity):
+            self.memory.append((items, activity))
+
+    hub = FakeHub()
+    monkeypatch.setattr(mcp_server, "_DASHBOARD", SimpleNamespace(hub=hub))
+    items = {"map:Pallet Town": {"value": "known exit"}}
+
+    assert mcp_server.dashboard_publish_trace(
+        {"phase": "planning_thinking", "thinking_summary": "Head north."}
+    )["published"] is True
+    assert mcp_server.dashboard_publish_runtime({"step_count": 2}, "planned")["published"] is True
+    assert mcp_server.dashboard_publish_memory(items)["published"] is True
+    assert mcp_server.dashboard_publish_memory(
+        items,
+        {"tool": "search_memory", "keys": ["map:Pallet Town"]},
+    )["published"] is True
+
+    assert hub.traces[0]["thinking_summary"] == "Head north."
+    assert hub.runtime == [({"step_count": 2}, "planned")]
+    assert hub.memory[0] == (items, None)
+    assert hub.memory[1][1]["keys"] == ["map:Pallet Town"]

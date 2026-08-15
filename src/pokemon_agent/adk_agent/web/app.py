@@ -1,36 +1,71 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
+from typing import Any
 
 from google.adk.agents import Agent
 from google.adk.apps.app import App
 from google.genai import types
 
-from pokemon_agent.adk_agent.agents.interpreter.prompt import RESULT_INTERPRETER_PROMPT
-from pokemon_agent.adk_agent.agents.planner.agent import DEFAULT_ADK_MODEL
-from pokemon_agent.adk_agent.agents.planner.prompt import PLANNING_AGENT_PROMPT
+from pokemon_agent.adk_agent.agents.interpreter.agent import GoogleAdkResultInterpreter
+from pokemon_agent.adk_agent.agents.planner.agent import DEFAULT_ADK_MODEL, GoogleAdkPlanner
 from pokemon_agent.adk_agent.agents.shared import MAX_AUTOMATIC_FUNCTION_CALLS
-from pokemon_agent.adk_agent.runtime.session import ADK_WEB_APP_NAME, build_events_compaction_config
+from pokemon_agent.adk_agent.client import StdioPokemonMcpClient
+from pokemon_agent.adk_agent.coordinator.loop import PokemonAdkLoop
+from pokemon_agent.adk_agent.coordinator.workflow_agent import PokemonRedTeamAgent
+from pokemon_agent.adk_agent.runtime.logging import DateGroupedActionLogger
+from pokemon_agent.adk_agent.runtime.session import (
+    ADK_WEB_APP_NAME,
+    DEFAULT_ADK_SESSION_DB_PATH,
+    PROJECT_ROOT,
+    build_events_compaction_config,
+)
+from pokemon_agent.adk_agent.runtime.state import FileAgentRuntimeState
 from pokemon_agent.adk_agent.web.prompt import WEB_AGENT_PROMPT
 from pokemon_agent.adk_agent.web.tools import (
-    agent_runner_status,
     agent_runtime_status,
-    buttons,
-    move,
-    observe_game,
-    realtime_tick_status,
     recent_agent_actions,
-    recent_game_commands,
-    save_memory,
-    save_current_screenshot,
-    search_memory,
-    set_realtime_ticks,
-    start_agent_runner,
-    start_game,
-    stop_game,
-    wait,
 )
+from pokemon_agent.dashboard.server import DashboardRuntimeStateStore
+from pokemon_agent.memory.file_memory import FileLongTermMemory
+
+LOGGER = logging.getLogger(__name__)
+
+
+class _McpDashboardHub:
+    """Best-effort bridge from the ADK Web process to the MCP worker dashboard."""
+
+    def __init__(self, client: StdioPokemonMcpClient) -> None:
+        self.client = client
+
+    def publish_trace(self, trace: dict[str, Any]) -> None:
+        self._publish(self.client.publish_dashboard_trace, trace)
+
+    def publish_runtime(self, state: dict[str, Any], *, phase: str) -> None:
+        self._publish(
+            self.client.publish_dashboard_runtime,
+            _compact_dashboard_runtime_state(state),
+            phase=phase,
+        )
+
+    def publish_memory_snapshot(self, items: dict[str, dict[str, Any]]) -> None:
+        self._publish(self.client.publish_dashboard_memory, items)
+
+    def publish_memory_activity(
+        self,
+        items: dict[str, dict[str, Any]],
+        activity: dict[str, Any],
+    ) -> None:
+        self._publish(self.client.publish_dashboard_memory, items, activity)
+
+    @staticmethod
+    def _publish(operation: Any, *args: Any, **kwargs: Any) -> None:
+        try:
+            operation(*args, **kwargs)
+        except Exception:
+            LOGGER.debug("MCP dashboard bridge publish failed", exc_info=True)
 
 
 def load_project_env() -> None:
@@ -54,58 +89,116 @@ def build_root_agent(model: str | None = None) -> Agent:
             maximum_remote_calls=MAX_AUTOMATIC_FUNCTION_CALLS,
         ),
     )
-    planning_agent = Agent(
-        name="pokemon_red_planning_agent",
-        model=selected_model,
-        description="Returns one buttons plan or a persistent current-map world-coordinate move plan.",
-        instruction=PLANNING_AGENT_PROMPT,
-        generate_content_config=generate_content_config,
-        tools=[
-            start_game,
-            observe_game,
-            save_current_screenshot,
-            search_memory,
-            recent_game_commands,
-            recent_agent_actions,
-        ],
-    )
-    result_interpreter_agent = Agent(
-        name="pokemon_red_result_interpreter_agent",
-        model=selected_model,
-        description="Interprets meaningful action outcomes and writes durable file-backed memory.",
-        instruction=RESULT_INTERPRETER_PROMPT,
-        generate_content_config=generate_content_config,
-        tools=[
-            observe_game,
-            recent_game_commands,
-            save_memory,
-        ],
-    )
+    autoplay_team = build_autoplay_team(selected_model)
     return Agent(
-        name="pokemon_red_team",
+        name="pokemon_red_web_coordinator",
         model=selected_model,
-        description="Coordinates direct LLM action planning with deterministic one-shot execution and verification.",
+        description="Routes bounded autoplay requests to the traceable Pokemon Red runtime team.",
         instruction=WEB_AGENT_PROMPT,
         generate_content_config=generate_content_config,
         tools=[
-            start_agent_runner,
-            agent_runner_status,
-            start_game,
-            stop_game,
-            set_realtime_ticks,
-            realtime_tick_status,
-            buttons,
-            move,
-            wait,
-            recent_game_commands,
             agent_runtime_status,
             recent_agent_actions,
         ],
-        sub_agents=[
-            planning_agent,
-            result_interpreter_agent,
-        ],
+        sub_agents=[autoplay_team],
     )
+
+
+def build_autoplay_team(model: str | None = None) -> PokemonRedTeamAgent:
+    load_project_env()
+    selected_model = model or os.environ.get("POKEMON_AGENT_ADK_MODEL", DEFAULT_ADK_MODEL)
+    memory_store = FileLongTermMemory()
+    client = StdioPokemonMcpClient(
+        window="SDL2",
+        load_fixed=True,
+        control_ui=True,
+        realtime_fps=60.0,
+        ui_refresh_hz=30.0,
+        dashboard=True,
+    )
+    dashboard_hub = _McpDashboardHub(client)
+    planner = GoogleAdkPlanner.from_env(
+        model=selected_model,
+        include_screenshot=True,
+        thinking_budget=-1,
+        session_db_path=DEFAULT_ADK_SESSION_DB_PATH,
+        memory_store=memory_store,
+    )
+    interpreter = GoogleAdkResultInterpreter.from_env(
+        model=selected_model,
+        thinking_budget=-1,
+        session_db_path=DEFAULT_ADK_SESSION_DB_PATH,
+        memory_store=memory_store,
+    )
+    memory_activity_sink = lambda event: dashboard_hub.publish_memory_activity(
+        memory_store.items(),
+        event,
+    )
+    planner.memory_activity_callback = memory_activity_sink
+    interpreter.memory_activity_callback = memory_activity_sink
+    file_runtime_state_store = FileAgentRuntimeState(
+        metadata={
+            "session_db": str(DEFAULT_ADK_SESSION_DB_PATH.resolve()),
+            "autoplay_session_id": "current-dev-ui-invocation",
+            "planner_session_id": "pokemon-red-planner",
+            "result_interpreter_session_id": "pokemon-red-result-interpreter",
+        }
+    )
+    loop = PokemonAdkLoop(
+        client,
+        action_planner=planner,
+        result_interpreter=interpreter,
+        memory_store=memory_store,
+        trace=dashboard_hub.publish_trace,
+        action_logger=DateGroupedActionLogger(PROJECT_ROOT / "logs" / "actions"),
+        runtime_state_store=DashboardRuntimeStateStore(
+            file_runtime_state_store,
+            dashboard_hub,
+            memory_store=memory_store,
+        ),
+    )
+
+    def start_worker() -> dict[str, Any]:
+        started = client.start_session(window="SDL2", load_fixed=True, control_ui=True)
+        client.set_realtime_ticks(enabled=True, fps=60.0)
+        dashboard_hub.publish_memory_snapshot(memory_store.items())
+        return started
+
+    return PokemonRedTeamAgent(
+        loop=loop,
+        max_steps=None,
+        checkpoint_every=10,
+        startup=start_worker,
+        shutdown=lambda: client.stop_session(save_final=False),
+    )
+
+
+def _compact_dashboard_runtime_state(state: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "objective",
+        "current_goal",
+        "active_action_plan",
+        "planned_action",
+        "action_outcome",
+        "state_diff",
+        "step_count",
+        "max_steps",
+        "planner_call_count",
+        "interpreter_call_count",
+        "plan_error",
+        "interpret_error",
+        "done",
+        "termination_reason",
+    )
+    compact = {field: state.get(field) for field in fields}
+    action_result = state.get("action_result")
+    if isinstance(action_result, dict):
+        compact["action_result"] = {
+            key: value
+            for key, value in action_result.items()
+            if key not in {"before_observation", "after_observation"}
+        }
+    return compact
 
 
 def build_app(model: str | None = None) -> App:

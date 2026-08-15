@@ -45,6 +45,7 @@ adk_agent/
     shared.py      # shared streaming, JSON response, idle-pump, and trace helpers
   coordinator/
     loop.py        # Planning -> Execution -> Verification -> Interpretation
+    workflow_agent.py # traceable custom BaseAgent team used by CLI and Dev UI
     action_cycle.py
   runtime/
     history.py
@@ -68,6 +69,11 @@ dashboard/
 Role packages own their prompts and contracts. `coordinator` only orders the
 roles, `runtime` owns persistence and diagnostics, and `web` contains the Dev UI
 surface. The package root lazily exposes `app` and `root_agent` for ADK loading.
+
+ADK Dev UI runs the custom `pokemon_red_team` in the web server invocation so
+its planning, execution, interpretation, model, and tool spans share one Trace.
+PyBoy, SDL2, Qt, audio, and the live dashboard remain in a dedicated stdio MCP
+worker process to keep GUI event loops out of the web server.
 
 ## Authority Order
 
@@ -139,17 +145,20 @@ no planner-generated preconditions or Task objects.
 
 ### Action Executor
 
-The executor validates the planner's direct action and calls MCP/PokemonSession
-exactly once. The coordinator then observes fresh state and calls the Planner
-again for the next cycle.
+The executor validates the planner's direct action once. A buttons action makes
+one MCP call. A move action visits each optional waypoint and then the final
+target through ordered MCP/PokemonSession calls. The coordinator then observes
+fresh state and calls the Planner again for the next cycle.
 
 ```json
 {"type":"buttons","buttons":["a","wait"]}
 {"type":"move","target":[9,3]}
+{"type":"move","waypoints":[[9,5],[12,5]],"target":[16,3]}
 ```
 
-Movement targets are current-map world coordinates. Collision conversion and
-Dijkstra routing remain internal to the navigation/session layer.
+Movement targets and waypoints are current-map world coordinates. Collision
+conversion and Dijkstra routing remain internal to the navigation/session layer.
+An interruption or failed waypoint stops the remaining ordered route.
 
 The public action tools are intentionally small:
 

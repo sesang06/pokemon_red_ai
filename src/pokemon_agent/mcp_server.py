@@ -36,6 +36,7 @@ mcp = MCPServer("pokemon-red-pyboy") if MCPServer is not None else _MissingFastM
 _CALL_LOG = McpCommandLog()
 _SESSION = PokemonSession()
 _SESSION.set_mcp_log_provider(lambda: _CALL_LOG.format_recent())
+_DASHBOARD: Any | None = None
 
 
 def set_session_for_tests(session: PokemonSession) -> None:
@@ -204,6 +205,47 @@ def realtime_tick_status() -> dict[str, Any]:
     )
 
 
+@mcp.tool()
+def dashboard_publish_trace(trace: dict[str, Any]) -> dict[str, Any]:
+    """Forward an agent trace event to the dashboard owned by this MCP worker."""
+
+    if _DASHBOARD is None:
+        return {"published": False, "reason": "dashboard_not_running"}
+    _DASHBOARD.hub.publish_trace(trace)
+    return {"published": True, "kind": "trace"}
+
+
+@mcp.tool()
+def dashboard_publish_runtime(state: dict[str, Any], phase: str) -> dict[str, Any]:
+    """Forward compact agent runtime state to the dashboard owned by this MCP worker."""
+
+    if _DASHBOARD is None:
+        return {"published": False, "reason": "dashboard_not_running"}
+    _DASHBOARD.hub.publish_runtime(state, phase=phase)
+    return {"published": True, "kind": "runtime", "phase": phase}
+
+
+@mcp.tool()
+def dashboard_publish_memory(
+    items: dict[str, dict[str, Any]],
+    activity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Forward the current long-term-memory snapshot and optional activity."""
+
+    if _DASHBOARD is None:
+        return {"published": False, "reason": "dashboard_not_running"}
+    if activity and activity.get("keys"):
+        _DASHBOARD.hub.publish_memory_activity(items, activity)
+    else:
+        _DASHBOARD.hub.publish_memory_snapshot(items)
+    return {
+        "published": True,
+        "kind": "memory",
+        "item_count": len(items),
+        "activity_keys": list((activity or {}).get("keys") or []),
+    }
+
+
 @mcp.resource("pokemon://state/latest")
 def latest_state() -> str:
     """Return the latest structured state observation as JSON."""
@@ -255,6 +297,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--realtime-ticks", action="store_true", help="Tick the emulator continuously outside planner/tool actions.")
     parser.add_argument("--realtime-fps", type=float, default=60.0, help="Game frames per second for --realtime-ticks.")
     parser.add_argument("--ui-refresh-hz", type=float, default=30.0, help="How often to refresh the control panel from cached snapshots.")
+    parser.add_argument("--dashboard", action="store_true", help="Serve the real-time debugger for this MCP worker.")
+    parser.add_argument("--dashboard-host", default="127.0.0.1", help="Dashboard bind host.")
+    parser.add_argument("--dashboard-port", type=int, default=8765, help="Dashboard HTTP port.")
     parser.add_argument(
         "--transport",
         default="stdio",
@@ -266,6 +311,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global _DASHBOARD
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.WARNING))
     if not args.no_auto_start:
@@ -276,10 +322,33 @@ def main() -> None:
         )
     if args.realtime_ticks:
         get_session().set_realtime_ticking(enabled=True, fps=args.realtime_fps)
-    if args.transport == "stdio":
-        _run_stdio_with_control_panel_pump(ui_refresh_hz=args.ui_refresh_hz)
-    else:
-        mcp.run(args.transport)
+    dashboard = None
+    if args.dashboard:
+        try:
+            from pokemon_agent.dashboard.server import DashboardService
+
+            dashboard = DashboardService(host=args.dashboard_host, port=args.dashboard_port)
+            dashboard.attach_session(get_session())
+            dashboard.start()
+            _DASHBOARD = dashboard
+            logging.info("dashboard=%s", dashboard.url)
+        except Exception:
+            logging.exception("Dashboard failed to start; MCP gameplay will continue")
+            if dashboard is not None:
+                dashboard.stop()
+            dashboard = None
+            _DASHBOARD = None
+    try:
+        if args.transport == "stdio":
+            _run_stdio_with_control_panel_pump(ui_refresh_hz=args.ui_refresh_hz)
+        else:
+            mcp.run(args.transport)
+    finally:
+        if dashboard is not None:
+            dashboard.stop()
+        _DASHBOARD = None
+        if get_session().started:
+            get_session().stop(save_final=False)
 
 
 def _run_stdio_with_control_panel_pump(*, ui_refresh_hz: float = 30.0) -> None:

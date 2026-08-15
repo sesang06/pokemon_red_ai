@@ -45,8 +45,8 @@ flowchart LR
     EXEC --> INTERP["Result Interpreter"]
     INTERP --> FILEMEM["Long-term memory JSON"]
 
-    ADKWEB["ADK Dev UI"] --> WEBTOOLS["ADK Web tools"]
-    WEBTOOLS --> MCP
+    ADKWEB["ADK Dev UI"] --> WEBTEAM["Pokemon runtime team"]
+    WEBTEAM --> MCPWORKER["stdio MCP game worker"]
     ADKCLI --> SQLITE["ADK SQLite events"]
     ADKWEB --> SQLITE
     ADKCLI --> RUNTIME["Runtime state JSON"]

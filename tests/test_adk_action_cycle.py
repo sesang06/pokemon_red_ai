@@ -254,6 +254,64 @@ def test_interpreter_context_keeps_compact_remote_movement_result() -> None:
     }
 
 
+def test_interpreter_context_reports_waypoint_route_progress() -> None:
+    payload = compact_interpreter_context(
+        {
+            "step_count": 4,
+            "observation": observation(x=8, y=5, dialog_open=False),
+            "active_action_plan": {
+                "action": {
+                    "type": "move",
+                    "waypoints": [[6, 5], [8, 5]],
+                    "target": [12, 5],
+                    "reason": "follow_route",
+                },
+                "status": "active",
+            },
+            "action_outcome": {
+                "status": "interrupted",
+                "reason": "movement_blocked",
+            },
+            "execution_report": {
+                "stop_reason": "movement_blocked",
+                "result": {
+                    "requested_world_cell": {"x": 8, "y": 5},
+                    "requested_final_world_cell": {"x": 12, "y": 5},
+                    "requested_waypoints": [[6, 5], [8, 5]],
+                    "completed_waypoints": 1,
+                    "final_target_attempted": False,
+                    "final_target_reached": False,
+                    "route_results": [
+                        {
+                            "index": 0,
+                            "kind": "waypoint",
+                            "target": [6, 5],
+                            "reached": True,
+                            "stop_reason": "target_reached",
+                        },
+                        {
+                            "index": 1,
+                            "kind": "waypoint",
+                            "target": [8, 5],
+                            "reached": False,
+                            "stop_reason": "movement_blocked",
+                        },
+                    ],
+                    "steps_taken": 1,
+                    "stop_reason": "movement_blocked",
+                },
+            },
+        }
+    )
+
+    movement = payload["last_result"]["movement"]
+    assert movement["requested_waypoints"] == [[6, 5], [8, 5]]
+    assert movement["requested_final_world_cell"] == {"x": 12, "y": 5}
+    assert movement["completed_waypoints"] == 1
+    assert movement["final_target_attempted"] is False
+    assert movement["route_results"][-1]["stop_reason"] == "movement_blocked"
+
+
 def test_result_interpreter_preserves_public_screen_location_and_summary_fields() -> None:
     class FakeSummarizer:
         stream_output = False

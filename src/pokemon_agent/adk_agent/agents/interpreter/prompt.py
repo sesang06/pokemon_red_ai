@@ -5,6 +5,7 @@ from pokemon_agent.input_contract import (
 
     MAX_BUTTONS_PER_ACTION,
     MAX_MOVE_PATH_STEPS,
+    MAX_MOVE_WAYPOINTS,
     MAX_WORLD_NAVIGATION_SEGMENTS,
 )
 
@@ -21,7 +22,9 @@ Interpret results against the exact runtime action contract:
 - The complete valid lowercase button-token set is: """ + ", ".join(BUTTON_TOKENS) + """. A buttons array contains 1..""" + str(MAX_BUTTONS_PER_ACTION) + """
   tokens; `wait` means a 300 ms no-input pause. The same token may occur multiple times, such as
   ["right","wait","right"], to represent separate repeated presses. Never recommend or store an unsupported button alias.
-- A move target is a current-map world coordinate. One call may cross multiple screens: the executor follows local
+- A move target is a current-map world coordinate. A move may also contain up to """ + str(MAX_MOVE_WAYPOINTS) + """ ordered current-map
+  `waypoints`; the executor visits each waypoint in order and then the final target. One move may cross multiple screens:
+  the executor follows local
   four-direction Dijkstra segments of at most """ + str(MAX_MOVE_PATH_STEPS) + """ steps, refreshes the screen and collision map, and replans
   automatically for up to """ + str(MAX_WORLD_NAVIGATION_SEGMENTS) + """ segments.
 - `target_out_of_visible_area=true` means the requested destination started outside at least one observed screen; it is
@@ -30,6 +33,8 @@ Interpret results against the exact runtime action contract:
   an occupied requested target; `resolved_target_reached=true` with `stop_reason=target_reached` is successful arrival.
 - `navigation_limit_reached` with position change is partial progress. `interrupted_map_change` ends the old map-local
   coordinate request and requires a new destination on the newly observed map.
+- `completed_waypoints`, `route_results`, `final_target_attempted`, and `final_target_reached` report route progress.
+  If one waypoint is interrupted or unreachable, later waypoints and the final target are not attempted.
 - `movement_blocked`, `no_path`, `controls_locked`, and dialog/battle/menu interruptions describe the current bounded
   attempt. Record a failure memory only when verified or repeated; do not turn one transient interruption into a rule.
 - You interpret outcomes and maintain map memory through the provided tools only. Do not emit an action object yourself.

@@ -287,8 +287,14 @@ def _movement_result_for_interpreter(
         return None
     values = {
         "requested_target": action.get("target"),
+        "requested_waypoints": action.get("waypoints"),
         "requested_world_cell": execution_result.get("requested_world_cell"),
+        "requested_final_world_cell": execution_result.get("requested_final_world_cell"),
         "resolved_world_cell": execution_result.get("resolved_world_cell"),
+        "completed_waypoints": execution_result.get("completed_waypoints"),
+        "final_target_attempted": execution_result.get("final_target_attempted"),
+        "final_target_reached": execution_result.get("final_target_reached"),
+        "route_results": execution_result.get("route_results"),
         "target_out_of_visible_area": execution_result.get("target_out_of_visible_area"),
         "requested_target_reached": execution_result.get("requested_target_reached"),
         "resolved_target_reached": execution_result.get("resolved_target_reached"),

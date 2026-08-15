@@ -6,6 +6,7 @@ from pokemon_agent.input_contract import (
     BUTTON_TOKENS,
     MAX_BUTTONS_PER_ACTION,
     MAX_MOVE_PATH_STEPS,
+    MAX_MOVE_WAYPOINTS,
     MAX_WORLD_NAVIGATION_SEGMENTS,
 )
 from pokemon_agent.tools.pathfinding import GridPoint, reachable_distances
@@ -124,6 +125,9 @@ def sanitize_planned_action(action: dict[str, Any] | None) -> dict[str, Any] | N
                 ],
                 "reason": reason or "adk_move",
             }
+            waypoints = _waypoints_from_action(action)
+            if waypoints:
+                result["waypoints"] = waypoints
         elif action_type == "buttons":
             buttons = _buttons_from_action(action)
             if buttons is None:
@@ -195,7 +199,9 @@ def compact_state_for_prompt(state: dict[str, Any]) -> dict[str, Any]:
             "observes the new RAM/GameState and asks the Planner for the next action. Express repeated button input "
             "directly in the ordered buttons array. "
             "The only action types are buttons and move. A move may target any verified current-map world coordinate "
-            "from 0..255, including an off-screen destination. Python traverses local Dijkstra segments of up to "
+            "from 0..255, including an off-screen destination, and may include up to "
+            f"{MAX_MOVE_WAYPOINTS} ordered strategic waypoints. Python visits each waypoint and the final target using "
+            "local Dijkstra segments of up to "
             f"{MAX_MOVE_PATH_STEPS} steps and automatically re-observes and replans up to "
             f"{MAX_WORLD_NAVIGATION_SEGMENTS} segments. Never create a Task or mark a goal complete; "
             "RAM/structured GameState verification is authoritative."
@@ -381,6 +387,7 @@ def _compact_action(action: Any) -> dict[str, Any] | None:
         {
             "type": action.get("type"),
             "target": action.get("target"),
+            "waypoints": action.get("waypoints"),
             "buttons": action.get("buttons"),
         }
     )
@@ -471,6 +478,7 @@ def _navigation_for_prompt(observation: dict[str, Any]) -> dict[str, Any]:
         "automatic_segment_replanning": True,
         "max_path_steps_per_segment": MAX_MOVE_PATH_STEPS,
         "max_segments_per_move": MAX_WORLD_NAVIGATION_SEGMENTS,
+        "max_waypoints_per_move": MAX_MOVE_WAYPOINTS,
         "reachable_target_format": "[x,y,dijkstra_steps]",
     }
     walk_grid = walk_area_collision_for_observation(observation)
@@ -562,6 +570,26 @@ def _target_from_action(action: dict[str, Any]) -> tuple[Any, Any]:
     if not isinstance(target, (list, tuple)) or len(target) != 2:
         raise ValueError("move target must be a two-item list")
     return target[0], target[1]
+
+
+def _waypoints_from_action(action: dict[str, Any]) -> list[list[int]]:
+    raw_waypoints = action.get("waypoints")
+    if raw_waypoints is None:
+        return []
+    if not isinstance(raw_waypoints, list) or len(raw_waypoints) > MAX_MOVE_WAYPOINTS:
+        raise ValueError(f"move waypoints must be a list with at most {MAX_MOVE_WAYPOINTS} entries")
+
+    waypoints: list[list[int]] = []
+    for waypoint in raw_waypoints:
+        if not isinstance(waypoint, (list, tuple)) or len(waypoint) != 2:
+            raise ValueError("each move waypoint must be a two-item list")
+        waypoints.append(
+            [
+                bounded_int(waypoint[0], minimum=0, maximum=255),
+                bounded_int(waypoint[1], minimum=0, maximum=255),
+            ]
+        )
+    return waypoints
 
 
 def bounded_int(value: Any, *, minimum: int, maximum: int) -> int:

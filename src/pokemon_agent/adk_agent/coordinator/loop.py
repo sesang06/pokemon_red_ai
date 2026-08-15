@@ -74,29 +74,12 @@ class PokemonAdkLoop:
         checkpoint_every: int = 10,
         initial_runtime_state: PokemonAgentState | None = None,
     ) -> PokemonAgentState:
-        if initial_runtime_state is None:
-            state = initial_state(
-                objective=objective,
-                max_steps=max_steps,
-                checkpoint_every=checkpoint_every,
-            )
-            state["current_goal"] = goal_from_objective(objective)
-        else:
-            state = deepcopy(initial_runtime_state)
-            previous_objective = str(state.get("objective") or DEFAULT_OBJECTIVE)
-            requested_objective = objective or previous_objective
-            state["objective"] = requested_objective
-            state["max_steps"] = int(state.get("step_count", 0)) + max(0, int(max_steps))
-            state["checkpoint_every"] = checkpoint_every
-            state["done"] = False
-            state["termination_reason"] = None
-            if requested_objective != previous_objective:
-                state["current_goal"] = goal_from_objective(requested_objective)
-                state.pop("active_action_plan", None)
-                state.pop("action_outcome", None)
-            else:
-                state.setdefault("current_goal", goal_from_objective(requested_objective))
-        state["memory_path"] = str(self.memory_store.path)
+        state = self.initialize_state(
+            objective=objective,
+            max_steps=max_steps,
+            checkpoint_every=checkpoint_every,
+            initial_runtime_state=initial_runtime_state,
+        )
         self._publish(state, phase="starting")
 
         while not state.get("done", False):
@@ -120,6 +103,39 @@ class PokemonAdkLoop:
             state.update(self._checkpoint(state))
             self._publish(state, phase="completed" if state.get("done") else "checkpointed")
 
+        return state
+
+    def initialize_state(
+        self,
+        *,
+        objective: str = DEFAULT_OBJECTIVE,
+        max_steps: int = DEFAULT_MAX_STEPS,
+        checkpoint_every: int = 10,
+        initial_runtime_state: PokemonAgentState | None = None,
+    ) -> PokemonAgentState:
+        if initial_runtime_state is None:
+            state = initial_state(
+                objective=objective,
+                max_steps=max_steps,
+                checkpoint_every=checkpoint_every,
+            )
+            state["current_goal"] = goal_from_objective(objective)
+        else:
+            state = deepcopy(initial_runtime_state)
+            previous_objective = str(state.get("objective") or DEFAULT_OBJECTIVE)
+            requested_objective = objective or previous_objective
+            state["objective"] = requested_objective
+            state["max_steps"] = int(state.get("step_count", 0)) + max(0, int(max_steps))
+            state["checkpoint_every"] = checkpoint_every
+            state["done"] = False
+            state["termination_reason"] = None
+            if requested_objective != previous_objective:
+                state["current_goal"] = goal_from_objective(requested_objective)
+                state.pop("active_action_plan", None)
+                state.pop("action_outcome", None)
+            else:
+                state.setdefault("current_goal", goal_from_objective(requested_objective))
+        state["memory_path"] = str(self.memory_store.path)
         return state
 
     def _publish(self, state: PokemonAgentState, *, phase: str) -> None:
