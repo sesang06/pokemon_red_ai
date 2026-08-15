@@ -69,11 +69,16 @@ def fix_current_state(paths: ManualPlayPaths) -> Path:
     return paths.fixed_state
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run Pokemon Red from a fixed relative ROM and fixed PyBoy save-state."
     )
-    parser.add_argument("--steps", type=int, default=36000, help="Number of loop steps to run.")
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Optional frame limit. By default, play until the window closes or Ctrl+C is pressed.",
+    )
     parser.add_argument("--window", default="SDL2", help="PyBoy backend; the control UI merges SDL2 output into Qt.")
     parser.add_argument("--no-render", action="store_true", help="Disable rendering.")
     parser.add_argument("--fix-current", action="store_true", help="Copy src/pokered.gb.state into states/fixed_start.state and exit.")
@@ -87,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--record-gif", type=Path, help="Save an animated GIF of the run.")
     parser.add_argument("--record-mp4", type=Path, help="Save an MP4 video using ffmpeg if available.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -136,6 +141,8 @@ def main() -> None:
             save_every=args.save_every,
             tick_frames=1,
             control_panel=control_panel,
+            emulation_speed=1,
+            merge_sdl_into_control_panel=False,
         )
     except KeyboardInterrupt:
         print("\nStopped by user.")

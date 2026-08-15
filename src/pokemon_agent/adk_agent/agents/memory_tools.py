@@ -44,18 +44,30 @@ def search_memory_entries(
 
 def save_memory_entries(
     store: FileLongTermMemory,
-    entries: list[dict[str, str]],
+    entries: list[dict[str, Any]],
     *,
     source: str,
 ) -> dict[str, Any]:
     previous_items = store.items()
-    keys = store.remember_many(entries, source=source, merge_existing=True)
+    normalized_entries: list[dict[str, Any]] = []
+    operations: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("each memory entry must be an object")
+        normalized = dict(entry)
+        normalized["operation"] = str(entry.get("operation", "append")).strip().lower()
+        key = memory_key(str(entry.get("memory_type", "")), str(entry.get("name", "")))
+        operations[key] = normalized["operation"]
+        normalized_entries.append(normalized)
+
+    keys = store.remember_many(normalized_entries, source=source)
     items = store.items()
     results = [
         {
             "memory_type": key.split(":", 1)[0],
             "name": key.split(":", 1)[1],
             "key": key,
+            "operation": operations[key],
             "written": True,
             "previous_item": previous_items.get(key),
             "item": items.get(key),
@@ -100,8 +112,8 @@ def build_save_memory_tool(
     activity: list[dict[str, Any]] | None = None,
     on_activity: Callable[[dict[str, Any]], None] | None = None,
 ) -> MemoryTool:
-    def save_memory(entries: list[dict[str, str]]) -> dict[str, Any]:
-        """Atomically save multiple consolidated map, NPC, Pokemon, or event memories."""
+    def save_memory(entries: list[dict[str, Any]]) -> dict[str, Any]:
+        """Atomically append to or replace multiple map, NPC, Pokemon, or event memories."""
 
         result = save_memory_entries(store, entries, source=source)
         if activity is not None:

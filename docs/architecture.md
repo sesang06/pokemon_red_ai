@@ -11,7 +11,7 @@ Goal
   -> PokemonSession.observe() (RAM + vision)
   -> deterministic StateDiff and action/Goal verifier
   -> Result Interpreter (LLM only on failure or a durable event)
-       -> save_memory(entries=[consolidated updates]) when needed; existing values are read and merged atomically
+       -> save_memory(entries=[consolidated updates]) when needed; each value is appended or replaced atomically
   -> next Planner call with fresh state
 ```
 
@@ -45,7 +45,7 @@ adk_agent/
     shared.py      # shared streaming, JSON response, idle-pump, and trace helpers
   coordinator/
     loop.py        # Planning -> Execution -> Verification -> Interpretation
-    workflow_agent.py # traceable custom BaseAgent team used by CLI and Dev UI
+    workflow_agent.py # native LlmAgent planner/interpreter plus deterministic executor team
     action_cycle.py
   runtime/
     history.py
@@ -70,8 +70,10 @@ Role packages own their prompts and contracts. `coordinator` only orders the
 roles, `runtime` owns persistence and diagnostics, and `web` contains the Dev UI
 surface. The package root lazily exposes `app` and `root_agent` for ADK loading.
 
-ADK Dev UI runs the custom `pokemon_red_team` in the web server invocation so
-its planning, execution, interpretation, model, and tool spans share one Trace.
+ADK Dev UI runs the `pokemon_red_team` in the web server invocation. Planner and
+Result Interpreter are native `LlmAgent` children, while the executor is a
+deterministic `BaseAgent`, so their model, memory-tool, execution, and phase
+events share one Trace without nested Runner calls.
 PyBoy, SDL2, Qt, audio, and the live dashboard remain in a dedicated stdio MCP
 worker process to keep GUI event loops out of the web server.
 
@@ -92,9 +94,9 @@ item, Pokemon, badge, or story reward was received.
 
 The coordinator keeps these state groups separate:
 
-- `current_goal`: long-running objective and machine-verifiable conditions
+- `goal`: the latest volatile `main`/`sub` planning context snapshot
 - `active_action_plan`: the direct action selected for the current cycle
-- `planned_action`: the validated `buttons` or `move` action used this cycle
+- `active_action_plan.action`: the single validated `buttons` or `move` action used this cycle
 - `state_diff`: structured before/after changes and event types
 - `action_outcome`: `single_action_complete`, `interrupted`, or `execution_error`
 - `transition_history`: recent structured state transitions
@@ -175,22 +177,23 @@ and walk-cell coordinates are private session details.
 
 ### StateDiff and Verifier
 
-Every action compares before and after structured observations. The verifier
-can evaluate explicitly supplied Goal conditions without an LLM, but built-in
-objectives do not register automatic RAM success conditions. Action outcomes
-still use RAM-derived inventory, party, map, position, flags, dialog, battle,
-warp, event types, and action results as deterministic evidence.
+Every action compares before and after structured observations. Action outcomes
+use RAM-derived inventory, party, map, position, flags, dialog, battle, warp,
+event types, and action results as deterministic evidence. The `goal` snapshot
+guides planning only; it is not a success condition or an automatic termination
+signal.
 
 ### Result Interpreter and Memory
 
-The interpreter is not a 20-turn history compressor. It is called only for an
-action failure or a durable/unexpected event, and it may explain verified facts.
+The interpreter is not a 20-turn history compressor. It is called after every
+executed action, may explain verified facts, and may replace the latest goal
+snapshot through `update_goal(main_goal, sub_goal)`.
 It cannot override deterministic outcomes.
 
-Long-term memory is accessed only through ADK tools. The Planner makes one
-`search_memory(queries=[...])` call for all relevant identities. The interpreter
+Long-term memory is accessed only through ADK tools. The Planner and interpreter optionally make at most one
+`search_memory(queries=[...])` call when a missing historical fact is required. The interpreter
 optionally calls `save_memory(entries=[...])` once for all consolidated updates;
-that tool reads and preserves existing values while writing the batch atomically. Neither tool accepts an arbitrary key.
+each entry selects `append` or `replace`, and the mixed batch is written atomically. Neither tool accepts an arbitrary key.
 `memory_type` is restricted to `map`, `npc`, `pokemon`, or `event`, and each tool
 generates `<memory_type>:<name>` internally.
 

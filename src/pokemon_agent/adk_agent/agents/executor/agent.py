@@ -11,7 +11,7 @@ from pokemon_agent.adk_agent.agents.executor.schema import (
     execution_error_result,
     success_hint,
 )
-from pokemon_agent.adk_agent.agents.planner.schema import PokemonAgentState, sanitize_planned_action
+from pokemon_agent.adk_agent.agents.planner.schema import PokemonAgentState, sanitize_action
 from pokemon_agent.adk_agent.agents.shared import TraceSink, emit_trace
 from pokemon_agent.adk_agent.client import PokemonToolClient
 from pokemon_agent.adk_agent.runtime.logging import DateGroupedActionLogger
@@ -25,7 +25,10 @@ class ExecutionAgent:
     name: str = "pokemon_red_execution_agent"
 
     def execute(self, state: PokemonAgentState) -> PokemonAgentState:
-        action = sanitize_planned_action(state.get("planned_action"))
+        active_plan = state.get("active_action_plan")
+        if not isinstance(active_plan, dict):
+            active_plan = {}
+        action = sanitize_action(active_plan.get("action"))
         if action is None or action.get("type") not in ALLOWED_EXECUTION_ACTIONS:
             action = {
                 "type": "buttons",
@@ -33,6 +36,10 @@ class ExecutionAgent:
                 "reason": "invalid_execution_action",
                 "source": "execution_guard",
             }
+        executed_plan = dict(active_plan)
+        executed_plan["action"] = dict(action)
+        executed_plan.setdefault("status", "active")
+        executed_plan["source"] = action.get("source", executed_plan.get("source", "adk"))
 
         try:
             action_type = action.get("type")
@@ -85,7 +92,7 @@ class ExecutionAgent:
             }
         )
         return {
-            "planned_action": action,
+            "active_action_plan": executed_plan,
             "execution_report": report,
             "action_result": result,
             "action_history": history,

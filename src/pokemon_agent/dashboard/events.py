@@ -101,17 +101,10 @@ class LiveEventHub:
                     "VERIFICATION_PASSED" if passed else "VERIFICATION_FAILED",
                     f"Verifier: {status.replace('_', ' ')}",
                     {
-                        "action": state.get("planned_action"),
+                        "action": (state.get("active_action_plan") or {}).get("action"),
                         "outcome": outcome,
                         "state_diff": state.get("state_diff"),
                     },
-                    source="verifier",
-                )
-            if phase == "completed" and state.get("termination_reason") == "goal_completed":
-                self._append_event(
-                    "GOAL_COMPLETED",
-                    f"Goal completed: {state.get('objective')}",
-                    {"goal": state.get("current_goal")},
                     source="verifier",
                 )
             self._emit_state_if_due(force=True)
@@ -119,10 +112,8 @@ class LiveEventHub:
     def publish_trace(self, trace: dict[str, Any]) -> None:
         phase = str(trace.get("phase") or "unknown")
         with self._lock:
-            if phase in {"planning_thinking", "result_interpretation_thinking"}:
-                self._update_thinking(trace, status="streaming", append_event=False)
-            elif phase == "planning_done":
-                self._update_thinking(trace, status="complete", append_event=True)
+            if phase == "planning_done":
+                self._update_public_summary(trace)
                 action_plan = trace.get("action_plan") if isinstance(trace.get("action_plan"), dict) else {}
                 action = action_plan.get("action") if isinstance(action_plan.get("action"), dict) else {}
                 self._append_event(
@@ -150,7 +141,7 @@ class LiveEventHub:
                     source="executor",
                 )
             elif phase in {"result_interpretation", "result_interpretation_done"}:
-                self._update_thinking(trace, status="complete", append_event=True)
+                self._update_public_summary(trace)
                 self._append_event(
                     "RESULT_INTERPRETED",
                     "Action result interpreted",
@@ -173,18 +164,10 @@ class LiveEventHub:
                     _json_safe(trace),
                     source=str(trace.get("agent") or "agent"),
                 )
-            # Thinking summaries reuse one state slot. Push every streamed chunk
-            # immediately; only the completed summary is appended to the event log.
             self._emit_state_if_due(force=True)
 
-    def _update_thinking(
-        self,
-        trace: dict[str, Any],
-        *,
-        status: str,
-        append_event: bool,
-    ) -> None:
-        summary = str(trace.get("thinking_summary") or "").strip()
+    def _update_public_summary(self, trace: dict[str, Any]) -> None:
+        summary = str(trace.get("thought_summary") or "").strip()
         if not summary:
             return
         phase = str(trace.get("phase") or "")
@@ -192,22 +175,10 @@ class LiveEventHub:
         updated_at = now_iso()
         self._state["agent"]["thinking"] = {
             "agent": role,
-            "status": status,
+            "status": "complete",
             "summary": summary,
             "updated_at": updated_at,
         }
-        if append_event:
-            self._append_event(
-                "THINKING_SUMMARY",
-                f"{role.title()} thinking summary",
-                {
-                    "agent": role,
-                    "step": trace.get("step"),
-                    "summary": summary,
-                    "status": status,
-                },
-                source=role,
-            )
 
     def publish_memory_snapshot(
         self,

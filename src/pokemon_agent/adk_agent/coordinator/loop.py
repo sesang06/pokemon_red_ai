@@ -9,19 +9,17 @@ from pokemon_agent.adk_agent.coordinator.action_cycle import (
     action_transition_summary,
     append_transition,
     build_state_diff,
-    goal_from_objective,
     verify_action_cycle,
-    verify_goal,
 )
 from pokemon_agent.adk_agent.client import PokemonToolClient
 from pokemon_agent.adk_agent.agents.planner.schema import (
     ActionPlanner,
     DEFAULT_MAX_STEPS,
-    DEFAULT_OBJECTIVE,
     PokemonAgentState,
     classify_mode,
     initial_state,
 )
+from pokemon_agent.adk_agent.agents.goal import goal_from_main, normalize_goal
 from pokemon_agent.adk_agent.agents.executor.agent import ExecutionAgent
 from pokemon_agent.adk_agent.agents.interpreter.agent import ResultInterpreterAgent
 from pokemon_agent.adk_agent.agents.interpreter.schema import ResultSummarizer
@@ -69,13 +67,13 @@ class PokemonAdkLoop:
     def run(
         self,
         *,
-        objective: str = DEFAULT_OBJECTIVE,
+        main_goal: str | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         checkpoint_every: int = 10,
         initial_runtime_state: PokemonAgentState | None = None,
     ) -> PokemonAgentState:
         state = self.initialize_state(
-            objective=objective,
+            main_goal=main_goal,
             max_steps=max_steps,
             checkpoint_every=checkpoint_every,
             initial_runtime_state=initial_runtime_state,
@@ -85,7 +83,6 @@ class PokemonAdkLoop:
         while not state.get("done", False):
             state.update(self._observe(state))
             state.update({"mode": classify_mode(state["observation"])})
-            state.update(self._verify_goal_before_action(state))
             self._publish(state, phase="observed")
             if state.get("done"):
                 self._publish(state, phase="completed")
@@ -108,35 +105,43 @@ class PokemonAdkLoop:
     def initialize_state(
         self,
         *,
-        objective: str = DEFAULT_OBJECTIVE,
+        main_goal: str | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         checkpoint_every: int = 10,
         initial_runtime_state: PokemonAgentState | None = None,
     ) -> PokemonAgentState:
         if initial_runtime_state is None:
+            restored = self._read_runtime_goal()
+            selected_goal = goal_from_main(main_goal) if main_goal is not None else normalize_goal(restored)
             state = initial_state(
-                objective=objective,
+                goal=selected_goal,
                 max_steps=max_steps,
                 checkpoint_every=checkpoint_every,
             )
-            state["current_goal"] = goal_from_objective(objective)
         else:
             state = deepcopy(initial_runtime_state)
-            previous_objective = str(state.get("objective") or DEFAULT_OBJECTIVE)
-            requested_objective = objective or previous_objective
-            state["objective"] = requested_objective
+            previous_goal = normalize_goal(state.get("goal"))
+            selected_goal = goal_from_main(main_goal) if main_goal is not None else previous_goal
+            state["goal"] = selected_goal
             state["max_steps"] = int(state.get("step_count", 0)) + max(0, int(max_steps))
             state["checkpoint_every"] = checkpoint_every
             state["done"] = False
             state["termination_reason"] = None
-            if requested_objective != previous_objective:
-                state["current_goal"] = goal_from_objective(requested_objective)
+            if selected_goal != previous_goal:
                 state.pop("active_action_plan", None)
                 state.pop("action_outcome", None)
-            else:
-                state.setdefault("current_goal", goal_from_objective(requested_objective))
         state["memory_path"] = str(self.memory_store.path)
         return state
+
+    def _read_runtime_goal(self) -> dict[str, str] | None:
+        if self.runtime_state_store is None:
+            return None
+        reader = getattr(self.runtime_state_store, "read", None)
+        if not callable(reader):
+            return None
+        saved = reader()
+        goal = saved.get("goal") if isinstance(saved, dict) else None
+        return normalize_goal(goal) if isinstance(goal, dict) else None
 
     def _publish(self, state: PokemonAgentState, *, phase: str) -> None:
         if self.runtime_state_store is None:
@@ -160,22 +165,17 @@ class PokemonAdkLoop:
         result = state.get("action_result", {})
         after = result.get("after_observation", previous)
         state_diff = build_state_diff(previous, after)
-        goal_verification = verify_goal(state.get("current_goal", {}), after)
-        goal_completed = bool(goal_verification.get("verified"))
         active_action_plan, action_outcome = verify_action_cycle(
             state.get("active_action_plan", {}),
             action_result=result,
             state_diff=state_diff,
-            goal_completed=goal_completed,
         )
-        current_goal = dict(state.get("current_goal", {}))
-        current_goal["verification"] = goal_verification
-        current_goal["status"] = "completed" if goal_completed else "in_progress"
 
         before_position = position_tuple(previous)
         after_position = position_tuple(after)
         stuck_score = state.get("stuck_score", 0)
-        action = state.get("planned_action", {})
+        active_plan = state.get("active_action_plan", {})
+        action = active_plan.get("action", {}) if isinstance(active_plan, dict) else {}
 
         if action.get("type") == "move":
             if result.get("stop_reason") in {"no_path", "movement_blocked", "max_steps_reached", "execution_error"}:
@@ -188,12 +188,12 @@ class PokemonAdkLoop:
             stuck_score = max(0, stuck_score - 1)
 
         max_steps_reached = state.get("step_count", 0) >= state.get("max_steps", DEFAULT_MAX_STEPS)
-        done = goal_completed or max_steps_reached
-        termination_reason = "goal_completed" if goal_completed else "max_steps_reached" if max_steps_reached else None
+        done = max_steps_reached
+        termination_reason = "max_steps_reached" if max_steps_reached else None
         transitions, history_summary = append_transition(
             list(state.get("transition_history", [])),
             action_transition_summary(
-                state.get("planned_action", {}),
+                action,
                 state_diff,
                 action_outcome,
             ),
@@ -214,7 +214,7 @@ class PokemonAdkLoop:
 
         return {
             "observation": after,
-            "current_goal": current_goal,
+            "goal": normalize_goal(state.get("goal")),
             "active_action_plan": active_action_plan,
             "state_diff": state_diff,
             "action_outcome": action_outcome,
@@ -225,16 +225,6 @@ class PokemonAdkLoop:
             "termination_reason": termination_reason,
             "done": done,
         }
-
-    def _verify_goal_before_action(self, state: PokemonAgentState) -> PokemonAgentState:
-        goal = dict(state.get("current_goal", {}))
-        verification = verify_goal(goal, state.get("observation", {}))
-        goal["verification"] = verification
-        if verification.get("verified"):
-            goal["status"] = "completed"
-            return {"current_goal": goal, "termination_reason": "goal_completed", "done": True}
-        goal["status"] = "in_progress"
-        return {"current_goal": goal}
 
     def _interpret(self, state: PokemonAgentState) -> PokemonAgentState:
         return self.result_interpreter_agent.interpret(state)

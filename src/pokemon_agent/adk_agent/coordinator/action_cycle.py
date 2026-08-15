@@ -4,7 +4,6 @@ import re
 from copy import deepcopy
 from typing import Any, TypedDict
 
-from pokemon_agent.adk_agent.agents.planner.schema import DEFAULT_OBJECTIVE
 from pokemon_agent.adk_agent.runtime.history import RAW_HISTORY_TURNS
 
 
@@ -32,11 +31,6 @@ HARD_STOP_REASONS = {
     "no_path",
     "realtime_ticker_stopped",
 }
-FAILED_ACTION_STATUSES = {
-    "execution_error",
-    "interrupted",
-}
-CONDITION_OPERATORS = ("equals", "min", "max", "contains")
 
 
 class StateDiff(TypedDict, total=False):
@@ -49,59 +43,11 @@ class StateDiff(TypedDict, total=False):
     meaningful: bool
 
 
-def goal_from_objective(objective: str) -> dict[str, Any]:
-    return {
-        "id": _slug(objective) or DEFAULT_OBJECTIVE,
-        "description": objective or DEFAULT_OBJECTIVE,
-        "success_conditions": [],
-        "status": "in_progress",
-        "verification": {"verified": False, "conditions": []},
-    }
-
-
-def _normalize_state_condition(condition: Any) -> dict[str, Any] | None:
-    if condition is None:
-        return None
-    if not isinstance(condition, dict):
-        return None
-    path = str(condition.get("path") or "").strip()
-    operators = [operator for operator in CONDITION_OPERATORS if operator in condition]
-    if not path or len(operators) != 1:
-        return None
-    operator = operators[0]
-    return {"path": path[:120], operator: deepcopy(condition[operator])}
-
-
-def evaluate_state_condition(condition: Any, observation: dict[str, Any]) -> dict[str, Any]:
-    normalized = _normalize_state_condition(condition)
-    if normalized is None:
-        return {"condition": condition, "matched": None, "evidence": None}
-    game_state = observation.get("state", {}) if isinstance(observation, dict) else {}
-    path = normalized["path"]
-    actual = _state_path_value(game_state, path)
-    operator = next(key for key in CONDITION_OPERATORS if key in normalized)
-    expected = normalized[operator]
-    matched = _compare_requirement(actual, operator, expected)
-    return {
-        "condition": normalized,
-        "matched": matched,
-        "evidence": {"path": path, "actual": actual, "operator": operator, "expected": expected},
-    }
-
-
-def verify_goal(goal: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
-    conditions = _condition_list(goal.get("success_conditions"))
-    results = [evaluate_state_condition(condition, observation) for condition in conditions]
-    verified = bool(results) and all(result.get("matched") is True for result in results)
-    return {"verified": verified, "conditions": results, "source": "deterministic_game_state"}
-
-
 def verify_action_cycle(
     action_plan: dict[str, Any],
     *,
     action_result: dict[str, Any],
     state_diff: StateDiff,
-    goal_completed: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     updated = deepcopy(action_plan)
     stop_reason = str(action_result.get("stop_reason") or "")
@@ -133,15 +79,10 @@ def verify_action_cycle(
         "action_result": "failed" if execution_failed or interrupted else "success",
         "state_changes": list(state_diff.get("event_types", [])),
         "state_changed": bool(state_diff.get("meaningful")),
-        "important_event": durable_event or goal_completed,
-        "goal_completed": goal_completed,
+        "important_event": durable_event,
         "reason": _action_outcome_reason(status, stop_reason),
     }
     return updated, outcome
-
-
-def should_interpret_action_outcome(outcome: dict[str, Any]) -> bool:
-    return bool(outcome.get("important_event")) or outcome.get("status") in FAILED_ACTION_STATUSES
 
 
 def build_state_diff(before_observation: dict[str, Any], after_observation: dict[str, Any]) -> StateDiff:
@@ -254,41 +195,6 @@ def _action_outcome_reason(status: str, stop_reason: str) -> str:
     return stop_reason or status
 
 
-def _condition_list(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    return list(value) if isinstance(value, (list, tuple)) else [value]
-
-
-def _state_path_value(state: dict[str, Any], path: str) -> Any:
-    normalized = path.strip()
-    if normalized.lower().startswith("inventory."):
-        return _item_count(state, normalized.split(".", 1)[1])
-    if normalized in {"pokeball_count", "inventory_pokeballs"}:
-        return _item_count(state, "POKE_BALL")
-    current: Any = state
-    for part in normalized.split("."):
-        if not isinstance(current, dict) or part not in current:
-            return None
-        current = current[part]
-    return current
-
-
-def _compare_requirement(actual: Any, operator: str, expected: Any) -> bool | None:
-    if actual is None:
-        return None
-    try:
-        if operator == "min":
-            return float(actual) >= float(expected)
-        if operator == "max":
-            return float(actual) <= float(expected)
-        if operator == "contains":
-            return str(expected).lower() in str(actual).lower()
-        return actual == expected
-    except (TypeError, ValueError):
-        return False
-
-
 def _menu_state(state: dict[str, Any]) -> dict[str, Any]:
     menu = state.get("menu")
     if isinstance(menu, dict):
@@ -323,10 +229,6 @@ def _item_counts(state: dict[str, Any]) -> dict[str, int]:
     return counts
 
 
-def _item_count(state: dict[str, Any], name: str) -> int:
-    return _item_counts(state).get(_normalize_item_name(name), 0)
-
-
 def _positive_item_deltas(before: dict[str, Any], after: dict[str, Any]) -> dict[str, int]:
     old = _item_counts(before)
     new = _item_counts(after)
@@ -359,8 +261,3 @@ def _durable_flags(flags: Any) -> dict[str, Any]:
     if not isinstance(flags, dict):
         return {}
     return {str(key): value for key, value in flags.items() if not str(key).startswith("has_")}
-
-
-def _slug(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
-    return slug or "action"

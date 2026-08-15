@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import base64
 import json
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import AsyncGenerator
 
+from google.adk.models.base_llm import BaseLlm
+from google.adk.models.llm_response import LlmResponse
+from pydantic import Field
+
+from pokemon_agent.adk_agent.agents.interpreter.agent import GoogleAdkResultInterpreter
+from pokemon_agent.adk_agent.agents.planner.agent import GoogleAdkPlanner
 from pokemon_agent.adk_agent.agents.executor.agent import ExecutionAgent
 from pokemon_agent.adk_agent.coordinator.loop import PokemonAdkLoop
 from pokemon_agent.adk_agent.coordinator.workflow_agent import (
     AUTOPLAY_SESSION_ID,
+    PokemonExecutionAgent,
     PokemonRedTeamAgent,
+    _interpreter_content,
     _requested_steps,
     run_traced_pokemon_loop,
 )
@@ -88,7 +98,78 @@ class FakeClient:
             },
             "game_area_collision": [[1 for _ in range(20)] for _ in range(18)],
             "walk_area_collision": [[1 for _ in range(10)] for _ in range(9)],
+            "screenshot": {
+                "format": "png",
+                "width": 160,
+                "height": 144,
+                "base64": base64.b64encode(
+                    f"screen-{self.x}-{self.y}".encode("ascii")
+                ).decode("ascii"),
+            },
         }
+
+
+class StaticResponseLlm(BaseLlm):
+    response_text: str
+    requests: list[object] = Field(default_factory=list)
+
+    async def generate_content_async(self, llm_request, stream: bool = False) -> AsyncGenerator[LlmResponse, None]:
+        self.requests.append(llm_request.model_copy(deep=True))
+        yield LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=self.response_text)],
+            ),
+            partial=False,
+            turnComplete=True,
+        )
+
+
+class ImportantEventClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.party: list[dict] = []
+
+    def press_buttons(self, buttons: list[str]):
+        self.party = [{"species": "BULBASAUR", "level": 5}]
+        return {
+            "executed_actions": [{"button": button} for button in buttons],
+            "stop_reason": "buttons_complete",
+            "after_observation": self._observation(),
+        }
+
+    def _observation(self):
+        observation = super()._observation()
+        observation["state"]["party"] = list(self.party)
+        return observation
+
+
+def native_wait_loop(tmp_path: Path, *, client=None):
+    memory = FileLongTermMemory(tmp_path / "memory.json")
+    planner = GoogleAdkPlanner(model="fake-planner", memory_store=memory)
+    interpreter = GoogleAdkResultInterpreter(model="fake-interpreter", memory_store=memory)
+    planner.agent.model = StaticResponseLlm(
+        model="fake-planner",
+        response_text=(
+            '{"screen_description":"Oak Lab","current_location":"Oak Lab (5,6)",'
+            '"thought_summary":"Wait once and observe the current state.",'
+            '"action":{"type":"buttons","buttons":["wait"],"reason":"observe_once"}}'
+        ),
+    )
+    interpreter.agent.model = StaticResponseLlm(
+        model="fake-interpreter",
+        response_text=(
+            '{"screen_description":"Oak Lab","current_location":"Oak Lab (5,6)",'
+            '"thought_summary":"The action completed without a durable event.",'
+            '"summary":"No durable event.","memory_saved":false}'
+        ),
+    )
+    return PokemonAdkLoop(
+        client or FakeClient(),
+        action_planner=planner,
+        result_interpreter=interpreter,
+        memory_store=memory,
+    )
 
 
 def test_adk_loop_without_llm_planner_stops_without_game_input(tmp_path: Path) -> None:
@@ -117,19 +198,44 @@ def test_adk_loop_uses_action_planner_when_available(tmp_path: Path) -> None:
         memory_store=FileLongTermMemory(tmp_path / "memory.json"),
     ).run(max_steps=1)
 
-    assert result["planned_action"]["source"] == "adk"
-    assert result["planned_action"]["buttons"] == ["wait"]
+    assert result["active_action_plan"]["action"]["source"] == "adk"
+    assert result["active_action_plan"]["action"]["buttons"] == ["wait"]
     assert result["active_action_plan"]["action"]["reason"] == "observe_once"
     assert result["plan_decision"]["agent"] == "pokemon_red_planning_agent"
     assert result["execution_report"]["agent"] == "pokemon_red_execution_agent"
 
 
-def test_custom_adk_team_traces_all_three_runtime_phases(tmp_path: Path) -> None:
-    loop = PokemonAdkLoop(
-        FakeClient(),
-        action_planner=WaitPlanner(),
-        memory_store=FileLongTermMemory(tmp_path / "memory.json"),
+def test_execution_uses_active_action_plan_as_the_single_action_source() -> None:
+    class RecordingClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.received_buttons: list[list[str]] = []
+
+        def press_buttons(self, buttons: list[str]):
+            self.received_buttons.append(list(buttons))
+            return super().press_buttons(buttons)
+
+    client = RecordingClient()
+    result = ExecutionAgent(client).execute(
+        {
+            "active_action_plan": {
+                "action": {"type": "buttons", "buttons": ["a"], "reason": "advance_dialog"},
+                "status": "active",
+            },
+            "observation": client.observe(),
+        }
     )
+
+    assert client.received_buttons == [["a"]]
+    assert result["active_action_plan"]["action"] == {
+        "type": "buttons",
+        "buttons": ["a"],
+        "reason": "advance_dialog",
+    }
+
+
+def test_custom_adk_team_traces_all_three_runtime_phases(tmp_path: Path) -> None:
+    loop = native_wait_loop(tmp_path)
     team = PokemonRedTeamAgent(loop=loop, max_steps=1, checkpoint_every=0)
 
     assert AUTOPLAY_SESSION_ID == "pokemon-red-autoplay"
@@ -140,6 +246,7 @@ def test_custom_adk_team_traces_all_three_runtime_phases(tmp_path: Path) -> None
     ]
     assert all(agent.parent_agent is team for agent in team.sub_agents)
 
+    loop = native_wait_loop(tmp_path / "run")
     events = []
     result = run_traced_pokemon_loop(
         loop,
@@ -162,12 +269,32 @@ def test_custom_adk_team_traces_all_three_runtime_phases(tmp_path: Path) -> None
     assert output_events[0].output["phase"] == "completed"
 
 
-def test_custom_adk_team_allows_multiple_steps_with_one_node_output(tmp_path: Path) -> None:
-    loop = PokemonAdkLoop(
-        FakeClient(),
-        action_planner=WaitPlanner(),
-        memory_store=FileLongTermMemory(tmp_path / "memory.json"),
+def test_team_executes_against_its_own_state_without_child_parent_lookup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def forbidden_child_run(*_args, **_kwargs):
+        raise AssertionError("execution child must not resolve state through parent_agent")
+        yield
+
+    monkeypatch.setattr(PokemonExecutionAgent, "run_async", forbidden_child_run)
+    client = FakeClient()
+
+    result = run_traced_pokemon_loop(
+        native_wait_loop(tmp_path, client=client),
+        max_steps=1,
+        checkpoint_every=0,
+        session_db_path=str(tmp_path / "adk_sessions.db"),
     )
+
+    assert result["active_action_plan"]["action"]["buttons"] == ["wait"]
+    assert result["active_action_plan"]["action"]["reason"] == "observe_once"
+    assert result["execution_report"]["action"] == result["active_action_plan"]["action"]
+
+
+def test_custom_adk_team_allows_multiple_steps_with_one_node_output(tmp_path: Path) -> None:
+    loop = native_wait_loop(tmp_path)
+    interpreter_model = loop.result_interpreter_agent.summarizer.agent.model
     events = []
 
     result = run_traced_pokemon_loop(
@@ -187,7 +314,126 @@ def test_custom_adk_team_allows_multiple_steps_with_one_node_output(tmp_path: Pa
         "step": 3,
         "done": True,
         "termination_reason": "max_steps_reached",
+        "goal": {"main": "Complete Pokemon Red", "sub": ""},
     }
+    assert len(interpreter_model.requests) == 3
+    for request in interpreter_model.requests:
+        media_parts = [
+            part
+            for content in request.contents
+            for part in (content.parts or [])
+            if getattr(part, "inline_data", None)
+        ]
+        assert len(media_parts) == 1
+
+
+def test_interpreter_content_contains_planner_conclusion_and_only_latest_screenshot() -> None:
+    current_screen = base64.b64encode(b"current-screen").decode("ascii")
+    previous_screen = base64.b64encode(b"previous-screen").decode("ascii")
+    content = _interpreter_content(
+        {
+            "step_count": 4,
+            "observation": {
+                "state": {
+                    "map_name": "Route 1",
+                    "position": {"x": 8, "y": 28},
+                    "mode": "battle",
+                    "in_battle": True,
+                    "dialog_open": True,
+                },
+                "screenshot": {"base64": current_screen},
+            },
+            "previous_observation": {"screenshot": {"base64": previous_screen}},
+            "plan_decision": {
+                "screen_description": "A wild Rattata battle is visible.",
+                "current_location": "Route 1 at coordinates [8, 28]",
+                "thought_summary": "Advance the battle narrative once.",
+            },
+            "active_action_plan": {
+                "action": {
+                    "type": "buttons",
+                    "buttons": ["a"],
+                    "reason": "advance_battle_narrative_continuation",
+                },
+                "status": "single_action_complete",
+            },
+        }
+    )
+
+    payload = json.loads(content.parts[0].text)
+    assert payload["planner_conclusion"] == {
+        "screen_description": "A wild Rattata battle is visible.",
+        "current_location": "Route 1 at coordinates [8, 28]",
+        "thought_summary": "Advance the battle narrative once.",
+        "action": {
+            "type": "buttons",
+            "buttons": ["a"],
+            "reason": "advance_battle_narrative_continuation",
+        },
+    }
+    media_parts = [part for part in content.parts if getattr(part, "inline_data", None)]
+    assert len(media_parts) == 1
+    assert media_parts[0].inline_data.data == b"current-screen"
+    assert (
+        media_parts[0].media_resolution.level
+        == types.PartMediaResolutionLevel.MEDIA_RESOLUTION_MEDIUM
+    )
+
+
+def test_native_adk_children_emit_model_events_in_the_outer_team_trace(tmp_path: Path) -> None:
+    memory = FileLongTermMemory(tmp_path / "memory.json")
+    planner = GoogleAdkPlanner(model="fake-planner", memory_store=memory)
+    interpreter = GoogleAdkResultInterpreter(model="fake-interpreter", memory_store=memory)
+    planner_model = StaticResponseLlm(
+        model="fake-planner",
+        response_text=(
+            '{"screen_description":"Oak Lab","current_location":"Oak Lab (5,6)",'
+            '"thought_summary":"Interact once and verify the result.",'
+            '"action":{"type":"buttons","buttons":["a"],"reason":"interact"}}'
+        ),
+    )
+    interpreter_model = StaticResponseLlm(
+        model="fake-interpreter",
+        response_text=(
+            '{"screen_description":"A Pokemon joined the party.",'
+            '"current_location":"Oak Lab (5,6)",'
+            '"thought_summary":"The party change verifies acquisition.",'
+            '"summary":"Bulbasaur was acquired.","memory_saved":false}'
+        ),
+    )
+    planner.agent.model = planner_model
+    interpreter.agent.model = interpreter_model
+    loop = PokemonAdkLoop(
+        ImportantEventClient(),
+        action_planner=planner,
+        result_interpreter=interpreter,
+        memory_store=memory,
+    )
+    events = []
+
+    result = run_traced_pokemon_loop(
+        loop,
+        max_steps=1,
+        checkpoint_every=0,
+        session_db_path=str(tmp_path / "adk_sessions.db"),
+        event_sink=events.append,
+    )
+
+    authors = [event.author for event in events]
+    assert result["step_count"] == 1
+    assert result["interpretation"]["llm_called"] is True
+    assert "pokemon_red_planning_agent" in authors
+    assert "pokemon_red_result_interpreter_agent" in authors
+    assert len(planner_model.requests) == 1
+    assert len(interpreter_model.requests) == 1
+    planner_payloads = [
+        part.text
+        for content in planner_model.requests[0].contents
+        for part in (content.parts or [])
+        if part.text and '"state"' in part.text
+    ]
+    assert planner_payloads
+    assert '"position":{"x":5,"y":6}' in planner_payloads[-1]
 
 
 def test_custom_adk_team_reads_requested_step_count_from_user_message() -> None:
@@ -247,7 +493,7 @@ def test_execution_agent_allows_multi_step_world_moves(tmp_path: Path) -> None:
         memory_store=FileLongTermMemory(tmp_path / "memory.json"),
     ).run(max_steps=1)
 
-    assert result["planned_action"]["target"] == [10, 6]
+    assert result["active_action_plan"]["action"]["target"] == [10, 6]
     assert client.world_move_calls[-1] == {"target_x": 10, "target_y": 6}
 
 
@@ -378,11 +624,7 @@ def test_adk_loop_emits_agent_trace_events(tmp_path: Path) -> None:
     events = []
 
     class FakePlanner:
-        thinking_summary_callback = None
-        last_thinking_summary = "Dialog is open, so one A press is the bounded next action."
-
         def plan(self, state):
-            self.thinking_summary_callback(self.last_thinking_summary)
             return {
                 "screen_description": "오박사 연구실의 대화 화면",
                 "current_location": "Oak's Lab (5, 6)",
@@ -400,8 +642,7 @@ def test_adk_loop_emits_agent_trace_events(tmp_path: Path) -> None:
     assert set(result["plan_decision"]) == {
         "agent",
         "phase",
-        "objective",
-        "current_goal",
+        "goal",
         "action_plan",
         "memory_keys_read",
         "reason",
@@ -415,18 +656,16 @@ def test_adk_loop_emits_agent_trace_events(tmp_path: Path) -> None:
     assert result["plan_decision"]["thought_summary"] == "대화를 진행한 뒤 새 상태를 확인합니다."
     assert "session_dialog" not in result
     assert [event["phase"] for event in events] == [
-        "planning_thinking",
         "planning_done",
         "execution_done",
         "result_interpretation",
     ]
-    assert events[0]["thinking_summary"].startswith("Dialog is open")
-    assert events[1]["thinking_summary"].startswith("Dialog is open")
-    assert events[1]["screen_description"] == "오박사 연구실의 대화 화면"
-    assert format_trace_event(events[1]).startswith(
+    assert "thinking_summary" not in events[0]
+    assert events[0]["screen_description"] == "오박사 연구실의 대화 화면"
+    assert format_trace_event(events[0]).startswith(
         "[agent-trace] pokemon_red_planning_agent phase=planning_done"
     )
-    assert "thought_summary: 대화를 진행한 뒤 새 상태를 확인합니다." in format_trace_event(events[1])
+    assert "thought_summary: 대화를 진행한 뒤 새 상태를 확인합니다." in format_trace_event(events[0])
 
 
 def test_adk_loop_pumps_realtime_while_waiting_for_planner(tmp_path: Path) -> None:
@@ -555,13 +794,16 @@ def test_adk_loop_compacts_action_history_after_twenty_turns(tmp_path) -> None:
 
 def test_execution_agent_rejects_unknown_action_types() -> None:
     state = {
-        "planned_action": {"type": "unsupported_action"},
+        "active_action_plan": {
+            "action": {"type": "unsupported_action"},
+            "status": "active",
+        },
         "action_history": [],
         "step_count": 0,
     }
 
     result = ExecutionAgent(FakeClient()).execute(state)
 
-    assert result["planned_action"]["type"] == "buttons"
-    assert result["planned_action"]["buttons"] == ["wait"]
+    assert result["active_action_plan"]["action"]["type"] == "buttons"
+    assert result["active_action_plan"]["action"]["buttons"] == ["wait"]
     assert result["execution_report"]["success_hint"] == "realtime_wait_complete"

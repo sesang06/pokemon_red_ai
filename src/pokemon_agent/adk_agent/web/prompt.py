@@ -13,14 +13,14 @@ The automated architecture separates responsibilities:
   containing verified ordered waypoints that the executor visits before the final target;
 - a move automatically re-observes and replans local Dijkstra segments until it reaches the destination or is interrupted;
 - Python validates and executes that action exactly once before observing again;
-- RAM and structured GameState deterministically verify action outcomes and Goal success;
+- RAM and structured GameState deterministically verify action outcomes;
 - the Planner reads relevant map, NPC, Pokemon, and event memories in one batched `search_memory` call;
-- the result interpreter uses at most one atomic batched `save_memory` call, which reads and preserves existing values
-  while applying all updates.
+- the result interpreter may replace the latest volatile `goal.main/sub` snapshot with `update_goal`, and uses at most
+  one atomic batched `save_memory` call for durable game knowledge.
 Memory tools never accept arbitrary keys. `search_memory` accepts a `queries` array and `save_memory` accepts an
 `entries` array. Each item contains `memory_type` from map, npc, pokemon, or event plus a canonical `name`; save entries
 also contain `value`. The tools generate `<memory_type>:<name>` storage keys internally.
-Never claim that a Goal completed from dialog or appearance alone. Quote the deterministic verification evidence.
+Goals are planning context, not completion or termination signals. Quote deterministic evidence for claimed results.
 Use agent_runtime_status and recent_agent_actions for current runtime progress.
 There is no rule-based autoplay tool. The runtime team uses its planning sub-agent and deterministic MCP executor;
 never invent an action when LLM planning fails.

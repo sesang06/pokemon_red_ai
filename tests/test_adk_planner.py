@@ -1,36 +1,38 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+
+from google.genai import types
+from google.adk.models.llm_request import LlmRequest
 
 from pokemon_agent.adk_agent.agents.planner.agent import (
     GoogleAdkPlanner,
     parse_planner_response,
-    _strip_prior_media_from_session_service,
 )
 from pokemon_agent.adk_agent.agents.interpreter.agent import GoogleAdkResultInterpreter
 from pokemon_agent.adk_agent.agents.planner.schema import (
-    DEFAULT_OBJECTIVE,
     compact_state_for_prompt,
     normalize_action_plan,
-    sanitize_planned_action,
+    sanitize_action,
 )
 from pokemon_agent.adk_agent.agents.shared import (
     MAX_AUTOMATIC_FUNCTION_CALLS,
     event_finish_reason,
     event_text,
-    event_thinking_summary,
     invalid_response_error,
     parse_json_object,
 )
-from pokemon_agent.adk_agent.runtime.history import RESULT_INTERPRETER_PRIOR_TURNS
 from pokemon_agent.adk_agent.runtime.session import (
     ADK_WEB_APP_NAME,
     DEFAULT_COMPACTION_INTERVAL,
+    DEFAULT_COMPACTION_MODEL,
     DEFAULT_COMPACTION_OVERLAP_SIZE,
     DEFAULT_COMPACTION_TOKEN_THRESHOLD,
     DEFAULT_EVENT_RETENTION_SIZE,
     ContextFilteringSqliteSessionService,
+    ThinkingDisabledGemini,
     build_events_compaction_config,
 )
 from pokemon_agent.input_contract import (
@@ -58,7 +60,7 @@ def test_adk_event_text_extracts_content_parts() -> None:
     assert event_text(FakeEvent()) == '{"type":"buttons","buttons":["wait"]}'
 
 
-def test_adk_event_text_separates_gemini_thinking_summary_parts() -> None:
+def test_adk_event_text_ignores_private_thinking_parts() -> None:
     class ThoughtPart:
         text = "Checking the current map and reachable targets."
         thought = True
@@ -67,7 +69,6 @@ def test_adk_event_text_separates_gemini_thinking_summary_parts() -> None:
         content = type("Content", (), {"parts": [ThoughtPart(), FakePart()]})()
 
     event = MixedEvent()
-    assert event_thinking_summary(event) == "Checking the current map and reachable targets."
     assert event_text(event) == '{"type":"buttons","buttons":["wait"]}'
 
 
@@ -96,6 +97,23 @@ def test_planner_response_rejects_non_action_json() -> None:
     assert parse_planner_response('{"goal":"complete_pokemon_red"}') is None
 
 
+def test_planner_response_uses_final_action_json_after_prose_quotes_an_earlier_action() -> None:
+    response = '''The previous rejected action was {"type":"buttons","buttons":["wait"]}.
+Now return the final response:
+{"screen_description":"battle","current_location":"Route 1 (10, 33)","thought_summary":"Advance the fainted dialog.","action":{"type":"buttons","buttons":["a"],"reason":"advance_fainted_dialog"}}'''
+
+    assert parse_planner_response(response) == {
+        "screen_description": "battle",
+        "current_location": "Route 1 (10, 33)",
+        "thought_summary": "Advance the fainted dialog.",
+        "action": {
+            "type": "buttons",
+            "buttons": ["a"],
+            "reason": "advance_fainted_dialog",
+        },
+    }
+
+
 def test_adk_planner_budget_and_truncation_diagnostics() -> None:
     class TruncatedEvent:
         finish_reason = "MAX_TOKENS"
@@ -107,20 +125,11 @@ def test_adk_planner_budget_and_truncation_diagnostics() -> None:
     )
 
 
-def test_adk_planner_uses_sse_streaming_by_default() -> None:
+def test_native_adk_agent_backends_use_medium_thinking_without_thought_output() -> None:
     planner = GoogleAdkPlanner()
 
-    assert planner.stream_output is True
-    assert planner.run_config.streaming_mode.value == "sse"
-    assert planner.runner.app is planner.app
-    assert planner.app.events_compaction_config.compaction_interval == 5
-    assert planner.app.events_compaction_config.overlap_size == 1
-    assert (
-        planner.app.events_compaction_config.token_threshold
-        == DEFAULT_COMPACTION_TOKEN_THRESHOLD
-    )
-    assert planner.app.events_compaction_config.event_retention_size == 8
-    assert planner.agent.generate_content_config.thinking_config.include_thoughts is True
+    assert planner.agent.generate_content_config.thinking_config.thinking_level == "MEDIUM"
+    assert planner.agent.generate_content_config.thinking_config.include_thoughts is False
     assert (
         planner.agent.generate_content_config.automatic_function_calling.maximum_remote_calls
         == MAX_AUTOMATIC_FUNCTION_CALLS
@@ -130,10 +139,11 @@ def test_adk_planner_uses_sse_streaming_by_default() -> None:
     planner_tool_names = {
         getattr(tool, "name", getattr(tool, "__name__", "")) for tool in planner.agent.tools
     }
-    assert planner_tool_names == {"search_memory"}
+    assert planner_tool_names == {"search_memory", "save_memory"}
 
     interpreter = GoogleAdkResultInterpreter()
-    assert interpreter.agent.generate_content_config.thinking_config.include_thoughts is True
+    assert interpreter.agent.generate_content_config.thinking_config.thinking_level == "MEDIUM"
+    assert interpreter.agent.generate_content_config.thinking_config.include_thoughts is False
     assert (
         interpreter.agent.generate_content_config.automatic_function_calling.maximum_remote_calls
         == MAX_AUTOMATIC_FUNCTION_CALLS
@@ -142,112 +152,10 @@ def test_adk_planner_uses_sse_streaming_by_default() -> None:
     interpreter_tool_names = {
         getattr(tool, "name", getattr(tool, "__name__", "")) for tool in interpreter.agent.tools
     }
-    assert interpreter_tool_names == {"save_memory"}
+    assert interpreter_tool_names == {"search_memory", "save_memory", "update_goal"}
 
 
-def test_adk_planner_prints_partial_tokens_and_parses_final_json(capsys) -> None:
-    final_response = (
-        '{"screen_description":"lab","current_location":"Oak Lab",'
-        '"thought_summary":"observe","action":{"type":"buttons","buttons":["wait"]}}'
-    )
-
-    class StreamPart:
-        def __init__(self, text: str, *, thought: bool = False):
-            self.text = text
-            self.thought = thought
-
-    class StreamContent:
-        def __init__(self, text: str, *, thought: bool = False):
-            self.parts = [StreamPart(text, thought=thought)]
-
-    class StreamEvent:
-        def __init__(self, text: str, *, partial: bool, thought: bool = False, finish_reason=None):
-            self.content = StreamContent(text, thought=thought)
-            self.partial = partial
-            self.finish_reason = finish_reason
-
-        def is_final_response(self):
-            return not self.partial
-
-    class StreamRunner:
-        async def run_async(self, **kwargs):
-            assert kwargs["run_config"] == "sse-config"
-            yield StreamEvent("Checking the current map. ", partial=True, thought=True)
-            yield StreamEvent("Choosing a bounded action.", partial=True, thought=True)
-            midpoint = len(final_response) // 2
-            yield StreamEvent(final_response[:midpoint], partial=True)
-            yield StreamEvent(final_response[midpoint:], partial=True)
-            yield StreamEvent(final_response, partial=False, finish_reason="STOP")
-
-    planner = GoogleAdkPlanner.__new__(GoogleAdkPlanner)
-    planner._session_created = True
-    planner.session_service = type("SessionService", (), {"sessions": {}})()
-    planner.app_name = "app"
-    planner.user_id = "user"
-    planner.session_id = "session"
-    planner.include_screenshot = False
-    planner.stream_output = True
-    planner.run_config = "sse-config"
-    planner.runner = StreamRunner()
-    summaries = []
-    planner.thinking_summary_callback = summaries.append
-
-    result = asyncio.run(planner.plan_async({"observation": {"state": {}}}))
-
-    assert result == {
-        "screen_description": "lab",
-        "current_location": "Oak Lab",
-        "thought_summary": "observe",
-        "action": {"type": "buttons", "buttons": ["wait"]},
-        "source": "adk",
-    }
-    assert planner.last_thinking_summary == "Checking the current map. Choosing a bounded action."
-    assert summaries[-1] == planner.last_thinking_summary
-    assert capsys.readouterr().out == f"[llm-stream pokemon_red_planner] {final_response}\n"
-
-
-def test_adk_planner_strips_prior_session_images_but_keeps_text() -> None:
-    async def build_session():
-        from google.adk.events import Event
-        from google.adk.sessions import InMemorySessionService
-        from google.genai import types
-
-        service = InMemorySessionService()
-        session = await service.create_session(app_name="app", user_id="user", session_id="session")
-        event = Event(
-            author="user",
-            content=types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_text(text="previous observation text"),
-                    types.Part.from_bytes(data=b"old-screenshot", mime_type="image/png"),
-                    types.Part.from_bytes(data=b"old-overlay", mime_type="image/png"),
-                ],
-            ),
-        )
-        await service.append_event(session=session, event=event)
-        return service
-
-    service = asyncio.run(build_session())
-
-    removed = _strip_prior_media_from_session_service(
-        service,
-        app_name="app",
-        user_id="user",
-        session_id="session",
-    )
-
-    session = service.sessions["app"]["user"]["session"]
-    parts = session.events[0].content.parts
-    assert removed == 2
-    assert [part.text for part in parts if getattr(part, "text", None)] == [
-        "previous observation text",
-        "[2 prior media images omitted from this request. Use only the latest screenshot and overlay attached to the current user message.]",
-    ]
-    assert all(getattr(part, "inline_data", None) is None for part in parts)
-
-
-def test_turn_compaction_runs_at_five_turn_intervals_with_one_turn_overlap() -> None:
+def test_turn_compaction_runs_at_ten_turn_intervals_with_one_turn_overlap() -> None:
     async def exercise_compaction():
         from google.adk.agents import Agent
         from google.adk.apps.app import App
@@ -325,36 +233,46 @@ def test_turn_compaction_runs_at_five_turn_intervals_with_one_turn_overlap() -> 
                 await service.append_event(session, event)
             return events
 
-        for turn in range(1, 5):
+        for turn in range(1, 10):
             await add_turn(turn)
         before_interval = await compact()
-        await add_turn(5)
+        await add_turn(10)
         first = await compact()
-        for turn in range(6, 10):
+        for turn in range(11, 20):
             await add_turn(turn)
         before_second_interval = await compact()
-        await add_turn(10)
+        await add_turn(20)
         second = await compact()
         return summarizer.ranges, before_interval, first, before_second_interval, second
 
     ranges, before_interval, first, before_second_interval, second = asyncio.run(exercise_compaction())
 
-    assert DEFAULT_COMPACTION_INTERVAL == 5
+    assert DEFAULT_COMPACTION_INTERVAL == 10
     assert DEFAULT_COMPACTION_OVERLAP_SIZE == 1
-    assert DEFAULT_COMPACTION_TOKEN_THRESHOLD > 0
+    assert DEFAULT_COMPACTION_TOKEN_THRESHOLD == 10_000
     assert DEFAULT_EVENT_RETENTION_SIZE == 8
     assert before_interval == []
     assert before_second_interval == []
     assert len(first) == 1
     assert len(second) == 1
     assert ranges == [
-        [f"inv-{turn}" for turn in range(1, 6)],
-        [f"inv-{turn}" for turn in range(5, 11)],
+        [f"inv-{turn}" for turn in range(1, 11)],
+        [f"inv-{turn}" for turn in range(10, 21)],
     ]
 
 
-def test_result_interpreter_does_not_retain_prior_session_turns() -> None:
-    assert GoogleAdkResultInterpreter.prior_session_turns == RESULT_INTERPRETER_PRIOR_TURNS == 0
+def test_compaction_uses_flash_lite_with_thinking_disabled() -> None:
+    config = build_events_compaction_config()
+    llm = config.summarizer._llm
+    request = LlmRequest(model=llm.model)
+
+    assert isinstance(llm, ThinkingDisabledGemini)
+    assert llm.model == DEFAULT_COMPACTION_MODEL == "gemini-2.5-flash-lite"
+
+    llm.configure_request(request)
+
+    assert request.config.thinking_config.thinking_budget == 0
+    assert request.config.thinking_config.include_thoughts is False
 
 
 def test_shared_sqlite_preserves_full_trace_and_filters_prior_media(tmp_path) -> None:
@@ -364,7 +282,7 @@ def test_shared_sqlite_preserves_full_trace_and_filters_prior_media(tmp_path) ->
         from google.genai import types
 
         database_path = tmp_path / "adk_sessions.db"
-        filtered = ContextFilteringSqliteSessionService(database_path, prior_turn_limit=10)
+        filtered = ContextFilteringSqliteSessionService(database_path)
         session = await filtered.create_session(app_name=ADK_WEB_APP_NAME, user_id="user", session_id="planner")
         for turn in range(12):
             await filtered.append_event(
@@ -389,20 +307,12 @@ def test_shared_sqlite_preserves_full_trace_and_filters_prior_media(tmp_path) ->
             )
 
         filtered_session = await filtered.get_session(app_name=ADK_WEB_APP_NAME, user_id="user", session_id="planner")
-        stateless = ContextFilteringSqliteSessionService(database_path, prior_turn_limit=0)
-        stateless_session = await stateless.get_session(
-            app_name=ADK_WEB_APP_NAME,
-            user_id="user",
-            session_id="planner",
-        )
         dev_ui_reader = SqliteSessionService(str(database_path))
         full_session = await dev_ui_reader.get_session(app_name=ADK_WEB_APP_NAME, user_id="user", session_id="planner")
-        return filtered_session, stateless_session, full_session
+        return filtered_session, full_session
 
-    filtered_session, stateless_session, full_session = asyncio.run(exercise_services())
-    assert len([event for event in filtered_session.events if event.author == "user"]) == 10
-    assert filtered_session.events[0].content.parts[0].text == "user-2"
-    assert stateless_session.events == []
+    filtered_session, full_session = asyncio.run(exercise_services())
+    assert len([event for event in filtered_session.events if event.author == "user"]) == 12
     assert len([event for event in full_session.events if event.author == "user"]) == 12
     assert not any(
         getattr(part, "inline_data", None)
@@ -492,7 +402,6 @@ def test_planner_payload_compacts_last_action_plan_and_outcome() -> None:
                 "status": "single_action_complete",
                 "action_result": "success",
                 "state_changes": ["position_changed"],
-                "goal_completed": False,
                 "reason": "single_action_complete",
             },
             "state_diff": {"meaningful": True},
@@ -508,7 +417,6 @@ def test_planner_payload_compacts_last_action_plan_and_outcome() -> None:
         "action_result": "success",
         "state_changed": True,
         "state_changes": ["position_changed"],
-        "goal_completed": False,
         "reason": "single_action_complete",
     }
     assert "current_task" not in json.dumps(payload)
@@ -658,7 +566,7 @@ def test_planner_payload_uses_memory_tools_and_limits_navigation_context() -> No
     }
     non_navigation = compact_state_for_prompt(
         {
-            "objective": DEFAULT_OBJECTIVE,
+            "goal": {"main": "Complete Pokemon Red", "sub": "Choose a starter"},
             "mode": "dialog",
             "observation": observation,
             "active_action_plan": {
@@ -672,7 +580,7 @@ def test_planner_payload_uses_memory_tools_and_limits_navigation_context() -> No
 
     navigation = compact_state_for_prompt(
         {
-            "objective": DEFAULT_OBJECTIVE,
+            "goal": {"main": "Complete Pokemon Red", "sub": "Leave Oak's Lab"},
             "mode": "overworld",
             "observation": observation,
             "active_action_plan": {
@@ -707,8 +615,6 @@ def test_planner_payload_uses_memory_tools_and_limits_navigation_context() -> No
 
 
 def test_adk_planner_content_attaches_only_current_screenshot_and_overlay() -> None:
-    import base64
-
     planner = GoogleAdkPlanner.__new__(GoogleAdkPlanner)
     planner.include_screenshot = True
     state = {
@@ -725,15 +631,20 @@ def test_adk_planner_content_attaches_only_current_screenshot_and_overlay() -> N
     assert len(media_parts) == 2
     assert media_parts[0].inline_data.data == b"current-screen"
     assert media_parts[1].inline_data.data == b"current-overlay"
+    assert all(
+        part.media_resolution.level
+        == types.PartMediaResolutionLevel.MEDIA_RESOLUTION_MEDIUM
+        for part in media_parts
+    )
     assert "\n  " not in content.parts[0].text
 
 
-def test_sanitize_planned_action_rejects_out_of_bounds_target() -> None:
-    assert sanitize_planned_action({"type": "move", "target": [256, 4]}) is None
+def test_sanitize_action_rejects_out_of_bounds_target() -> None:
+    assert sanitize_action({"type": "move", "target": [256, 4]}) is None
 
 
-def test_sanitize_planned_action_accepts_button_arrays() -> None:
-    action = sanitize_planned_action(
+def test_sanitize_action_accepts_button_arrays() -> None:
+    action = sanitize_action(
         {
             "type": "buttons",
             "buttons": ["a", "wait"],
@@ -747,28 +658,28 @@ def test_sanitize_planned_action_accepts_button_arrays() -> None:
     }
 
 
-def test_sanitize_planned_action_rejects_unsupported_action_shapes() -> None:
-    assert sanitize_planned_action({"type": "unsupported_action", "button": "a"}) is None
-    assert sanitize_planned_action({"type": "buttons", "buttons": [{"button": "a"}]}) is None
-    assert sanitize_planned_action({"type": "move", "target": {"x": 1, "y": 3}}) is None
+def test_sanitize_action_rejects_unsupported_action_shapes() -> None:
+    assert sanitize_action({"type": "unsupported_action", "button": "a"}) is None
+    assert sanitize_action({"type": "buttons", "buttons": [{"button": "a"}]}) is None
+    assert sanitize_action({"type": "move", "target": {"x": 1, "y": 3}}) is None
 
 
-def test_sanitize_planned_action_rejects_oversized_button_arrays_instead_of_truncating() -> None:
+def test_sanitize_action_rejects_oversized_button_arrays_instead_of_truncating() -> None:
     buttons = ["wait"] * (MAX_BUTTONS_PER_ACTION + 1)
 
-    assert sanitize_planned_action({"type": "buttons", "buttons": buttons}) is None
+    assert sanitize_action({"type": "buttons", "buttons": buttons}) is None
 
 
-def test_sanitize_planned_action_accepts_move_target() -> None:
-    assert sanitize_planned_action({"type": "move", "target": [1, 3]}) == {
+def test_sanitize_action_accepts_move_target() -> None:
+    assert sanitize_action({"type": "move", "target": [1, 3]}) == {
         "type": "move",
         "target": [1, 3],
         "reason": "adk_move",
     }
 
 
-def test_sanitize_planned_action_accepts_ordered_move_waypoints() -> None:
-    assert sanitize_planned_action(
+def test_sanitize_action_accepts_ordered_move_waypoints() -> None:
+    assert sanitize_action(
         {
             "type": "move",
             "waypoints": [[4, 5], (8, 9)],
@@ -783,11 +694,11 @@ def test_sanitize_planned_action_accepts_ordered_move_waypoints() -> None:
     }
 
 
-def test_sanitize_planned_action_rejects_invalid_move_waypoints() -> None:
-    assert sanitize_planned_action(
+def test_sanitize_action_rejects_invalid_move_waypoints() -> None:
+    assert sanitize_action(
         {"type": "move", "waypoints": [[4, 5, 6]], "target": [12, 9]}
     ) is None
-    assert sanitize_planned_action(
+    assert sanitize_action(
         {
             "type": "move",
             "waypoints": [[index, 5] for index in range(MAX_MOVE_WAYPOINTS + 1)],

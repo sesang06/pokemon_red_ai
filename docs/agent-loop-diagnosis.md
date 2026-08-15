@@ -143,7 +143,6 @@ action_request: {'type': 'move', 'target': [4, 3]}
 | `team.py:221`, `history.py:6` | `RAW_HISTORY_TURNS=20`. 히스토리는 매 스텝 1씩 늘고 압축 후 다시 20으로 잘리므로, **21스텝부터 "1턴 압축"을 위해 매 스텝 interpreter LLM이 호출**된다. |
 | `prompts.py` `RESULT_INTERPRETER_PROMPT` | 매 호출마다 `history_summary` 전체를 새로 쓰게 지시. 1턴 정보로 누적 요약이 계속 덮어써지며 정보가 유실된다. |
 | `loop.py:109-129` | `stuck_score`를 계산하지만 **아무도 소비하지 않는다.** 프롬프트에 숫자로만 실리고, 실제 조종자인 룰 플래너는 무시한다. |
-| `history.py:21`, `adk_planner.py:189` | `trim_session_to_recent_turns` / `_strip_prior_media_from_session_service`가 `session_service.sessions` dict를 찾는데 `SqliteSessionService`에는 해당 속성이 없어 **항상 no-op**. |
 | `data/adk_sessions.db` | `events` 테이블 0건, `sessions`에 `adk_agent`와 `src.pokemon_agent.adk_agent` 두 app_name이 공존 (CLI/Dev UI 세션 분리). |
 
 ---

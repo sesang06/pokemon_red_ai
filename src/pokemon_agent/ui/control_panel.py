@@ -150,6 +150,16 @@ class QtStateControlPanel:
         buttons_button.setToolTip("Queue a delayed button-token array")
         button_grid.addWidget(buttons_button, 4, 1)
 
+        game_a_button = QPushButton("A")
+        game_a_button.clicked.connect(lambda _checked=False: self._queue_single_button("a"))
+        game_a_button.setToolTip("Press the Game Boy A button")
+        button_grid.addWidget(game_a_button, 5, 0)
+
+        game_b_button = QPushButton("B")
+        game_b_button.clicked.connect(lambda _checked=False: self._queue_single_button("b"))
+        game_b_button.setToolTip("Press the Game Boy B button")
+        button_grid.addWidget(game_b_button, 5, 1)
+
         self.save_fixed_on_quit = QCheckBox("Save fixed state when quitting")
         layout.addWidget(self.save_fixed_on_quit)
 
@@ -305,6 +315,10 @@ class QtStateControlPanel:
 
         self.commands.append(ControlCommand("buttons", buttons=tuple(buttons)))
         self.status_label.setText(f"Queued buttons: {buttons}")
+
+    def _queue_single_button(self, button: str) -> None:
+        self.commands.append(ControlCommand("buttons", buttons=(button,)))
+        self.status_label.setText(f"Queued button: {button}")
 
     def _queue_stop(self) -> None:
         if self.save_fixed_on_quit.isChecked():

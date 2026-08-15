@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from pokemon_agent.adk_agent.agents.goal import normalize_goal
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_RUNTIME_STATE_PATH = PROJECT_ROOT / "data" / "adk_runtime_state.json"
@@ -22,30 +24,31 @@ class FileAgentRuntimeState:
     def read(self) -> dict[str, Any]:
         if not self.path.exists():
             return {
-                "version": 1,
+                "version": 2,
                 "updated_at": None,
                 "phase": "not_started",
+                "goal": normalize_goal(None),
                 "action_history": [],
             }
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {
-                "version": 1,
+                "version": 2,
                 "updated_at": None,
                 "phase": "unavailable",
+                "goal": normalize_goal(None),
                 "action_history": [],
             }
         return data if isinstance(data, dict) else {}
 
     def publish(self, state: dict[str, Any], *, phase: str) -> None:
         payload = {
-            "version": 1,
+            "version": 2,
             "updated_at": _now_iso(),
             "phase": phase,
             "metadata": dict(self.metadata),
-            "objective": state.get("objective"),
-            "current_goal": state.get("current_goal"),
+            "goal": normalize_goal(state.get("goal")),
             "active_action_plan": state.get("active_action_plan"),
             "action_outcome": state.get("action_outcome"),
             "state_diff": state.get("state_diff"),

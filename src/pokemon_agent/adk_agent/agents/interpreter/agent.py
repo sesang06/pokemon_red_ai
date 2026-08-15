@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -10,34 +9,29 @@ from typing import Any
 
 from pokemon_agent.adk_agent.agents.memory_tools import (
     build_save_memory_tool,
+    build_search_memory_tool,
+)
+from pokemon_agent.adk_agent.agents.goal import (
+    GoalUpdateBuffer,
+    build_update_goal_tool,
+    normalize_goal,
 )
 from pokemon_agent.adk_agent.agents.interpreter.schema import ResultSummarizer
-from pokemon_agent.adk_agent.agents.planner.agent import DEFAULT_ADK_MODEL
+from pokemon_agent.adk_agent.agents.planner.agent import (
+    DEFAULT_ADK_MODEL,
+    DEFAULT_ADK_THINKING_LEVEL,
+)
 from pokemon_agent.adk_agent.agents.interpreter.prompt import RESULT_INTERPRETER_PROMPT
 from pokemon_agent.adk_agent.agents.planner.schema import PokemonAgentState
 from pokemon_agent.adk_agent.agents.shared import (
-    ConsoleTokenStream,
     MAX_AUTOMATIC_FUNCTION_CALLS,
     TraceSink,
     emit_trace,
-    event_finish_reason,
-    event_text,
-    event_thinking_summary,
-    invalid_response_error,
-    parse_json_object,
     public_output_fields,
     run_with_idle_pump,
 )
-from pokemon_agent.adk_agent.coordinator.action_cycle import should_interpret_action_outcome
 from pokemon_agent.adk_agent.runtime.history import (
     RAW_HISTORY_TURNS,
-    RESULT_INTERPRETER_PRIOR_TURNS,
-    trim_session_to_recent_turns,
-)
-from pokemon_agent.adk_agent.runtime.session import (
-    ADK_WEB_APP_NAME,
-    DEFAULT_ADK_USER_ID,
-    ContextFilteringSqliteSessionService,
 )
 from pokemon_agent.memory.file_memory import FileLongTermMemory
 
@@ -55,52 +49,10 @@ class ResultInterpreterAgent:
 
     def interpret(self, state: PokemonAgentState) -> PokemonAgentState:
         action_outcome = state.get("action_outcome", {})
-        if not should_interpret_action_outcome(action_outcome):
-            interpretation = dict(state.get("interpretation") or {})
-            interpretation.setdefault("agent", self.name)
-            interpretation.setdefault("phase", "result_interpretation")
-            interpretation.setdefault("summary", "action_cycle_in_progress")
-            interpretation["current_action_status"] = action_outcome.get("status", "continue")
-            interpretation["current_state_changes"] = action_outcome.get("state_changes", [])
-            interpretation["llm_called"] = False
-            interpretation["history_compacted_turns"] = (
-                1 if int(state.get("step_count", 0)) > self.history_limit else 0
-            )
-            interpretation.update(
-                public_output_fields(
-                    None,
-                    dict(state),
-                    default_thought=(
-                        "The current action cycle is still in progress; wait for the next verifiable result."
-                    ),
-                )
-            )
-            emit_trace(
-                self.trace,
-                {
-                    "agent": self.name,
-                    "phase": "result_interpretation",
-                    "step": state.get("step_count", 0),
-                    "memory_written": [],
-                },
-            )
-            return {"interpretation": interpretation, "interpret_error": None}
-
         payload = compact_interpreter_context(dict(state))
         summary_result: dict[str, Any] = {}
         interpret_error: str | None = None
         if self.summarizer is not None:
-            supports_thinking_callback = hasattr(self.summarizer, "thinking_summary_callback")
-            if supports_thinking_callback:
-                self.summarizer.thinking_summary_callback = lambda summary: emit_trace(
-                    self.trace,
-                    {
-                        "agent": self.name,
-                        "phase": "result_interpretation_thinking",
-                        "step": state.get("step_count", 0),
-                        "thinking_summary": summary,
-                    },
-                )
             try:
                 emit_trace(
                     self.trace,
@@ -136,11 +88,14 @@ class ResultInterpreterAgent:
                     )
             except Exception as exc:
                 interpret_error = f"{type(exc).__name__}: {exc}"
-            finally:
-                if supports_thinking_callback:
-                    self.summarizer.thinking_summary_callback = None
 
         written_keys = list(getattr(self.summarizer, "last_saved_memory_keys", []))
+        goal_update = getattr(self.summarizer, "last_goal_update", None)
+        goal = normalize_goal(
+            goal_update.get("goal")
+            if isinstance(goal_update, dict) and isinstance(goal_update.get("goal"), dict)
+            else state.get("goal")
+        )
         summary_text = str(
             summary_result.get("summary")
             or summary_result.get("reason")
@@ -159,8 +114,7 @@ class ResultInterpreterAgent:
             "summary": summary_text,
             "action_succeeded": action_outcome.get("action_result") == "success",
             "action_status": action_outcome.get("status"),
-            "goal_progress": summary_result.get("goal_progress"),
-            "goal_completed": action_outcome.get("goal_completed", False),
+            "goal_updated": bool(isinstance(goal_update, dict) and goal_update.get("changed")),
             "verified_state_change": summary_result.get(
                 "verified_state_change", action_outcome.get("state_changes", [])
             ),
@@ -188,7 +142,6 @@ class ResultInterpreterAgent:
                     else "result_interpretation"
                 ),
                 "step": state.get("step_count", 0),
-                "thinking_summary": getattr(self.summarizer, "last_thinking_summary", None),
                 "screen_description": interpretation["screen_description"],
                 "current_location": interpretation["current_location"],
                 "thought_summary": interpretation["thought_summary"],
@@ -197,6 +150,7 @@ class ResultInterpreterAgent:
             },
         )
         return {
+            "goal": goal,
             "interpretation": interpretation,
             "interpret_error": interpret_error,
             "interpreter_call_count": int(state.get("interpreter_call_count", 0))
@@ -215,6 +169,7 @@ def compact_interpreter_context(state: dict[str, Any]) -> dict[str, Any]:
     execution_result = (
         execution_report.get("result") if isinstance(execution_report.get("result"), dict) else {}
     )
+    plan_decision = state.get("plan_decision") if isinstance(state.get("plan_decision"), dict) else {}
 
     last_result: dict[str, Any] = {
         "status": action_outcome.get("status", action_plan.get("status", "unknown")),
@@ -224,7 +179,6 @@ def compact_interpreter_context(state: dict[str, Any]) -> dict[str, Any]:
             if isinstance(state_diff.get("changes"), dict)
             else "position_changed" in state_diff.get("event_types", [])
         ),
-        "goal_completed": bool(action_outcome.get("goal_completed", False)),
     }
     movement_result = _movement_result_for_interpreter(action_plan, execution_report, execution_result)
     if movement_result:
@@ -238,7 +192,7 @@ def compact_interpreter_context(state: dict[str, Any]) -> dict[str, Any]:
         "mode": game_state.get("mode") or state.get("mode") or "unknown",
         "dialog": bool(game_state.get("dialog_open", False)),
         "battle": bool(game_state.get("in_battle", False)),
-        "flags": _relevant_flags(game_state, action_plan, state.get("current_goal")),
+        "flags": _relevant_flags(game_state, action_plan, state.get("goal")),
         "party_count": _party_count(game_state),
     }
     dialog_text = game_state.get("dialog_text")
@@ -258,7 +212,14 @@ def compact_interpreter_context(state: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "step": int(state.get("step_count", 0)),
+        "goal": normalize_goal(state.get("goal")),
         "state": compact_state,
+        "planner_conclusion": {
+            "screen_description": plan_decision.get("screen_description"),
+            "current_location": plan_decision.get("current_location"),
+            "thought_summary": plan_decision.get("thought_summary"),
+            "action": action_plan.get("action"),
+        },
         "action_plan": {
             "action": action_plan.get("action"),
             "status": action_plan.get("status"),
@@ -397,27 +358,18 @@ def _compact_party_for_memory(party: Any) -> list[dict[str, Any]]:
 
 def _relevant_flags(game_state: dict[str, Any], action_plan: dict[str, Any], goal: Any) -> dict[str, bool]:
     flags = game_state.get("flags") if isinstance(game_state.get("flags"), dict) else {}
-    explicit: list[str] = []
-    for condition in _iter_conditions(goal):
-        if isinstance(condition, dict):
-            path = str(condition.get("path") or "")
-            if path.startswith("flags."):
-                key = path.removeprefix("flags.")
-                if key and key not in explicit:
-                    explicit.append(key)
-
     action = action_plan.get("action") if isinstance(action_plan.get("action"), dict) else {}
     query = " ".join(
         str(value or "")
         for value in (
             action.get("type"),
             action.get("reason"),
-            goal.get("id") if isinstance(goal, dict) else None,
-            goal.get("description") if isinstance(goal, dict) else None,
+            goal.get("main") if isinstance(goal, dict) else None,
+            goal.get("sub") if isinstance(goal, dict) else None,
         )
     )
     query_tokens = _tokens(query)
-    selected = list(explicit)
+    selected: list[str] = []
     for key in flags:
         key_tokens = _tokens(str(key))
         if query_tokens.intersection(key_tokens) and key not in selected:
@@ -426,13 +378,6 @@ def _relevant_flags(game_state: dict[str, Any], action_plan: dict[str, Any], goa
         if value is True and key not in selected:
             selected.append(str(key))
     return {key: bool(flags[key]) for key in selected[:8] if key in flags}
-
-
-def _iter_conditions(goal: Any) -> list[Any]:
-    conditions: list[Any] = []
-    if isinstance(goal, dict) and isinstance(goal.get("success_conditions"), list):
-        conditions.extend(goal["success_conditions"])
-    return conditions
 
 
 def _position_list(position: Any) -> list[int] | None:
@@ -458,29 +403,20 @@ def _tokens(value: str) -> set[str]:
 
 @dataclass
 class GoogleAdkResultInterpreter:
+    """Builds the native Result Interpreter child for the shared ADK team run."""
+
     model: str = DEFAULT_ADK_MODEL
-    app_name: str = ADK_WEB_APP_NAME
-    user_id: str = DEFAULT_ADK_USER_ID
-    session_id: str = "pokemon-red-result-interpreter"
     temperature: float = 0.2
     max_output_tokens: int = 2048
-    thinking_budget: int | None = -1
-    stream_output: bool = True
-    prior_session_turns: int = RESULT_INTERPRETER_PRIOR_TURNS
-    session_db_path: str | os.PathLike[str] | None = None
+    thinking_level: str = DEFAULT_ADK_THINKING_LEVEL
     memory_store: FileLongTermMemory = field(default_factory=FileLongTermMemory)
-    last_interpret_error: str | None = field(init=False, default=None)
-    last_thinking_summary: str | None = field(init=False, default=None)
-    thinking_summary_callback: Callable[[str], None] | None = field(init=False, default=None, repr=False)
+    goal_updates: GoalUpdateBuffer = field(default_factory=GoalUpdateBuffer)
     memory_activity_callback: Callable[[dict[str, Any]], None] | None = field(init=False, default=None, repr=False)
     memory_tool_activity: list[dict[str, Any]] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
         try:
             from google.adk.agents import Agent
-            from google.adk.agents.run_config import RunConfig, StreamingMode
-            from google.adk.runners import Runner
-            from google.adk.sessions import InMemorySessionService
             from google.genai import types
         except ModuleNotFoundError as exc:
             raise RuntimeError('Install Google ADK first: python -m pip install -e ".[dev]"') from exc
@@ -492,25 +428,18 @@ class GoogleAdkResultInterpreter:
                 maximum_remote_calls=MAX_AUTOMATIC_FUNCTION_CALLS,
             ),
         }
-        if self.thinking_budget is not None:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(
-                thinking_budget=self.thinking_budget,
-                include_thoughts=True,
-            )
-        generate_config = types.GenerateContentConfig(**config_kwargs)
-        self.session_service = (
-            ContextFilteringSqliteSessionService(
-                self.session_db_path,
-                prior_turn_limit=self.prior_session_turns,
-            )
-            if self.session_db_path is not None
-            else InMemorySessionService()
+        config_kwargs["thinking_config"] = types.ThinkingConfig(
+            thinking_level=types.ThinkingLevel(self.thinking_level.upper()),
+            include_thoughts=False,
         )
+        generate_config = types.GenerateContentConfig(**config_kwargs)
         self.agent = Agent(
             name="pokemon_red_result_interpreter_agent",
             model=self.model,
             description="Interprets Pokemon Red action outcomes and proposes durable memory facts.",
             instruction=INTERPRETER_PROMPT,
+            disallow_transfer_to_parent=True,
+            disallow_transfer_to_peers=True,
             generate_content_config=generate_config,
             tools=[
                 build_save_memory_tool(
@@ -519,17 +448,14 @@ class GoogleAdkResultInterpreter:
                     activity=self.memory_tool_activity,
                     on_activity=self._publish_memory_activity,
                 ),
+                build_search_memory_tool(
+                    self.memory_store,
+                    activity=self.memory_tool_activity,
+                    on_activity=self._publish_memory_activity,
+                ),
+                build_update_goal_tool(self.goal_updates),
             ],
         )
-        self.runner = Runner(
-            agent=self.agent,
-            app_name=self.app_name,
-            session_service=self.session_service,
-        )
-        self.run_config = RunConfig(
-            streaming_mode=StreamingMode.SSE if self.stream_output else StreamingMode.NONE,
-        )
-        self._session_created = False
 
     def _publish_memory_activity(self, event: dict[str, Any]) -> None:
         if self.memory_activity_callback is not None:
@@ -540,98 +466,14 @@ class GoogleAdkResultInterpreter:
         cls,
         *,
         model: str | None = None,
-        thinking_budget: int | None = -1,
-        stream_output: bool = True,
-        session_db_path: str | os.PathLike[str] | None = None,
+        thinking_level: str = DEFAULT_ADK_THINKING_LEVEL,
         memory_store: FileLongTermMemory | None = None,
     ) -> "GoogleAdkResultInterpreter":
         return cls(
             model=model or os.environ.get("POKEMON_AGENT_ADK_MODEL", DEFAULT_ADK_MODEL),
-            thinking_budget=thinking_budget,
-            stream_output=stream_output,
-            session_db_path=session_db_path,
+            thinking_level=thinking_level,
             memory_store=memory_store or FileLongTermMemory(),
         )
-
-    def summarize(self, payload: dict[str, Any]) -> dict[str, Any] | None:
-        return asyncio.run(self.summarize_async(payload))
-
-    async def summarize_async(self, payload: dict[str, Any]) -> dict[str, Any] | None:
-        self.last_interpret_error = None
-        self.last_thinking_summary = None
-        self.memory_tool_activity.clear()
-        await self._ensure_session()
-        trim_session_to_recent_turns(
-            self.session_service,
-            app_name=self.app_name,
-            user_id=self.user_id,
-            session_id=self.session_id,
-            max_turns=self.prior_session_turns,
-        )
-        from google.genai import types
-
-        content = types.Content(
-            role="user",
-            parts=[
-                types.Part.from_text(
-                    text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                )
-            ],
-        )
-        final_text = ""
-        streamed_text = ""
-        streamed_thinking = ""
-        final_thinking = ""
-        finish_reason: str | None = None
-        console_stream = ConsoleTokenStream("pokemon_red_result_interpreter", enabled=self.stream_output)
-        async for event in self.runner.run_async(
-            user_id=self.user_id,
-            session_id=self.session_id,
-            new_message=content,
-            run_config=self.run_config,
-        ):
-            text = event_text(event)
-            thinking = event_thinking_summary(event)
-            if thinking:
-                if getattr(event, "partial", False):
-                    streamed_thinking += thinking
-                else:
-                    final_thinking = (
-                        thinking
-                        if not streamed_thinking or thinking.startswith(streamed_thinking)
-                        else streamed_thinking + thinking
-                    )
-                current_thinking = (final_thinking or streamed_thinking).strip()
-                if current_thinking:
-                    self.last_thinking_summary = current_thinking
-                    callback = getattr(self, "thinking_summary_callback", None)
-                    if callback is not None:
-                        callback(current_thinking)
-            if getattr(event, "partial", False) and text:
-                streamed_text += text
-                console_stream.write(text)
-            elif text:
-                final_text = text
-            response_finish_reason = event_finish_reason(event)
-            if response_finish_reason:
-                finish_reason = response_finish_reason
-            if event.is_final_response() and text:
-                final_text = text
-
-        if not final_text:
-            final_text = streamed_text
-        console_stream.finish(final_text)
-
-        parsed = parse_json_object(final_text)
-        if isinstance(parsed, dict):
-            return parsed
-        self.last_interpret_error = invalid_response_error(final_text, finish_reason=finish_reason)
-        LOGGER.warning(
-            "ADK result interpreter response rejected: %s; preview=%r",
-            self.last_interpret_error,
-            final_text[:500],
-        )
-        return None
 
     @property
     def last_saved_memory_keys(self) -> list[str]:
@@ -644,21 +486,6 @@ class GoogleAdkResultInterpreter:
             )
         )
 
-    async def _ensure_session(self) -> None:
-        if self._session_created:
-            return
-        from google.adk.sessions.base_session_service import GetSessionConfig
-
-        session = await self.session_service.get_session(
-            app_name=self.app_name,
-            user_id=self.user_id,
-            session_id=self.session_id,
-            config=GetSessionConfig(num_recent_events=0),
-        )
-        if session is None:
-            await self.session_service.create_session(
-                app_name=self.app_name,
-                user_id=self.user_id,
-                session_id=self.session_id,
-            )
-        self._session_created = True
+    @property
+    def last_goal_update(self) -> dict[str, Any] | None:
+        return self.goal_updates.last_update

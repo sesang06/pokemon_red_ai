@@ -55,8 +55,7 @@ def initial_live_state() -> dict[str, Any]:
         },
         "agent": {
             "phase": "not_started",
-            "objective": None,
-            "task": None,
+            "goal": {"main": "Complete Pokemon Red", "sub": ""},
             "action": None,
             "result": None,
             "pipeline": pipeline_for_phase("not_started"),
@@ -145,28 +144,16 @@ def observation_state(observation: dict[str, Any], *, ticker: dict[str, Any] | N
 
 
 def runtime_state(state: dict[str, Any], *, phase: str) -> dict[str, Any]:
-    goal = state.get("current_goal") if isinstance(state.get("current_goal"), dict) else {}
     plan = state.get("active_action_plan") if isinstance(state.get("active_action_plan"), dict) else {}
-    action = state.get("planned_action") if isinstance(state.get("planned_action"), dict) else plan.get("action")
+    action = plan.get("action")
     outcome = state.get("action_outcome") if isinstance(state.get("action_outcome"), dict) else None
     result = state.get("action_result") if isinstance(state.get("action_result"), dict) else {}
     navigation = navigation_from_result(result)
-    task = None
-    if goal:
-        task = {
-            "id": goal.get("id"),
-            "description": goal.get("description") or goal.get("id"),
-            "status": goal.get("status") or "planned",
-            "step": int(state.get("step_count", 0)),
-            "max_steps": state.get("max_steps"),
-            "verification": goal.get("verification"),
-        }
     return {
         "updated_at": now_iso(),
         "agent": {
             "phase": phase,
-            "objective": state.get("objective"),
-            "task": task,
+            "goal": state.get("goal"),
             "action": action,
             "result": outcome or _compact_action_result(result),
             "pipeline": pipeline_for_phase(phase),

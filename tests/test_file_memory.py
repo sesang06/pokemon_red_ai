@@ -102,14 +102,58 @@ def test_file_memory_batch_merge_preserves_distinct_existing_facts(tmp_path: Pat
     store.remember("map", "Oak's Lab", "Professor Oak stands near [5,2].", source="test")
 
     store.remember_many(
-        [{"memory_type": "map", "name": "Oak's Lab", "value": "The exit is at [5,11]."}],
+        [
+            {
+                "memory_type": "map",
+                "name": "Oak's Lab",
+                "value": "The exit is at [5,11].",
+                "operation": "append",
+            }
+        ],
         source="result_interpreter",
-        merge_existing=True,
     )
 
     assert store.get("map", "Oak's Lab")["value"] == (
         "Professor Oak stands near [5,2].\nThe exit is at [5,11]."
     )
+
+
+def test_file_memory_replace_operation_overwrites_existing_value(tmp_path: Path) -> None:
+    store = FileLongTermMemory(tmp_path / "memory.json")
+    store.remember("npc", "Professor Oak", "outdated location", source="test")
+
+    store.remember_many(
+        [
+            {
+                "memory_type": "npc",
+                "name": "Professor Oak",
+                "value": "Runs the Pokemon Lab in Pallet Town.",
+                "operation": "replace",
+            }
+        ],
+        source="result_interpreter",
+    )
+
+    assert store.get("npc", "Professor Oak")["value"] == "Runs the Pokemon Lab in Pallet Town."
+
+
+def test_file_memory_rejects_invalid_operation_before_writing(tmp_path: Path) -> None:
+    store = FileLongTermMemory(tmp_path / "memory.json")
+    store.remember("map", "Pallet Town", "north exit", source="test")
+
+    with pytest.raises(ValueError, match="memory operation"):
+        store.remember_many(
+            [
+                {
+                    "memory_type": "map",
+                    "name": "Pallet Town",
+                    "value": "south exit",
+                    "operation": "delete",
+                }
+            ]
+        )
+
+    assert store.get("map", "Pallet Town")["value"] == "north exit"
 
 
 def test_file_memory_keeps_supported_namespaces_and_hides_unknown_keys(tmp_path: Path) -> None:

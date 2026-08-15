@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from pokemon_agent.adk_agent.coordinator.action_cycle import (
     build_state_diff,
-    evaluate_state_condition,
-    goal_from_objective,
     verify_action_cycle,
-    verify_goal,
 )
 from pokemon_agent.adk_agent.agents.interpreter.agent import compact_interpreter_context
 from pokemon_agent.adk_agent.agents.interpreter.agent import ResultInterpreterAgent
@@ -33,26 +30,6 @@ def action_plan() -> dict:
     }
 
 
-def test_state_condition_reads_nested_ram_state() -> None:
-    assert evaluate_state_condition(
-        {"path": "position", "equals": {"x": 5, "y": 6}},
-        observation(),
-    )["matched"] is True
-    assert evaluate_state_condition(
-        {"path": "flags.got_starter", "equals": True},
-        observation(),
-    )["matched"] is False
-    assert evaluate_state_condition({"path": "dialog_open", "not_equals": True}, observation())["matched"] is None
-
-
-def test_objectives_do_not_receive_hardcoded_ram_success_conditions() -> None:
-    for objective in ("obtain_pokeballs", "obtain_first_pokemon", "reach_viridian_city"):
-        goal = goal_from_objective(objective)
-        assert goal["id"] == objective
-        assert goal["description"] == objective
-        assert goal["success_conditions"] == []
-
-
 def test_action_cycle_completes_after_exactly_one_execution() -> None:
     before = observation(dialog_open=True)
     after = observation(dialog_open=False)
@@ -60,7 +37,6 @@ def test_action_cycle_completes_after_exactly_one_execution() -> None:
         action_plan(),
         action_result={"stop_reason": "buttons_complete"},
         state_diff=build_state_diff(before, after),
-        goal_completed=False,
     )
 
     assert updated["status"] == "single_action_complete"
@@ -76,7 +52,6 @@ def test_action_cycle_stops_on_execution_interruption() -> None:
         action_plan(),
         action_result={"stop_reason": "realtime_ticker_stopped"},
         state_diff=state_diff,
-        goal_completed=False,
     )
 
     assert interrupted["status"] == "interrupted"
@@ -91,21 +66,11 @@ def test_dialog_or_battle_transition_completes_the_move_action() -> None:
             action_plan(),
             action_result={"stop_reason": stop_reason},
             state_diff=build_state_diff(current, dialog),
-            goal_completed=False,
         )
 
         assert outcome["status"] == "single_action_complete"
         assert outcome["action_result"] == "success"
         assert outcome["reason"] == stop_reason
-
-
-def test_goal_verification_remains_deterministic() -> None:
-    goal = {"success_conditions": [{"path": "flags.got_starter", "equals": True}]}
-    assert verify_goal(goal, observation())["verified"] is False
-
-    completed = observation()
-    completed["state"]["flags"]["got_starter"] = True
-    assert verify_goal(goal, completed)["verified"] is True
 
 
 def test_interpreter_context_contains_action_outcome_without_task_fields() -> None:
@@ -114,21 +79,32 @@ def test_interpreter_context_contains_action_outcome_without_task_fields() -> No
     payload = compact_interpreter_context(
         {
             "step_count": 3,
+            "goal": {"main": "Complete Pokemon Red", "sub": "Choose a starter Pokemon"},
             "observation": after,
             "active_action_plan": {
                 **action_plan(),
                 "status": "single_action_complete",
             },
+            "plan_decision": {
+                "screen_description": "Professor Oak's dialog is open.",
+                "current_location": "Oak's Lab (5, 6)",
+                "thought_summary": "Advance the dialog once and verify the result.",
+            },
             "action_outcome": {
                 "status": "single_action_complete",
                 "reason": "single_action_complete",
-                "goal_completed": False,
             },
             "state_diff": build_state_diff(before, after),
         }
     )
 
     assert payload["action_plan"]["action"]["type"] == "buttons"
+    assert payload["planner_conclusion"] == {
+        "screen_description": "Professor Oak's dialog is open.",
+        "current_location": "Oak's Lab (5, 6)",
+        "thought_summary": "Advance the dialog once and verify the result.",
+        "action": action_plan()["action"],
+    }
     assert payload["last_result"]["status"] == "single_action_complete"
     assert payload["state_changes"] == ["dialog", "mode"]
     assert "before" not in str(payload)
@@ -312,7 +288,7 @@ def test_interpreter_context_reports_waypoint_route_progress() -> None:
     assert movement["route_results"][-1]["stop_reason"] == "movement_blocked"
 
 
-def test_result_interpreter_preserves_public_screen_location_and_summary_fields() -> None:
+def test_result_interpreter_runs_for_routine_results_and_preserves_public_fields() -> None:
     class FakeSummarizer:
         stream_output = False
         last_saved_memory_keys: list[str] = []
@@ -324,20 +300,19 @@ def test_result_interpreter_preserves_public_screen_location_and_summary_fields(
                 "current_location": "Oak's Lab (5, 6)",
                 "thought_summary": "대화는 끝났지만 스타터 획득 여부는 추가 확인이 필요합니다.",
                 "summary": "dialog closed",
-                "goal_progress": 0.5,
                 "memory_saved": False,
             }
 
     result = ResultInterpreterAgent(summarizer=FakeSummarizer()).interpret(
         {
             "step_count": 3,
+            "goal": {"main": "Complete Pokemon Red", "sub": "Choose a starter Pokemon"},
             "observation": observation(dialog_open=False),
             "active_action_plan": action_plan(),
             "action_outcome": {
                 "status": "single_action_complete",
                 "action_result": "success",
-                "important_event": True,
-                "goal_completed": False,
+                "important_event": False,
                 "state_changes": ["dialog_closed"],
             },
             "state_diff": {},
@@ -345,8 +320,49 @@ def test_result_interpreter_preserves_public_screen_location_and_summary_fields(
     )
 
     interpretation = result["interpretation"]
+    assert interpretation["llm_called"] is True
     assert interpretation["screen_description"] == "오박사 연구실에서 대화가 끝난 화면"
     assert interpretation["current_location"] == "Oak's Lab (5, 6)"
     assert interpretation["thought_summary"] == (
         "대화는 끝났지만 스타터 획득 여부는 추가 확인이 필요합니다."
     )
+    assert result["goal"] == {
+        "main": "Complete Pokemon Red",
+        "sub": "Choose a starter Pokemon",
+    }
+
+
+def test_valid_goal_tool_result_survives_invalid_interpreter_json() -> None:
+    class FailedSummarizer:
+        stream_output = False
+        last_saved_memory_keys: list[str] = []
+        last_interpret_error = "invalid_json_response"
+        last_goal_update = {
+            "phase": "goal_update",
+            "changed": True,
+            "goal": {
+                "main": "Complete Pokemon Red",
+                "sub": "Reach Viridian City",
+            },
+        }
+
+        def summarize(self, payload):
+            return None
+
+    result = ResultInterpreterAgent(summarizer=FailedSummarizer()).interpret(
+        {
+            "step_count": 4,
+            "goal": {"main": "Complete Pokemon Red", "sub": "Leave Oak's Lab"},
+            "observation": observation(dialog_open=False),
+            "active_action_plan": action_plan(),
+            "action_outcome": {"status": "single_action_complete"},
+            "state_diff": {},
+        }
+    )
+
+    assert result["goal"] == {
+        "main": "Complete Pokemon Red",
+        "sub": "Reach Viridian City",
+    }
+    assert result["interpret_error"] == "invalid_json_response"
+    assert result["interpretation"]["goal_updated"] is True

@@ -8,7 +8,6 @@ class InterpreterResponse(TypedDict):
     current_location: str
     thought_summary: str
     summary: str
-    goal_progress: float
     memory_saved: bool
 
 

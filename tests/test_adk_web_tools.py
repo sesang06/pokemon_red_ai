@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from google.adk.agents import LlmAgent
+
 from pokemon_agent.adk_agent.agents.planner.prompt import PLANNING_AGENT_PROMPT
 from pokemon_agent.adk_agent.agents.interpreter.prompt import RESULT_INTERPRETER_PROMPT
 from pokemon_agent.adk_agent.agents.shared import MAX_AUTOMATIC_FUNCTION_CALLS
@@ -38,7 +40,7 @@ def test_adk_web_tools_read_shared_cli_runtime_history(tmp_path: Path, monkeypat
     store = FileAgentRuntimeState(tmp_path / "adk_runtime_state.json")
     store.publish(
         {
-            "objective": "finish Pokemon Red",
+            "goal": {"main": "Finish Pokemon Red", "sub": "Reach Viridian City"},
             "step_count": 7,
             "mode": "overworld",
             "action_history": [{"step": 6}, {"step": 7}],
@@ -53,6 +55,7 @@ def test_adk_web_tools_read_shared_cli_runtime_history(tmp_path: Path, monkeypat
 
     assert status["phase"] == "executed"
     assert status["step_count"] == 7
+    assert status["goal"]["sub"] == "Reach Viridian City"
     assert actions["actions"] == [{"step": 7}]
 
 
@@ -73,9 +76,13 @@ def test_adk_web_dashboard_bridge_forwards_compact_agent_updates() -> None:
     client = FakeClient()
     hub = _McpDashboardHub(client)
     state = {
+        "goal": {"main": "Complete Pokemon Red", "sub": "Choose a starter"},
         "step_count": 3,
         "max_steps": 100,
-        "planned_action": {"type": "buttons", "buttons": ["a"]},
+        "active_action_plan": {
+            "action": {"type": "buttons", "buttons": ["a"]},
+            "status": "active",
+        },
         "action_result": {
             "stop_reason": "buttons_complete",
             "before_observation": {"screenshot": {"base64": "large"}},
@@ -94,6 +101,7 @@ def test_adk_web_dashboard_bridge_forwards_compact_agent_updates() -> None:
 
     runtime = client.calls[1][1]
     assert runtime["step_count"] == 3
+    assert runtime["goal"]["sub"] == "Choose a starter"
     assert runtime["action_result"] == {"stop_reason": "buttons_complete"}
     assert "observation" not in runtime
     assert client.calls[0][1]["thinking_summary"] == "Read the dialog."
@@ -147,6 +155,9 @@ def test_adk_web_root_agent_exposes_traceable_runtime_team() -> None:
         "pokemon_red_execution_agent",
         "pokemon_red_result_interpreter_agent",
     ]
+    assert isinstance(team.sub_agents[0], LlmAgent)
+    assert not isinstance(team.sub_agents[1], LlmAgent)
+    assert isinstance(team.sub_agents[2], LlmAgent)
     tool_names = {getattr(tool, "name", getattr(tool, "__name__", "")) for tool in root_agent.tools}
     assert tool_names == {"agent_runtime_status", "recent_agent_actions"}
 
@@ -166,10 +177,13 @@ def test_adk_web_exports_compacted_app() -> None:
     assert app.root_agent is not None
     assert configured.name == "adk_agent"
     assert configured.root_agent.name == "pokemon_red_web_coordinator"
-    assert configured.events_compaction_config.compaction_interval == 5
+    assert configured.events_compaction_config.compaction_interval == 10
     assert configured.events_compaction_config.overlap_size == 1
-    assert configured.events_compaction_config.token_threshold is not None
+    assert configured.events_compaction_config.token_threshold == 10_000
     assert configured.events_compaction_config.event_retention_size == 8
+    assert configured.events_compaction_config.summarizer._llm.model == "gemini-2.5-flash-lite"
+    assert configured.root_agent.generate_content_config.thinking_config.thinking_level == "MEDIUM"
+    assert configured.root_agent.generate_content_config.thinking_config.include_thoughts is False
     assert (
         configured.root_agent.generate_content_config.automatic_function_calling.maximum_remote_calls
         == MAX_AUTOMATIC_FUNCTION_CALLS
@@ -195,9 +209,17 @@ def test_adk_web_planning_prompt_documents_direct_action_contract() -> None:
     assert "RAM/GameState" in PLANNING_AGENT_PROMPT
     assert "repeat_until" not in PLANNING_AGENT_PROMPT
     assert "max_repeats" not in PLANNING_AGENT_PROMPT
-    assert 'search_memory(queries=[{"memory_type":"map","name":state.map_name}, ...])' in PLANNING_AGENT_PROMPT
+    assert "`search_memory` is optional" in PLANNING_AGENT_PROMPT
+    assert "Do not call it by default" in PLANNING_AGENT_PROMPT
+    assert "Most turns should use the current screenshot" in PLANNING_AGENT_PROMPT
+    assert "Do not search before saving" in PLANNING_AGENT_PROMPT
     assert "Never call `search_memory` a second time" in PLANNING_AGENT_PROMPT
     assert "save_memory(entries=" in RESULT_INTERPRETER_PROMPT
+    assert '`operation` as `append` or `replace`' in RESULT_INTERPRETER_PROMPT
+    assert "Different entries in one call may use" in RESULT_INTERPRETER_PROMPT
+    assert "different operations" in RESULT_INTERPRETER_PROMPT
+    assert "Most action" in RESULT_INTERPRETER_PROMPT
+    assert "results must be interpreted directly" in RESULT_INTERPRETER_PROMPT
     for memory_type in ("map", "npc", "pokemon", "event"):
         assert f"`{memory_type}`" in PLANNING_AGENT_PROMPT
     assert "<memory_type>:<name>" in PLANNING_AGENT_PROMPT

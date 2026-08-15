@@ -236,7 +236,7 @@ flowchart LR
 | 데이터 | 유지 정책 | 용도 |
 |---|---|---|
 | ADK SQLite 이벤트 | 전체 보존 | Dev UI 추적과 대화 기록 |
-| planner 모델 세션 | 최근 5턴 | 다음 행동 결정을 위한 짧은 대화 맥락 |
+| planner 모델 세션 | 10턴 간격 compaction, 1턴 overlap | 다음 행동 결정을 위한 요약 대화 맥락 |
 | 이전 이미지 | 모델 context에서 제거 | 매 호출마다 누적되는 vision token 방지 |
 | 최신 screenshot/overlay | 현재 planner 호출에만 첨부 | 현재 화면 판단 |
 | `action_history` | raw 최근 20개 | 실행 결과 판단 및 압축 대상 |

@@ -8,8 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from pokemon_agent.adk_agent.agents.interpreter.agent import GoogleAdkResultInterpreter
-from pokemon_agent.adk_agent.agents.planner.agent import DEFAULT_ADK_MODEL, GoogleAdkPlanner
-from pokemon_agent.adk_agent.agents.planner.schema import DEFAULT_MAX_STEPS, DEFAULT_OBJECTIVE
+from pokemon_agent.adk_agent.agents.planner.agent import (
+    DEFAULT_ADK_MODEL,
+    DEFAULT_ADK_THINKING_LEVEL,
+    GoogleAdkPlanner,
+)
+from pokemon_agent.adk_agent.agents.planner.schema import DEFAULT_MAX_STEPS
 from pokemon_agent.adk_agent.client import InProcessPokemonMcpClient
 from pokemon_agent.adk_agent.coordinator.loop import PokemonAdkLoop
 from pokemon_agent.adk_agent.coordinator.workflow_agent import (
@@ -33,7 +37,6 @@ DEFAULT_REALTIME_TICKS = True
 DEFAULT_ADK_VISION = True
 DEFAULT_AGENT_TRACE = True
 DEFAULT_DASHBOARD = True
-DEFAULT_ADK_THINKING_BUDGET = -1
 DEFAULT_ACTION_LOG_DIR = Path("logs") / "actions"
 
 
@@ -55,7 +58,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_WINDOW,
         help="PyBoy backend. With control UI, SDL2 is merged into Qt while audio stays enabled; null is silent/headless.",
     )
-    parser.add_argument("--objective", default=DEFAULT_OBJECTIVE, help="Agent objective label.")
+    parser.add_argument(
+        "--main-goal",
+        default=None,
+        help="Override the restored volatile main goal and clear its sub goal.",
+    )
     parser.add_argument("--checkpoint-every", type=int, default=10, help="Save PyBoy state every N loop actions.")
     parser.add_argument("--no-load-fixed", action="store_true", help="Start without loading states/fixed_start.state.")
     parser.add_argument(
@@ -91,17 +98,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--no-adk-vision", dest="adk_vision", action="store_false", help="Do not send screenshots to the ADK model.")
     parser.add_argument(
-        "--adk-thinking-budget",
-        type=int,
-        default=DEFAULT_ADK_THINKING_BUDGET,
-        help="Gemini thinking budget for planner/interpreter. -1 is automatic.",
-    )
-    parser.add_argument(
-        "--no-adk-thinking",
-        dest="adk_thinking_budget",
-        action="store_const",
-        const=None,
-        help="Do not send a thinking_config to the ADK model.",
+        "--adk-thinking-level",
+        choices=("minimal", "low", "medium", "high"),
+        default=DEFAULT_ADK_THINKING_LEVEL.lower(),
+        help="Gemini thinking level for planner/interpreter. Private thought parts are not emitted.",
     )
     parser.add_argument(
         "--memory-path",
@@ -170,14 +170,12 @@ def main() -> None:
         action_planner = GoogleAdkPlanner.from_env(
             model=args.adk_model,
             include_screenshot=args.adk_vision,
-            thinking_budget=args.adk_thinking_budget,
-            session_db_path=args.adk_session_db,
+            thinking_level=args.adk_thinking_level,
             memory_store=memory_store,
         )
         result_interpreter = GoogleAdkResultInterpreter.from_env(
             model=args.adk_model,
-            thinking_budget=args.adk_thinking_budget,
-            session_db_path=args.adk_session_db,
+            thinking_level=args.adk_thinking_level,
             memory_store=memory_store,
         )
 
@@ -187,8 +185,6 @@ def main() -> None:
             metadata={
                 "session_db": str(args.adk_session_db.resolve()),
                 "autoplay_session_id": AUTOPLAY_SESSION_ID,
-                "planner_session_id": "pokemon-red-planner",
-                "result_interpreter_session_id": "pokemon-red-result-interpreter",
             },
         )
         trace_printer = AgentTracePrinter(enabled=args.agent_trace)
@@ -233,14 +229,14 @@ def main() -> None:
         )
         result = run_traced_pokemon_loop(
             loop,
-            objective=args.objective,
+            main_goal=args.main_goal,
             max_steps=args.steps,
             checkpoint_every=args.checkpoint_every,
             session_db_path=str(args.adk_session_db),
             idle_pump=idle_pump,
             idle_pump_interval=1.0 / max(1.0, min(float(args.ui_refresh_hz), 120.0)),
         )
-        result["adk_thinking_budget"] = args.adk_thinking_budget
+        result["adk_thinking_level"] = args.adk_thinking_level
         print(json.dumps(summarize_result(result), indent=2, ensure_ascii=False))
     finally:
         if dashboard is not None:
@@ -251,7 +247,7 @@ def main() -> None:
 def summarize_result(result: dict[str, Any]) -> dict[str, Any]:
     observation = result.get("observation", {})
     return {
-        "objective": result.get("objective"),
+        "goal": result.get("goal"),
         "done": result.get("done"),
         "termination_reason": result.get("termination_reason"),
         "step_count": result.get("step_count"),
@@ -261,7 +257,6 @@ def summarize_result(result: dict[str, Any]) -> dict[str, Any]:
         "fixed_state_path": result.get("fixed_state_path"),
         "memory_path": result.get("memory_path"),
         "state": observation.get("state"),
-        "current_goal": result.get("current_goal"),
         "active_action_plan": result.get("active_action_plan"),
         "action_outcome": result.get("action_outcome"),
         "state_diff": result.get("state_diff"),
@@ -273,8 +268,8 @@ def summarize_result(result: dict[str, Any]) -> dict[str, Any]:
         "interpretation": result.get("interpretation"),
         "interpret_error": result.get("interpret_error"),
         "history_summary": result.get("history_summary"),
-        "adk_thinking_budget": result.get("adk_thinking_budget"),
-        "last_action": result.get("planned_action"),
+        "adk_thinking_level": result.get("adk_thinking_level"),
+        "last_action": (result.get("active_action_plan") or {}).get("action"),
         "plan_error": result.get("plan_error"),
         "last_result": {
             key: value

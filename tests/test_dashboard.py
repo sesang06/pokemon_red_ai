@@ -128,8 +128,7 @@ def test_runtime_state_store_publishes_file_state_and_memory() -> None:
     store = DashboardRuntimeStateStore(FileStore(), hub, memory_store=MemoryStore())
     store.publish(
         {
-            "objective": "complete_pokemon_red",
-            "current_goal": {"id": "complete_pokemon_red", "status": "in_progress"},
+            "goal": {"main": "Complete Pokemon Red", "sub": "Choose a starter"},
             "step_count": 1,
             "action_outcome": {"status": "single_action_complete"},
         },
@@ -138,7 +137,10 @@ def test_runtime_state_store_publishes_file_state_and_memory() -> None:
 
     snapshot = hub.snapshot()["state"]
     assert published[0][1] == "interpreted"
-    assert snapshot["agent"]["task"]["id"] == "complete_pokemon_red"
+    assert snapshot["agent"]["goal"] == {
+        "main": "Complete Pokemon Red",
+        "sub": "Choose a starter",
+    }
     assert snapshot["agent"]["current_step"] == 1
     assert snapshot["agent"]["max_steps"] is None
     assert snapshot["memory"]["recent"][0]["key"] == "map:Pallet Town"
@@ -180,24 +182,11 @@ def test_trace_events_only_expose_structured_public_fields() -> None:
     hub.publish_trace(
         {
             "agent": "pokemon_red_planning_agent",
-            "phase": "planning_thinking",
-            "step": 4,
-            "thinking_summary": "The player is in the overworld",
-        }
-    )
-    streaming_snapshot = hub.snapshot()
-    assert streaming_snapshot["events"] == []
-    assert streaming_snapshot["state"]["agent"]["thinking"]["status"] == "streaming"
-
-    hub.publish_trace(
-        {
-            "agent": "pokemon_red_planning_agent",
             "phase": "planning_done",
             "step": 4,
             "screen_description": "태초마을의 필드 화면",
             "current_location": "Pallet Town (7, 5)",
             "thought_summary": "이동 가능한 좌표로 탐색을 이어갑니다.",
-            "thinking_summary": "The player is in the overworld and the selected target is reachable.",
             "memory_keys_read": ["map:Pallet Town"],
             "action_plan": {
                 "action": {"type": "move", "target": [7, 5]},
@@ -206,14 +195,12 @@ def test_trace_events_only_expose_structured_public_fields() -> None:
     )
 
     snapshot = hub.snapshot()
-    thinking_event = snapshot["events"][-3]
     event = snapshot["events"][-2]
-    assert thinking_event["type"] == "THINKING_SUMMARY"
-    assert thinking_event["payload"]["summary"].startswith("The player is in the overworld")
+    assert all(item["type"] != "THINKING_SUMMARY" for item in snapshot["events"])
     thinking_state = snapshot["state"]["agent"]["thinking"]
     assert thinking_state["agent"] == "planner"
     assert thinking_state["status"] == "complete"
-    assert thinking_state["summary"].startswith("The player is in the overworld")
+    assert thinking_state["summary"] == "이동 가능한 좌표로 탐색을 이어갑니다."
     assert thinking_state["updated_at"]
     assert event["type"] == "PLAN_CREATED"
     assert event["payload"]["screen_description"] == "태초마을의 필드 화면"
@@ -224,39 +211,18 @@ def test_trace_events_only_expose_structured_public_fields() -> None:
     assert "max_repeats" not in event["payload"]
 
 
-def test_thinking_summary_streams_each_chunk_without_creating_partial_events() -> None:
-    async def scenario() -> None:
-        hub = LiveEventHub(state_hz=1)
-        subscription = hub.subscribe()
-        assert (await subscription.queue.get())["kind"] == "snapshot"
+def test_private_thinking_trace_is_not_exposed() -> None:
+    hub = LiveEventHub()
+    before = hub.snapshot()
+    hub.publish_trace(
+        {
+            "agent": "pokemon_red_planning_agent",
+            "phase": "planning_thinking",
+            "step": 2,
+            "thinking_summary": "Checking the map and reachable targets",
+        }
+    )
+    after = hub.snapshot()
 
-        hub.publish_trace(
-            {
-                "agent": "pokemon_red_planning_agent",
-                "phase": "planning_thinking",
-                "step": 2,
-                "thinking_summary": "Checking the map",
-            }
-        )
-        first = await asyncio.wait_for(subscription.queue.get(), timeout=1)
-
-        hub.publish_trace(
-            {
-                "agent": "pokemon_red_planning_agent",
-                "phase": "planning_thinking",
-                "step": 2,
-                "thinking_summary": "Checking the map and reachable targets",
-            }
-        )
-        second = await asyncio.wait_for(subscription.queue.get(), timeout=1)
-
-        assert first["kind"] == "state_delta"
-        assert first["changes"]["agent"]["thinking"]["summary"] == "Checking the map"
-        assert second["kind"] == "state_delta"
-        assert second["changes"]["agent"]["thinking"]["summary"] == (
-            "Checking the map and reachable targets"
-        )
-        assert hub.snapshot()["events"] == []
-        hub.unsubscribe(subscription)
-
-    asyncio.run(scenario())
+    assert after["events"] == before["events"] == []
+    assert after["state"]["agent"]["thinking"] == before["state"]["agent"]["thinking"]

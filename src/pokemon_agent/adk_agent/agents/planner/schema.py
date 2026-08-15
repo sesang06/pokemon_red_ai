@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Protocol, TypedDict
 
+from pokemon_agent.adk_agent.agents.goal import normalize_goal
 from pokemon_agent.input_contract import (
     BUTTON_TOKENS,
     MAX_BUTTONS_PER_ACTION,
@@ -18,7 +19,6 @@ from pokemon_agent.tools.screen_navigation import (
 PokemonMode = Literal["battle", "dialog", "menu", "overworld", "unknown"]
 ALLOWED_BUTTON_TOKENS = frozenset(BUTTON_TOKENS)
 PROMPT_TRANSITION_LIMIT = 2
-DEFAULT_OBJECTIVE = "complete_pokemon_red"
 DEFAULT_MAX_STEPS = 10_000
 
 
@@ -35,11 +35,10 @@ class PlannerResponse(TypedDict):
 
 
 class PokemonAgentState(TypedDict, total=False):
-    objective: str
+    goal: dict[str, str]
     observation: dict[str, Any]
     previous_observation: dict[str, Any]
     mode: PokemonMode
-    current_goal: dict[str, Any]
     active_action_plan: dict[str, Any]
     action_outcome: dict[str, Any]
     state_diff: dict[str, Any]
@@ -48,7 +47,6 @@ class PokemonAgentState(TypedDict, total=False):
     llm_planner_call_count: int
     interpreter_call_count: int
     plan_decision: dict[str, Any]
-    planned_action: dict[str, Any]
     execution_report: dict[str, Any]
     action_result: dict[str, Any]
     action_history: list[dict[str, Any]]
@@ -69,12 +67,12 @@ class PokemonAgentState(TypedDict, total=False):
 
 def initial_state(
     *,
-    objective: str = DEFAULT_OBJECTIVE,
+    goal: dict[str, str] | None = None,
     max_steps: int = DEFAULT_MAX_STEPS,
     checkpoint_every: int = 10,
 ) -> PokemonAgentState:
     return {
-        "objective": objective,
+        "goal": normalize_goal(goal),
         "action_history": [],
         "transition_history": [],
         "stuck_score": 0,
@@ -106,7 +104,7 @@ def classify_mode(observation: dict[str, Any]) -> PokemonMode:
     return "unknown"
 
 
-def sanitize_planned_action(action: dict[str, Any] | None) -> dict[str, Any] | None:
+def sanitize_action(action: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(action, dict):
         return None
 
@@ -151,7 +149,7 @@ def sanitize_planned_action(action: dict[str, Any] | None) -> dict[str, Any] | N
 def normalize_action_plan(raw: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
-    action = sanitize_planned_action(raw.get("action"))
+    action = sanitize_action(raw.get("action"))
     if action is None:
         return None
 
@@ -168,17 +166,13 @@ def compact_state_for_prompt(state: dict[str, Any]) -> dict[str, Any]:
     game_state = observation.get("state", {})
     if not isinstance(game_state, dict):
         game_state = {}
-    current_goal = state.get("current_goal", {})
-    if not isinstance(current_goal, dict):
-        current_goal = {}
     active_action_plan = state.get("active_action_plan")
     if not isinstance(active_action_plan, dict):
         active_action_plan = None
     mode = str(state.get("mode") or classify_mode(observation))
 
     context = {
-        "objective": state.get("objective"),
-        "current_goal": _compact_goal_for_prompt(current_goal),
+        "goal": normalize_goal(state.get("goal")),
         "step_count": state.get("step_count", 0),
         "mode": mode,
         "stuck_score": state.get("stuck_score", 0),
@@ -203,8 +197,8 @@ def compact_state_for_prompt(state: dict[str, Any]) -> dict[str, Any]:
             f"{MAX_MOVE_WAYPOINTS} ordered strategic waypoints. Python visits each waypoint and the final target using "
             "local Dijkstra segments of up to "
             f"{MAX_MOVE_PATH_STEPS} steps and automatically re-observes and replans up to "
-            f"{MAX_WORLD_NAVIGATION_SEGMENTS} segments. Never create a Task or mark a goal complete; "
-            "RAM/structured GameState verification is authoritative."
+            f"{MAX_WORLD_NAVIGATION_SEGMENTS} segments. Never create a Task or mutate the goal; "
+            "the Result Interpreter owns goal updates after verified actions."
         ),
     }
 
@@ -218,21 +212,6 @@ def compact_state_for_prompt(state: dict[str, Any]) -> dict[str, Any]:
         context["navigation"] = _navigation_for_prompt(observation)
 
     return _without_empty(context)
-
-
-def _compact_goal_for_prompt(goal: dict[str, Any]) -> dict[str, Any] | None:
-    if not goal:
-        return None
-    verification = goal.get("verification") if isinstance(goal.get("verification"), dict) else {}
-    return _without_empty(
-        {
-            "id": goal.get("id"),
-            "description": goal.get("description"),
-            "status": goal.get("status"),
-            "success_conditions": goal.get("success_conditions"),
-            "verified": verification.get("verified"),
-        }
-    )
 
 
 def _compact_action_plan_for_prompt(plan: Any) -> dict[str, Any] | None:
@@ -258,7 +237,6 @@ def _compact_action_outcome_for_prompt(result: Any, state_diff: Any) -> dict[str
             "state_changed": bool(state_changes or diff.get("meaningful")),
             "state_changes": state_changes,
             "important_event": result.get("important_event"),
-            "goal_completed": result.get("goal_completed"),
             "reason": result.get("reason"),
         }
     )

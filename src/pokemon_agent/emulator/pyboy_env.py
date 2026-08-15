@@ -114,6 +114,8 @@ class PyBoyEnvironment:
         if symbols is not None:
             kwargs["symbols"] = str(symbols)
 
+        if window.lower() == "sdl2":
+            _install_manual_sdl_key_aliases()
         self.pyboy = PyBoy(str(rom_path), **kwargs)
         self._audio_output = _SdlAudioOutput(self.pyboy.sound, sound_volume) if qt_window and sound_emulated else None
 
@@ -127,6 +129,9 @@ class PyBoyEnvironment:
 
     def button(self, button: str, frames: int = 1) -> None:
         self.pyboy.button(button, frames)
+
+    def set_emulation_speed(self, speed: int) -> None:
+        self.pyboy.set_emulation_speed(max(0, int(speed)))
 
     def tick(self, frames: int = 1, render: bool = False) -> bool:
         running = bool(self.pyboy.tick(frames, render))
@@ -166,3 +171,18 @@ class PyBoyEnvironment:
             self._audio_output.close()
             self._audio_output = None
         self.pyboy.stop(save=save)
+
+
+def _install_manual_sdl_key_aliases() -> None:
+    """Make the visible SDL2 window accept literal A/B keys for Game Boy A/B."""
+    try:
+        import sdl2
+        from pyboy.plugins import window_sdl2
+        from pyboy.utils import WindowEvent
+    except ImportError:
+        return
+
+    window_sdl2.KEY_DOWN[sdl2.SDLK_a] = WindowEvent.PRESS_BUTTON_A
+    window_sdl2.KEY_UP[sdl2.SDLK_a] = WindowEvent.RELEASE_BUTTON_A
+    window_sdl2.KEY_DOWN[sdl2.SDLK_b] = WindowEvent.PRESS_BUTTON_B
+    window_sdl2.KEY_UP[sdl2.SDLK_b] = WindowEvent.RELEASE_BUTTON_B

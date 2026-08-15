@@ -147,6 +147,70 @@ def test_run_rom_updates_control_panel_screen(monkeypatch: Any, tmp_path: Path) 
     assert control_panel.closed is True
 
 
+def test_run_rom_unbounded_mode_stops_when_emulator_closes(monkeypatch: Any, tmp_path: Path) -> None:
+    fake_env = FakePokemonEnvironment()
+    original_tick = fake_env.tick
+
+    def closing_tick(frames: int = 1, render: bool = False) -> bool:
+        original_tick(frames, render)
+        return len(fake_env.ticks) < 3
+
+    fake_env.tick = closing_tick  # type: ignore[method-assign]
+    monkeypatch.setattr(app, "PyBoyEnvironment", lambda rom_path, window: fake_env)
+
+    app.run_rom(
+        tmp_path / "pokered.gb",
+        steps=None,
+        window="null",
+        render=True,
+        capture_config=CaptureConfig(directory=tmp_path / "captures"),
+        state_dir=tmp_path / "states",
+        load_state=None,
+        save_final=None,
+        save_every=0,
+        tick_frames=1,
+        emulation_speed=1,
+    )
+
+    assert len(fake_env.ticks) == 3
+    assert fake_env.emulation_speed == 1
+    assert fake_env.stopped is True
+
+
+def test_run_rom_can_keep_separate_sdl_game_window_with_control_panel(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    fake_env = FakePokemonEnvironment()
+    control_panel = FakeControlPanel()
+    opened_windows: list[str] = []
+
+    def create_environment(rom_path: Path, window: str) -> FakePokemonEnvironment:
+        opened_windows.append(window)
+        return fake_env
+
+    monkeypatch.setattr(app, "PyBoyEnvironment", create_environment)
+
+    app.run_rom(
+        tmp_path / "pokered.gb",
+        steps=1,
+        window="SDL2",
+        render=True,
+        capture_config=CaptureConfig(directory=tmp_path / "captures"),
+        state_dir=tmp_path / "states",
+        load_state=None,
+        save_final=None,
+        save_every=0,
+        tick_frames=1,
+        control_panel=control_panel,  # type: ignore[arg-type]
+        emulation_speed=1,
+        merge_sdl_into_control_panel=False,
+    )
+
+    assert opened_windows == ["SDL2"]
+    assert fake_env.emulation_speed == 1
+
+
 def test_run_rom_control_panel_move_command(monkeypatch: Any, tmp_path: Path) -> None:
     fake_env = FakePokemonEnvironment()
     control_panel = FakeControlPanel()
@@ -227,6 +291,17 @@ def test_run_rom_control_panel_buttons_command_waits_between_buttons(monkeypatch
 def test_parse_buttons_array_accepts_json_and_comma_text() -> None:
     assert _parse_buttons_array('["a", "wait", "start"]') == ["a", "wait", "start"]
     assert _parse_buttons_array("a, wait b") == ["a", "wait", "b"]
+
+
+def test_control_panel_single_button_queues_game_button() -> None:
+    panel = QtStateControlPanel.__new__(QtStateControlPanel)
+    panel.commands = []
+    panel.status_label = type("Status", (), {"setText": lambda self, text: setattr(self, "text", text)})()
+
+    panel._queue_single_button("a")
+    panel._queue_single_button("b")
+
+    assert [command.buttons for command in panel.commands] == [("a",), ("b",)]
 
 
 def test_control_panel_text_update_preserves_scroll_position() -> None:

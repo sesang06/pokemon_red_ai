@@ -6,6 +6,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import count
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,7 @@ from pokemon_agent.vision.overlay import render_collision_overlay
 
 def run_rom(
     rom: Path,
-    steps: int,
+    steps: int | None,
     window: str,
     render: bool,
     capture_config: CaptureConfig,
@@ -39,9 +40,17 @@ def run_rom(
     save_every: int,
     tick_frames: int,
     control_panel: QtStateControlPanel | None = None,
+    emulation_speed: int | None = None,
+    merge_sdl_into_control_panel: bool = True,
 ) -> None:
-    emulator_window = "qt" if control_panel is not None and window == "SDL2" else window
+    emulator_window = (
+        "qt"
+        if merge_sdl_into_control_panel and control_panel is not None and window == "SDL2"
+        else window
+    )
     env = PyBoyEnvironment(rom_path=rom, window=emulator_window)
+    if emulation_speed is not None:
+        env.set_emulation_speed(emulation_speed)
     reader = PokemonRedMemoryReader()
     capture = CaptureRecorder(env, capture_config)
     last_ram_update = 0.0
@@ -55,7 +64,8 @@ def run_rom(
             env.load_state(load_state)
             logging.info("loaded state=%s", load_state)
 
-        for index in range(steps):
+        iterations = count() if steps is None else range(steps)
+        for index in iterations:
             state = reader.read(env.memory)
             if index % 60 == 0:
                 logging.info("frame=%s state=%s", index, state.summary())

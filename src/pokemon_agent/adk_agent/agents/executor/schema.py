@@ -22,8 +22,6 @@ def compact_plan_decision(plan_decision: Any) -> dict[str, Any]:
     return {
         "agent": plan_decision.get("agent"),
         "phase": plan_decision.get("phase"),
-        "objective": plan_decision.get("objective"),
-        "current_goal": plan_decision.get("current_goal"),
         "action_plan": plan_decision.get("action_plan"),
         "memory_keys_read": plan_decision.get("memory_keys_read"),
         "reason": plan_decision.get("reason"),

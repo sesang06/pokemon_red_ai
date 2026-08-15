@@ -8,7 +8,7 @@ const state = {
   updated_at: null,
   emulator: { status: "waiting", frame_index: 0, tool_step_index: 0, fps: 60, ticker_alive: false },
   game: { map_id: null, map_name: "Unknown", position: null, facing: null, mode: "unknown", dialog_open: false, dialog_text: null, in_battle: false, party: [], items: [], badges: [], money: null, screenshot: null, overlay: null },
-  agent: { phase: "not_started", objective: null, task: null, action: null, result: null, pipeline: {}, current_step: 0, max_steps: null, planner_calls: 0, executor_actions: 0, interpreter_calls: 0, plan_error: null, interpret_error: null },
+  agent: { phase: "not_started", goal: { main: "Complete Pokemon Red", sub: "" }, action: null, result: null, pipeline: {}, current_step: 0, max_steps: null, planner_calls: 0, executor_actions: 0, interpreter_calls: 0, plan_error: null, interpret_error: null },
   navigation: { player: null, target: null, path: [], visible_cells: [], walk_area_collision: [], world_map: null },
   memory: { recent: [], last_activity: null },
   debug: { state_events: [], state_diff: null, action_outcome: null, ram: {}, screenshot_metadata: null },

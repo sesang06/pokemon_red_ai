@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 
 from pokemon_agent.adk_agent.agents.planner.agent import DEFAULT_ADK_MODEL
-from pokemon_agent.adk_agent.agents.planner.schema import DEFAULT_OBJECTIVE
 from pokemon_agent.adk_agent.runner import parse_args
 
 
@@ -11,7 +10,7 @@ def test_adk_runner_defaults_to_live_vision_loop() -> None:
     args = parse_args([])
 
     assert args.steps == 10_000
-    assert args.objective == DEFAULT_OBJECTIVE
+    assert args.main_goal is None
     assert args.window == "SDL2"
     assert args.control_ui is True
     assert args.realtime_ticks is True
@@ -19,7 +18,7 @@ def test_adk_runner_defaults_to_live_vision_loop() -> None:
     assert args.ui_refresh_hz == 30.0
     assert args.adk_model == os.environ.get("POKEMON_AGENT_ADK_MODEL", DEFAULT_ADK_MODEL)
     assert args.adk_vision is True
-    assert args.adk_thinking_budget == -1
+    assert args.adk_thinking_level == "medium"
     assert args.agent_trace is True
     assert args.dashboard is True
     assert args.dashboard_host == "127.0.0.1"
@@ -35,7 +34,10 @@ def test_adk_runner_optional_features_can_be_disabled() -> None:
             "--no-control-ui",
             "--no-realtime-ticks",
             "--no-adk-vision",
-            "--no-adk-thinking",
+            "--adk-thinking-level",
+            "low",
+            "--main-goal",
+            "Catch Mewtwo",
             "--no-agent-trace",
             "--no-dashboard",
             "--no-action-log",
@@ -46,7 +48,8 @@ def test_adk_runner_optional_features_can_be_disabled() -> None:
     assert args.realtime_ticks is False
     assert args.adk_model == os.environ.get("POKEMON_AGENT_ADK_MODEL", DEFAULT_ADK_MODEL)
     assert args.adk_vision is False
-    assert args.adk_thinking_budget is None
+    assert args.adk_thinking_level == "low"
+    assert args.main_goal == "Catch Mewtwo"
     assert args.agent_trace is False
     assert args.dashboard is False
     assert args.action_log_dir is None

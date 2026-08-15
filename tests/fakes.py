@@ -35,6 +35,7 @@ class FakePokemonEnvironment:
         self.saved_paths: list[Path] = []
         self.loaded_paths: list[Path] = []
         self.stopped = False
+        self.emulation_speed: int | None = None
         self.collision = [[1 for _ in range(20)] for _ in range(18)]
         self.area = [[x + y * 20 for x in range(20)] for y in range(18)]
 
@@ -52,6 +53,9 @@ class FakePokemonEnvironment:
     def tick(self, frames: int = 1, render: bool = False) -> bool:
         self.ticks.append((frames, render))
         return True
+
+    def set_emulation_speed(self, speed: int) -> None:
+        self.emulation_speed = int(speed)
 
     def screen_image(self) -> Image.Image:
         return Image.new("RGB", (160, 144), "red")

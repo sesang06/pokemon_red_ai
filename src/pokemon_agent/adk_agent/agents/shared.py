@@ -37,18 +37,8 @@ class ConsoleTokenStream:
 
 
 def event_text(event: Any) -> str:
-    return _event_part_text(event, include_thoughts=False)
-
-
-def event_thinking_summary(event: Any) -> str:
-    return _event_part_text(event, include_thoughts=True)
-
-
-def _event_part_text(event: Any, *, include_thoughts: bool) -> str:
     content = getattr(event, "content", None)
     if content is None:
-        if include_thoughts:
-            return ""
         output = getattr(event, "output", None)
         return "" if output is None else str(output)
 
@@ -56,7 +46,7 @@ def _event_part_text(event: Any, *, include_thoughts: bool) -> str:
     text_parts = [
         str(part.text)
         for part in parts
-        if getattr(part, "text", None) and bool(getattr(part, "thought", False)) is include_thoughts
+        if getattr(part, "text", None) and not bool(getattr(part, "thought", False))
     ]
     return "\n".join(text_parts)
 
@@ -77,19 +67,34 @@ def invalid_response_error(content: str, *, finish_reason: str | None) -> str:
 
 def parse_json_object(content: str) -> Any:
     cleaned = content.strip()
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, flags=re.DOTALL)
+    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.DOTALL)
     if fence_match:
         cleaned = fence_match.group(1)
-    elif not cleaned.startswith("{"):
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start >= 0 and end > start:
-            cleaned = cleaned[start : end + 1]
 
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
+        pass
+
+    # Gemini can occasionally preface its final JSON with prose that quotes an
+    # earlier action object. Decode every complete object and keep the one that
+    # reaches furthest into the response; this selects the final ActionPlan
+    # instead of merging unrelated braces into invalid JSON.
+    decoder = json.JSONDecoder()
+    candidates: list[tuple[int, int, Any]] = []
+    for start, character in enumerate(cleaned):
+        if character != "{":
+            continue
+        try:
+            value, end = decoder.raw_decode(cleaned, start)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            candidates.append((end, start, value))
+    if not candidates:
         return None
+    _, _, value = max(candidates, key=lambda candidate: (candidate[0], -candidate[1]))
+    return value
 
 
 def public_output_fields(

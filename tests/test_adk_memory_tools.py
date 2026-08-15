@@ -62,3 +62,33 @@ def test_search_memory_deduplicates_batch_and_requests_final_response(tmp_path: 
     assert result["found_count"] == 1
     assert result["results"][0]["item"]["value"] == "starter table is north"
     assert "emit the required final JSON response" in result["next_step"]
+
+
+def test_save_memory_supports_mixed_append_and_replace_operations(tmp_path: Path) -> None:
+    store = FileLongTermMemory(tmp_path / "memory.json")
+    store.remember("map", "Oak's Lab", "Oak stands near [5,2].", source="test")
+    store.remember("npc", "Professor Oak", "outdated description", source="test")
+    save_memory = build_save_memory_tool(store)
+
+    result = save_memory(
+        entries=[
+            {
+                "memory_type": "map",
+                "name": "Oak's Lab",
+                "value": "Exit is at [5,11].",
+                "operation": "append",
+            },
+            {
+                "memory_type": "npc",
+                "name": "Professor Oak",
+                "value": "Runs the Pokemon Lab in Pallet Town.",
+                "operation": "replace",
+            },
+        ]
+    )
+
+    assert [entry["operation"] for entry in result["results"]] == ["append", "replace"]
+    assert store.get("map", "Oak's Lab")["value"] == (
+        "Oak stands near [5,2].\nExit is at [5,11]."
+    )
+    assert store.get("npc", "Professor Oak")["value"] == "Runs the Pokemon Lab in Pallet Town."

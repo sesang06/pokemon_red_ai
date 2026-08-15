@@ -157,10 +157,10 @@ pytest
 `http://127.0.0.1:8765` by default. The page displays the actual PyBoy frame,
 RAM-derived game state, current goal/action/result, visible world cells and
 path, party, inventory, agent pipeline, recent memory, and a bounded structured
-event log. Gemini's official thinking summaries are streamed into the
-`THINKING SUMMARY` inspector and recorded once per completed model call in the
-event log. A summary can remain empty when Gemini does not return one. The page
-is an observer only; closing or reloading it does not pause PyBoy or the agent.
+event log. Planner and interpreter use Gemini's medium thinking level, but
+private thought parts are not returned or streamed. Their explicit public
+`thought_summary` JSON fields remain available in completed agent events. The
+page is an observer only; closing or reloading it does not pause PyBoy or the agent.
 
 ```powershell
 .\.venv\Scripts\pokemon-adk.exe
@@ -321,10 +321,12 @@ $env:POKEMON_AGENT_ADK_MODEL="gemini-3.5-flash"
 ```
 
 The default ADK runner sends the latest screenshot and collision overlay to the
-planner. The model returns direct `buttons` or world-coordinate `move` JSON with
-an explicit one-shot input sequence. Invalid or unavailable LLM responses stop
-the loop with `planning_failed` without sending game input. Use
-`--no-adk-vision` to disable image input.
+planner as transient per-request context. They reach the model but are not saved
+as inline image payloads in the Planner conversation history. The model returns
+direct `buttons` or world-coordinate `move` JSON with an explicit one-shot input
+sequence. Invalid or unavailable LLM responses stop the loop with
+`planning_failed` without sending game input. Use `--no-adk-vision` to disable
+image input.
 
 Each ADK execution action is also written as JSONL grouped by local date:
 `logs\actions\YYYYMMDD\actions.jsonl`. Use `--action-log-dir <path>` to change
@@ -337,7 +339,7 @@ calls occur once per executed action.
 Interpreter calls occur only at failures, Goal completion,
 or durable events; a 20-entry history limit does not
 trigger LLM calls. The complete DB trace remains available to ADK Dev UI.
-Structured `current_goal`, `active_action_plan`, `action_outcome`, `state_diff`, and
+Structured `goal.main/sub`, `active_action_plan`, `action_outcome`, `state_diff`, and
 `action_history` are updated atomically in `data\adk_runtime_state.json` for Dev UI status tools.
 
 For live UI refresh, realtime ticking, LLM planning, and vision together:
@@ -354,10 +356,8 @@ Run the ADK Web UI with the traceable Pokemon runtime team:
 
 This starts Dev UI with the same `data\adk_sessions.db` used by
 `pokemon-adk.exe`. Open `http://localhost:8000`, select the `adk_agent` app and
-user `user`. The CLI sessions are
-`pokemon-red-planner` and
-`pokemon-red-result-interpreter`; refresh the session list/event view while the
-CLI runs to load newly persisted model events.
+user `user`. The CLI team trace is stored in the `pokemon-red-autoplay` session;
+refresh the session list/event view while the CLI runs to load new events.
 
 The root agent also exposes `agent_runtime_status` and `recent_agent_actions`. In Dev UI, try:
 
@@ -369,8 +369,9 @@ To run autoplay from Dev UI, ask `Play Pokemon for 100 steps.` The web coordinat
 `pokemon_red_team`, which starts an SDL2/Qt MCP worker and runs the vision-enabled planner, deterministic executor,
 result interpreter, checkpoints, action logs, and dashboard at `http://127.0.0.1:8765/`. The current Dev UI Trace shows
 `pokemon_red_web_coordinator -> pokemon_red_team -> planning -> execution -> result interpretation`, including nested
-model and tool spans. The dedicated `pokemon-red-planner` and `pokemon-red-result-interpreter` sessions also retain the
-model conversation events.
+model requests, responses, public decision summaries, token metadata, and memory-tool spans. Both CLI and Web autoplay use
+the same native Planner and Result Interpreter children inside their outer team trace; neither starts a nested ADK
+Runner or a separate sub-agent session.
 
 ADK Web records the coordinator transfer and each runtime phase in the current
 event history. The planner's latest game screenshot and collision overlay are
@@ -382,9 +383,10 @@ model context.
 - The Google ADK planner produces one bounded `buttons` action or one persistent current-map `move` ActionPlan.
 - Python validates each action once and owns collision checks, screen-by-screen Dijkstra replanning, and interruption handling.
 - RAM-derived GameState deterministically verifies action results and Goal success.
-- The Planner reads relevant map, NPC, Pokemon, and event memories with one batched
-  `search_memory(queries=[...])` call.
-- The result interpreter uses at most one atomic `save_memory(entries=[...])` call, which reads and preserves existing values while applying all updates; persisted keys are generated internally as
+- The Planner optionally reads map, NPC, Pokemon, and event memories with at most one batched
+  `search_memory(queries=[...])` call when the next action needs a missing historical fact.
+- The result interpreter uses at most one atomic `save_memory(entries=[...])` call. Each entry selects `append` to
+  preserve and extend the value or `replace` to overwrite it; persisted keys are generated internally as
   `map:<name>`, `npc:<name>`, `pokemon:<name>`, or `event:<name>`.
 - Navigation is deterministic Dijkstra over the latest visible walkability grid and automatically replans toward remote current-map coordinates.
 - Battle and dialog are isolated because they use different observations and

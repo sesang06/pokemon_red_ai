@@ -88,6 +88,9 @@ class DashboardRuntimeStateStore:
         if self.memory_store is not None and phase in {"interpreted", "completed"}:
             self.hub.publish_memory_snapshot(self.memory_store.items())
 
+    def read(self) -> dict[str, Any]:
+        return self.file_store.read()
+
 
 class DashboardService:
     def __init__(

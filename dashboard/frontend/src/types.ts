@@ -63,15 +63,7 @@ export type LiveState = {
   };
   agent: {
     phase: string;
-    objective: string | null;
-    task: {
-      id: string | null;
-      description: string | null;
-      status: string;
-      step: number;
-      max_steps: number | null;
-      verification?: unknown;
-    } | null;
+    goal: { main: string; sub: string };
     action: Record<string, unknown> | null;
     result: Record<string, unknown> | null;
     pipeline: Record<string, PipelineStatus>;

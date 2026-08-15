@@ -11,6 +11,7 @@ from typing import Any
 
 DEFAULT_LONG_TERM_MEMORY_PATH = Path(__file__).resolve().parents[3] / "data" / "long_term_memory.json"
 MEMORY_TYPES = ("map", "npc", "pokemon", "event")
+MEMORY_WRITE_OPERATIONS = ("append", "replace")
 
 
 class FileLongTermMemory:
@@ -67,11 +68,10 @@ class FileLongTermMemory:
         entries: list[dict[str, Any]],
         *,
         source: str = "result_interpreter",
-        merge_existing: bool = False,
     ) -> list[str]:
         """Validate and persist multiple memories with one atomic file replacement."""
 
-        validated: list[tuple[str, Any]] = []
+        validated: list[tuple[str, Any, str]] = []
         for entry in entries:
             if not isinstance(entry, dict):
                 raise ValueError("each memory entry must be an object")
@@ -79,7 +79,12 @@ class FileLongTermMemory:
             value = entry.get("value")
             if value is None or (isinstance(value, str) and not value.strip()):
                 raise ValueError("memory value must not be empty")
-            validated.append((key, value))
+            operation = str(entry.get("operation", "replace")).strip().lower()
+            if operation not in MEMORY_WRITE_OPERATIONS:
+                raise ValueError(
+                    f"memory operation must be one of: {', '.join(MEMORY_WRITE_OPERATIONS)}"
+                )
+            validated.append((key, value, operation))
         if not validated:
             raise ValueError("at least one memory entry is required")
 
@@ -87,8 +92,8 @@ class FileLongTermMemory:
         items = store.setdefault("items", {})
         now = _now_iso()
         keys: list[str] = []
-        for key, value in validated:
-            if merge_existing:
+        for key, value, operation in validated:
+            if operation == "append":
                 existing = items.get(key)
                 existing_value = existing.get("value") if isinstance(existing, dict) else None
                 value = _merge_memory_values(existing_value, value)

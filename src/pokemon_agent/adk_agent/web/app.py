@@ -10,7 +10,11 @@ from google.adk.apps.app import App
 from google.genai import types
 
 from pokemon_agent.adk_agent.agents.interpreter.agent import GoogleAdkResultInterpreter
-from pokemon_agent.adk_agent.agents.planner.agent import DEFAULT_ADK_MODEL, GoogleAdkPlanner
+from pokemon_agent.adk_agent.agents.planner.agent import (
+    DEFAULT_ADK_MODEL,
+    DEFAULT_ADK_THINKING_LEVEL,
+    GoogleAdkPlanner,
+)
 from pokemon_agent.adk_agent.agents.shared import MAX_AUTOMATIC_FUNCTION_CALLS
 from pokemon_agent.adk_agent.client import StdioPokemonMcpClient
 from pokemon_agent.adk_agent.coordinator.loop import PokemonAdkLoop
@@ -84,7 +88,10 @@ def build_root_agent(model: str | None = None) -> Agent:
     generate_content_config = types.GenerateContentConfig(
         temperature=0.2,
         maxOutputTokens=900,
-        thinking_config=types.ThinkingConfig(include_thoughts=True),
+        thinking_config=types.ThinkingConfig(
+            thinking_level=types.ThinkingLevel.MEDIUM,
+            include_thoughts=False,
+        ),
         automatic_function_calling=types.AutomaticFunctionCallingConfig(
             maximum_remote_calls=MAX_AUTOMATIC_FUNCTION_CALLS,
         ),
@@ -120,14 +127,12 @@ def build_autoplay_team(model: str | None = None) -> PokemonRedTeamAgent:
     planner = GoogleAdkPlanner.from_env(
         model=selected_model,
         include_screenshot=True,
-        thinking_budget=-1,
-        session_db_path=DEFAULT_ADK_SESSION_DB_PATH,
+        thinking_level=DEFAULT_ADK_THINKING_LEVEL,
         memory_store=memory_store,
     )
     interpreter = GoogleAdkResultInterpreter.from_env(
         model=selected_model,
-        thinking_budget=-1,
-        session_db_path=DEFAULT_ADK_SESSION_DB_PATH,
+        thinking_level=DEFAULT_ADK_THINKING_LEVEL,
         memory_store=memory_store,
     )
     memory_activity_sink = lambda event: dashboard_hub.publish_memory_activity(
@@ -140,8 +145,6 @@ def build_autoplay_team(model: str | None = None) -> PokemonRedTeamAgent:
         metadata={
             "session_db": str(DEFAULT_ADK_SESSION_DB_PATH.resolve()),
             "autoplay_session_id": "current-dev-ui-invocation",
-            "planner_session_id": "pokemon-red-planner",
-            "result_interpreter_session_id": "pokemon-red-result-interpreter",
         }
     )
     loop = PokemonAdkLoop(
@@ -175,10 +178,8 @@ def build_autoplay_team(model: str | None = None) -> PokemonRedTeamAgent:
 
 def _compact_dashboard_runtime_state(state: dict[str, Any]) -> dict[str, Any]:
     fields = (
-        "objective",
-        "current_goal",
+        "goal",
         "active_action_plan",
-        "planned_action",
         "action_outcome",
         "state_diff",
         "step_count",
