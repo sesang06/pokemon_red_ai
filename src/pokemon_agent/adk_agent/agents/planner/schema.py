@@ -6,6 +6,7 @@ from pokemon_agent.input_contract import (
     BUTTON_TOKENS,
     MAX_BUTTONS_PER_ACTION,
     MAX_MOVE_PATH_STEPS,
+    MAX_WORLD_NAVIGATION_SEGMENTS,
 )
 from pokemon_agent.tools.pathfinding import GridPoint, reachable_distances
 from pokemon_agent.tools.screen_navigation import (
@@ -193,9 +194,10 @@ def compact_state_for_prompt(state: dict[str, Any]) -> dict[str, Any]:
             "Return one direct ActionPlan JSON containing exactly one action. It is executed once, then Python "
             "observes the new RAM/GameState and asks the Planner for the next action. Express repeated button input "
             "directly in the ordered buttons array. "
-            "The only action types are buttons and move. For move, copy [x,y] from a navigation.reachable_targets "
-            "entry and use its third value as the Dijkstra path length; one call can traverse up to "
-            f"{MAX_MOVE_PATH_STEPS} steps. Never create a Task or mark a goal complete; "
+            "The only action types are buttons and move. A move may target any verified current-map world coordinate "
+            "from 0..255, including an off-screen destination. Python traverses local Dijkstra segments of up to "
+            f"{MAX_MOVE_PATH_STEPS} steps and automatically re-observes and replans up to "
+            f"{MAX_WORLD_NAVIGATION_SEGMENTS} segments. Never create a Task or mark a goal complete; "
             "RAM/structured GameState verification is authoritative."
         ),
     }
@@ -462,11 +464,14 @@ def _world_map_for_prompt(world_map: Any) -> dict[str, Any] | None:
 
 
 def _navigation_for_prompt(observation: dict[str, Any]) -> dict[str, Any]:
-    """Expose exact world-coordinate targets accepted by one bounded move action."""
+    """Expose local candidates plus the persistent current-map movement contract."""
 
     navigation: dict[str, Any] = {
         "coordinate_system": "current_map_world",
-        "max_path_steps_per_move": MAX_MOVE_PATH_STEPS,
+        "remote_targets_allowed": True,
+        "automatic_segment_replanning": True,
+        "max_path_steps_per_segment": MAX_MOVE_PATH_STEPS,
+        "max_segments_per_move": MAX_WORLD_NAVIGATION_SEGMENTS,
         "reachable_target_format": "[x,y,dijkstra_steps]",
     }
     walk_grid = walk_area_collision_for_observation(observation)

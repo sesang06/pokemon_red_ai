@@ -373,14 +373,14 @@ image payload.
 
 ## Design Notes
 
-- The Google ADK planner produces one bounded `buttons` or `move` ActionPlan.
-- Python validates each action once and owns collision checks and pathfinding.
+- The Google ADK planner produces one bounded `buttons` action or one persistent current-map `move` ActionPlan.
+- Python validates each action once and owns collision checks, screen-by-screen Dijkstra replanning, and interruption handling.
 - RAM-derived GameState deterministically verifies action results and Goal success.
 - The Planner reads relevant map, NPC, Pokemon, and event memories through
   `search_memory(memory_type, name)`.
 - The result interpreter uses `search_memory` and `save_memory`; persisted keys are generated internally as
   `map:<name>`, `npc:<name>`, `pokemon:<name>`, or `event:<name>`.
-- Navigation is deterministic A* over a walkability grid.
+- Navigation is deterministic Dijkstra over the latest visible walkability grid and automatically replans toward remote current-map coordinates.
 - Battle and dialog are isolated because they use different observations and
   menu timing than overworld movement.
 - RAM reads are the source of truth for state such as map id and coordinates.

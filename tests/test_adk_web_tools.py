@@ -6,7 +6,12 @@ from pokemon_agent import mcp_server
 from pokemon_agent.adk_agent.agents.planner.prompt import PLANNING_AGENT_PROMPT
 from pokemon_agent.adk_agent.agents.interpreter.prompt import RESULT_INTERPRETER_PROMPT
 from pokemon_agent.adk_agent.agents.shared import MAX_AUTOMATIC_FUNCTION_CALLS
-from pokemon_agent.input_contract import BUTTON_TOKENS, MAX_BUTTONS_PER_ACTION, MAX_MOVE_PATH_STEPS
+from pokemon_agent.input_contract import (
+    BUTTON_TOKENS,
+    MAX_BUTTONS_PER_ACTION,
+    MAX_MOVE_PATH_STEPS,
+    MAX_WORLD_NAVIGATION_SEGMENTS,
+)
 from pokemon_agent.adk_agent.runtime.state import FileAgentRuntimeState
 from pokemon_agent.adk_agent.web import tools as web_tools
 from pokemon_agent.adk_agent.web.app import app, build_app, build_root_agent
@@ -296,17 +301,20 @@ def test_planner_and_interpreter_prompts_share_complete_input_and_navigation_con
         assert "current-map world coordinate" in prompt
 
     assert "navigation.reachable_targets" in PLANNING_AGENT_PROMPT
-    assert "do not default to an adjacent one-cell target" in PLANNING_AGENT_PROMPT
+    assert "persistent current-map destination" in PLANNING_AGENT_PROMPT
+    assert "even when it is off-screen" in PLANNING_AGENT_PROMPT
+    assert str(MAX_WORLD_NAVIGATION_SEGMENTS) in PLANNING_AGENT_PROMPT
     assert "ordered by path length from short to long" in PLANNING_AGENT_PROMPT
-    assert "prefer a purposeful target 6.." in PLANNING_AGENT_PROMPT
+    assert "use the farthest verified coordinate" in PLANNING_AGENT_PROMPT
     assert "leaving the room" in PLANNING_AGENT_PROMPT
-    assert "until `state.map_name` changes" in PLANNING_AGENT_PROMPT
-    assert "instead of oscillating back" in PLANNING_AGENT_PROMPT
+    assert "Do not target a screen boundary" in PLANNING_AGENT_PROMPT
+    assert "A map transition ends the move" in PLANNING_AGENT_PROMPT
     assert "Never output prose labels" in PLANNING_AGENT_PROMPT
     assert "Do not use Markdown fences" in PLANNING_AGENT_PROMPT
     assert "one detailed paragraph each" in PLANNING_AGENT_PROMPT
     assert "one detailed paragraph each" in RESULT_INTERPRETER_PROMPT
     assert not any("\uac00" <= char <= "\ud7a3" for char in PLANNING_AGENT_PROMPT)
     assert not any("\uac00" <= char <= "\ud7a3" for char in RESULT_INTERPRETER_PROMPT)
-    assert "max_steps_reached" in RESULT_INTERPRETER_PROMPT
+    assert "navigation_limit_reached" in RESULT_INTERPRETER_PROMPT
+    assert "interrupted_map_change" in RESULT_INTERPRETER_PROMPT
     assert "Do not emit an action object" in RESULT_INTERPRETER_PROMPT

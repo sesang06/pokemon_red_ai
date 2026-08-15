@@ -209,7 +209,7 @@ def test_interpreter_context_includes_compact_dialog_and_party_memory_evidence()
     ]
 
 
-def test_interpreter_context_keeps_compact_bounded_movement_result() -> None:
+def test_interpreter_context_keeps_compact_remote_movement_result() -> None:
     payload = compact_interpreter_context(
         {
             "step_count": 4,
@@ -223,13 +223,16 @@ def test_interpreter_context_keeps_compact_bounded_movement_result() -> None:
                 "reason": "single_action_complete",
             },
             "execution_report": {
-                "stop_reason": "max_steps_reached",
+                "stop_reason": "target_reached",
                 "result": {
                     "requested_world_cell": {"x": 20, "y": 5},
-                    "resolved_world_cell": {"x": 13, "y": 5},
+                    "resolved_world_cell": {"x": 20, "y": 5},
                     "target_out_of_visible_area": True,
-                    "steps_taken": 8,
-                    "stop_reason": "max_steps_reached",
+                    "requested_target_reached": True,
+                    "resolved_target_reached": True,
+                    "steps_taken": 15,
+                    "navigation_replans": 2,
+                    "stop_reason": "target_reached",
                 },
             },
         }
@@ -238,10 +241,13 @@ def test_interpreter_context_keeps_compact_bounded_movement_result() -> None:
     assert payload["last_result"]["movement"] == {
         "requested_target": [20, 5],
         "requested_world_cell": {"x": 20, "y": 5},
-        "resolved_world_cell": {"x": 13, "y": 5},
+        "resolved_world_cell": {"x": 20, "y": 5},
         "target_out_of_visible_area": True,
-        "steps_taken": 8,
-        "stop_reason": "max_steps_reached",
+        "requested_target_reached": True,
+        "resolved_target_reached": True,
+        "steps_taken": 15,
+        "navigation_replans": 2,
+        "stop_reason": "target_reached",
     }
 
 

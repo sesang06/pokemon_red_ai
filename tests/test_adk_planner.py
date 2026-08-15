@@ -33,7 +33,11 @@ from pokemon_agent.adk_agent.runtime.session import (
     ContextFilteringSqliteSessionService,
     build_events_compaction_config,
 )
-from pokemon_agent.input_contract import MAX_BUTTONS_PER_ACTION, MAX_MOVE_PATH_STEPS
+from pokemon_agent.input_contract import (
+    MAX_BUTTONS_PER_ACTION,
+    MAX_MOVE_PATH_STEPS,
+    MAX_WORLD_NAVIGATION_SEGMENTS,
+)
 
 
 class FakePart:
@@ -683,7 +687,10 @@ def test_planner_payload_uses_memory_tools_and_limits_navigation_context() -> No
         "min_y": 1,
         "max_y": 9,
     }
-    assert navigation["navigation"]["max_path_steps_per_move"] == MAX_MOVE_PATH_STEPS
+    assert navigation["navigation"]["remote_targets_allowed"] is True
+    assert navigation["navigation"]["automatic_segment_replanning"] is True
+    assert navigation["navigation"]["max_path_steps_per_segment"] == MAX_MOVE_PATH_STEPS
+    assert navigation["navigation"]["max_segments_per_move"] == MAX_WORLD_NAVIGATION_SEGMENTS
     assert [12, 9, 8] in navigation["navigation"]["reachable_targets"]
     assert [13, 9, 9] not in navigation["navigation"]["reachable_targets"]
     assert all(

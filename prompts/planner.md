@@ -3,8 +3,10 @@
 The runtime source of truth is
 `src/pokemon_agent/adk_agent/agents/planner/prompt.py`.
 
-The planner emits one bounded `buttons` or current-map world-coordinate `move`
-action. Each action is executed exactly once and cannot mark a Goal complete.
+The planner emits one bounded `buttons` action or a persistent current-map
+world-coordinate `move` action. Each action is executed exactly once and cannot
+mark a Goal complete. A move may name a verified off-screen coordinate; Python
+re-observes and replans local Dijkstra segments until arrival or interruption.
 
 ```json
 {

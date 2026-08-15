@@ -240,7 +240,7 @@ def test_button_array_waits_hold_and_after_frames_between_inputs(tmp_path: Path)
     )
 
 
-def test_move_to_world_cell_clamps_out_of_view_target_to_nearest_visible_cell(tmp_path: Path) -> None:
+def test_move_to_world_cell_replans_until_out_of_view_target_is_reached(tmp_path: Path) -> None:
     fake_env = FakePokemonEnvironment()
     session = PokemonSession(
         paths=fake_session_paths(tmp_path),
@@ -252,9 +252,76 @@ def test_move_to_world_cell_clamps_out_of_view_target_to_nearest_visible_cell(tm
 
     assert result["requested_world_cell"] == {"x": 0, "y": 6}
     assert result["target_out_of_visible_area"] is True
-    assert result["resolved_world_cell"] == {"x": 1, "y": 6}
-    assert [action["button"] for action in result["executed_actions"]] == ["left", "left", "left", "left"]
+    assert result["resolved_world_cell"] == {"x": 0, "y": 6}
+    assert [action["button"] for action in result["executed_actions"]] == [
+        "left",
+        "left",
+        "left",
+        "left",
+        "left",
+    ]
+    assert result["requested_target_reached"] is True
+    assert result["navigation_replans"] == 1
     assert result["stop_reason"] == "target_reached"
+
+
+def test_remote_world_move_refreshes_collision_and_replans_across_multiple_screens(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(session_module, "INPUT_AFTER_FRAMES", 0)
+
+    class TrackingEnvironment(FakePokemonEnvironment):
+        def __init__(self) -> None:
+            super().__init__()
+            self.collision_reads = 0
+
+        def game_area_collision(self):
+            self.collision_reads += 1
+            return super().game_area_collision()
+
+    fake_env = TrackingEnvironment()
+    session = PokemonSession(
+        paths=fake_session_paths(tmp_path),
+        env_factory=lambda rom, window: fake_env,
+    )
+
+    session.start(load_fixed=False)
+    result = session.move_to_world_cell(20, 6)
+
+    assert result["requested_target_reached"] is True
+    assert result["resolved_world_cell"] == {"x": 20, "y": 6}
+    assert result["navigation_replans"] == 2
+    assert len(result["navigation_segments"]) == 3
+    assert [action["button"] for action in result["executed_actions"]] == ["right"] * 15
+    assert result["planned_path"][0] == {"x": 5, "y": 6}
+    assert result["planned_path"][-1] == {"x": 20, "y": 6}
+    assert fake_env.collision_reads >= 3
+    assert result["stop_reason"] == "target_reached"
+
+
+def test_remote_world_move_stops_when_the_map_changes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(session_module, "INPUT_AFTER_FRAMES", 0)
+
+    class WarpEnvironment(FakePokemonEnvironment):
+        def button(self, button: str, frames: int = 1) -> None:
+            super().button(button, frames)
+            if button == "right" and self.memory[0xD362] >= 7:
+                self.memory[0xD35E] = 1
+
+    fake_env = WarpEnvironment()
+    session = PokemonSession(
+        paths=fake_session_paths(tmp_path),
+        env_factory=lambda rom, window: fake_env,
+    )
+
+    session.start(load_fixed=False)
+    result = session.move_to_world_cell(20, 6)
+
+    assert result["requested_target_reached"] is False
+    assert [action["button"] for action in result["executed_actions"]] == ["right", "right"]
+    assert result["after_observation"]["state"]["map_id"] == 1
+    assert result["stop_reason"] == "interrupted_map_change"
 
 
 def test_out_of_view_target_does_not_report_current_cell_as_reached(tmp_path: Path) -> None:

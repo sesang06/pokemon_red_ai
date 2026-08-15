@@ -291,7 +291,10 @@ def _movement_result_for_interpreter(
         "requested_world_cell": execution_result.get("requested_world_cell"),
         "resolved_world_cell": execution_result.get("resolved_world_cell"),
         "target_out_of_visible_area": execution_result.get("target_out_of_visible_area"),
+        "requested_target_reached": execution_result.get("requested_target_reached"),
+        "resolved_target_reached": execution_result.get("resolved_target_reached"),
         "steps_taken": execution_result.get("steps_taken"),
+        "navigation_replans": execution_result.get("navigation_replans"),
         "stop_reason": execution_report.get("stop_reason") or execution_result.get("stop_reason"),
     }
     return {key: value for key, value in values.items() if value is not None}

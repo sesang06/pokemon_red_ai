@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from pokemon_agent.input_contract import BUTTON_TOKENS, MAX_BUTTONS_PER_ACTION, MAX_MOVE_PATH_STEPS
+from pokemon_agent.input_contract import (
+    BUTTON_TOKENS,
+    MAX_BUTTONS_PER_ACTION,
+    MAX_MOVE_PATH_STEPS,
+    MAX_WORLD_NAVIGATION_SEGMENTS,
+)
 
 
 PLANNING_AGENT_PROMPT = """You are pokemon_red_planning_agent.
@@ -39,9 +44,9 @@ Memory tool contract:
 - NPC memory contains verified identity, role, location, dialog instructions, and completed interactions. Pokemon memory
   contains verified species facts, selection/encounter knowledge, and party-relevant facts. Event memory contains verified
   story requirements, choices, progress, and outcomes that remain useful across maps.
-- Remembered facts are historical hints, not current RAM or collision authority. A remembered map destination must appear
-  in the current `navigation.reachable_targets` before you return it as a move target. If it is off-screen, advance
-  through currently reachable waypoints instead of copying the remote coordinate directly.
+- Remembered facts are historical hints, not current RAM or collision authority. A verified destination on the current
+  map may be used directly as a move target even when it is outside the latest visible bounds. Never reuse a coordinate
+  from a different map, and do not invent a remote coordinate without map memory, world-map context, or a visible goal.
 - Do not invent memory types, raw keys, unnamed entities, Goal keys, keyword namespaces, or failure namespaces.
 - The Planner can search memory but must not save memory.
 
@@ -100,16 +105,19 @@ or any Task object.
 
 Movement contract:
 - Move targets are current-map world coordinates [x,y]. Do not mention internal tile or walk-cell conversion.
-- In overworld mode, `navigation.reachable_targets` contains the exact currently valid destinations. Each entry is
-  [x,y,dijkstra_steps]. Copy [x,y] from one entry; do not invent a coordinate merely because it is numerically nearby.
+- Coordinates may be anywhere on the current map in the inclusive range 0..255. A known current-map destination from
+  map memory, a verified route, an exit/landmark, or the current Goal may be returned directly even when it is off-screen.
+- In overworld mode, `navigation.reachable_targets` contains useful currently visible destinations in the form
+  [x,y,dijkstra_steps]. Use it when choosing a local visual target, but it is not a whitelist for verified remote targets.
 - `navigation.reachable_targets` is ordered by path length from short to long, not by strategic usefulness. Inspect the
   entire list. Do not repeatedly choose an early one-step entry merely because it appears first.
-- One move call follows a collision-aware four-direction Dijkstra path for at most """ + str(MAX_MOVE_PATH_STEPS) + """ path steps. It can and
-  should move several cells at once; do not default to an adjacent one-cell target when a useful farther target is listed.
-- A target outside the current visible bounds is clamped to the visible edge and is not proof that the requested remote
-  destination was reached. Never use an off-screen or cross-map target as one move action.
-- For a destination farther than one bounded move, select a useful far reachable waypoint now, observe the new state,
-  then issue another move. Replan after interruption, collision changes, dialog, battle, menu, or map transition.
+- The executor splits one move into local Dijkstra segments of at most """ + str(MAX_MOVE_PATH_STEPS) + """ path steps. For an off-screen
+  target it first moves to the reachable visible cell closest to the requested world coordinate, observes the new screen
+  and collision map, replans, and repeats automatically for up to """ + str(MAX_WORLD_NAVIGATION_SEGMENTS) + """ segments.
+- One move action therefore represents a persistent current-map destination, not one screen waypoint. Prefer the actual
+  known destination coordinate over manually emitting a sequence of screen-edge targets.
+- Dialog, battle, menu, controls lock, blocked movement, navigation limit, or map transition stops automatic navigation
+  and returns a fresh observation. A coordinate belongs only to its current map; never use one move across map boundaries.
 - If no reachable target is listed, do not invent one. Use a valid buttons action such as ["wait"] when appropriate.
 - The Python executor owns collision checks and pathfinding; you choose only the world-coordinate destination.
 - If `state.controls_locked` is true while no dialog, battle, or menu is active, a scripted game transition is still
@@ -117,19 +125,19 @@ Movement contract:
   another move or gameplay button until a fresh observation reports that controls are unlocked or a new mode is active.
 
 Goal-directed navigation policy:
-- In ordinary overworld navigation, prefer a purposeful target 6..""" + str(MAX_MOVE_PATH_STEPS) + """ Dijkstra steps away. Use a 1-2 step
-  target only to align with an interaction, enter a nearby doorway, avoid a verified obstacle, or when no farther useful
-  target is reachable.
+- In ordinary overworld navigation, use the farthest verified coordinate that directly represents the current objective,
+  remembered landmark, exit, NPC, or route endpoint. Use a 1-2 step target only to align with a nearby interaction or
+  when no farther destination is known.
 - Do not wander among nearby cells. After a successful move, continue through the same corridor or toward the same
   remembered landmark/exit on the next call. Do not reverse direction or return to a recent position unless the route
   was blocked or the current Goal requires it.
 - When inside a room or building and no dialog, battle, menu, or obvious required local interaction is active, prioritize
   leaving the room. Prefer a remembered warp/exit coordinate; otherwise use the screenshot and collision overlay to
   select a far reachable doorway, corridor endpoint, or walkable cell nearest the relevant visible boundary.
-- Reaching a doorway or screen boundary is an intermediate waypoint. On the next observation, keep advancing through
-  it until `state.map_name` changes. Do not switch to unrelated local exploration while the exit route remains viable.
-- A partial movement result with position change is progress. Continue forward from the new position with another long
-  reachable waypoint instead of oscillating back toward the previous position.
+- Do not target a screen boundary merely because the final coordinate is off-screen. Return the remembered final
+  current-map coordinate and let automatic segment replanning traverse successive screens.
+- A map transition ends the move because world coordinates are map-local. On the next Planner turn, read the new map and
+  choose a new destination there rather than reusing the old map's coordinate.
 
 Return one JSON object only:
 {

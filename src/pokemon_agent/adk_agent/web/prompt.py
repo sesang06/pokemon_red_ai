@@ -4,7 +4,8 @@ from __future__ import annotations
 WEB_AGENT_PROMPT = """You are the Pokemon Red ADK Web coordinator.
 Use tools to inspect or control the game and to inspect a separately running CLI session.
 The automated architecture separates responsibilities:
-- the LLM planner returns one bounded buttons or world-coordinate move action;
+- the LLM planner returns one buttons action or one persistent current-map world-coordinate move action;
+- a move automatically re-observes and replans local Dijkstra segments until it reaches the destination or is interrupted;
 - Python validates and executes that action exactly once before observing again;
 - RAM and structured GameState deterministically verify action outcomes and Goal success;
 - the Planner reads relevant map, NPC, Pokemon, and event memory with `search_memory`;

@@ -94,7 +94,7 @@ def buttons(buttons: list[str]) -> dict[str, Any]:
 
 
 def move(target: list[int]) -> dict[str, Any]:
-    """Execute a bounded {"type":"move","target":[x,y]} action using current map/world coordinates."""
+    """Move toward a current-map world coordinate, re-observing and replanning across screens."""
 
     _ensure_game_started()
     if not isinstance(target, list) or len(target) != 2:

@@ -19,6 +19,7 @@ from pokemon_agent.input_contract import (
     BUTTON_TOKENS,
     MAX_BUTTONS_PER_ACTION,
     MAX_MOVE_PATH_STEPS,
+    MAX_WORLD_NAVIGATION_SEGMENTS,
 )
 from pokemon_agent.memory.memory_reader import PokemonRedMemoryReader
 from pokemon_agent.memory.ram_map import format_ram_watch
@@ -732,53 +733,130 @@ class PokemonSession:
             current_position = _position_from_observation(current_observation)
             if current_position is None:
                 raise ValueError("current player position is unknown")
-
-            player_position = type(PLAYER_WALK_CELL)(current_position.x, current_position.y)
             requested_world_cell = type(PLAYER_WALK_CELL)(target_x, target_y)
-            requested_walk_cell = map_position_to_walk_cell(requested_world_cell, player_position)
-            target_walk_cell = requested_walk_cell
-            target_out_of_visible_area = not _walk_cell_in_visible_area(target_walk_cell)
-            if target_out_of_visible_area:
-                target_walk_cell = _clamp_walk_cell_to_visible_area(target_walk_cell)
+            initial_map_id = _map_id_from_observation(current_observation)
+            target_out_of_visible_area = False
+            executed_actions: list[dict[str, Any]] = []
+            planned_path: list[dict[str, int]] = []
+            navigation_segments: list[dict[str, Any]] = []
+            resolved_world_cell: GridPoint | None = None
+            stop_reason = "no_path"
 
-            result = self._move_to_walk_cell(target_walk_cell.x, target_walk_cell.y)
-            result["requested_world_cell"] = {"x": target_x, "y": target_y}
-            if target_out_of_visible_area:
-                result["target_out_of_visible_area"] = True
+            for segment_index in range(MAX_WORLD_NAVIGATION_SEGMENTS):
+                segment_before = self.observe(refresh_control_panel=False)
+                segment_position = _position_from_observation(segment_before)
+                if segment_position is None:
+                    stop_reason = "position_unknown"
+                    break
+                if _map_changed(initial_map_id, segment_before):
+                    stop_reason = "interrupted_map_change"
+                    break
+                if _same_position(segment_position, requested_world_cell):
+                    resolved_world_cell = requested_world_cell
+                    stop_reason = "target_reached"
+                    break
 
-            resolved_world = None
-            resolved_walk = result.get("resolved_target", {}).get("walk_cell")
-            if isinstance(resolved_walk, dict):
-                resolved_world = walk_cell_to_map_position(
-                    type(PLAYER_WALK_CELL)(int(resolved_walk["x"]), int(resolved_walk["y"])),
-                    player_position,
+                interruption = _interruption_reason(segment_before)
+                if interruption is not None:
+                    stop_reason = interruption
+                    break
+
+                player_position = GridPoint(segment_position.x, segment_position.y)
+                requested_walk_cell = map_position_to_walk_cell(requested_world_cell, player_position)
+                segment_target_is_remote = not _walk_cell_in_visible_area(requested_walk_cell)
+                target_out_of_visible_area = target_out_of_visible_area or segment_target_is_remote
+                target_walk_cell = (
+                    _clamp_walk_cell_to_visible_area(requested_walk_cell)
+                    if segment_target_is_remote
+                    else requested_walk_cell
                 )
-                result["resolved_world_cell"] = grid_point_dict(resolved_world)
-            after_position = _position_from_observation(result.get("after_observation", {}))
-            result["requested_target_reached"] = _same_position(after_position, requested_world_cell)
-            result["resolved_target_reached"] = (
-                resolved_world is not None and _same_position(after_position, resolved_world)
+
+                segment_result = self._move_to_walk_cell(target_walk_cell.x, target_walk_cell.y)
+                segment_after = segment_result.get("after_observation", {})
+                after_position = _position_from_observation(segment_after)
+                segment_resolved_world = _resolved_world_cell(segment_result, player_position)
+                if segment_resolved_world is not None:
+                    resolved_world_cell = segment_resolved_world
+                segment_world_path = _world_path_for_segment(segment_result, player_position)
+                _extend_unique_path(planned_path, segment_world_path)
+                segment_actions = [
+                    dict(action)
+                    for action in segment_result.get("executed_actions", [])
+                    if isinstance(action, dict)
+                ]
+                executed_actions.extend(segment_actions)
+                segment_stop_reason = str(segment_result.get("stop_reason") or "no_path")
+                made_progress = not _same_position(segment_position, after_position)
+                navigation_segments.append(
+                    {
+                        "index": segment_index,
+                        "from": grid_point_dict(GridPoint(segment_position.x, segment_position.y)),
+                        "toward": grid_point_dict(
+                            segment_resolved_world if segment_resolved_world is not None else player_position
+                        ),
+                        "to": None
+                        if after_position is None
+                        else {"x": int(after_position.x), "y": int(after_position.y)},
+                        "steps_taken": len(segment_actions),
+                        "stop_reason": segment_stop_reason,
+                    }
+                )
+
+                if _map_changed(initial_map_id, segment_after):
+                    stop_reason = "interrupted_map_change"
+                    break
+                if _same_position(after_position, requested_world_cell):
+                    resolved_world_cell = requested_world_cell
+                    stop_reason = "target_reached"
+                    break
+
+                if not segment_target_is_remote and segment_stop_reason == "target_reached":
+                    stop_reason = "target_reached"
+                    break
+
+                interruption = _interruption_reason(segment_after)
+                if interruption is not None:
+                    stop_reason = interruption
+                    break
+                if not made_progress:
+                    stop_reason = "no_path" if segment_stop_reason == "target_reached" else segment_stop_reason
+                    break
+                if segment_stop_reason not in {
+                    "target_reached",
+                    "planned_path_exhausted",
+                    "max_steps_reached",
+                }:
+                    stop_reason = segment_stop_reason
+                    break
+            else:
+                stop_reason = "navigation_limit_reached"
+
+            after_observation = self.observe(refresh_control_panel=False)
+            after_position = _position_from_observation(after_observation)
+            requested_target_reached = _same_position(after_position, requested_world_cell)
+            resolved_target_reached = (
+                resolved_world_cell is not None and _same_position(after_position, resolved_world_cell)
             )
-            if (
-                target_out_of_visible_area
-                and result.get("stop_reason") == "target_reached"
-                and not result.get("executed_actions")
-                and not result["requested_target_reached"]
-            ):
-                result["stop_reason"] = "no_path"
-            result["planned_path"] = [
-                grid_point_dict(
-                    walk_cell_to_map_position(
-                        type(PLAYER_WALK_CELL)(int(point["x"]), int(point["y"])),
-                        player_position,
-                    )
-                )
-                for point in result.get("planned_path", [])
-                if isinstance(point, dict) and point.get("x") is not None and point.get("y") is not None
-            ]
-            result.pop("requested_target", None)
-            result.pop("resolved_target", None)
-            result.pop("planned_screen_path", None)
+            if requested_target_reached:
+                stop_reason = "target_reached"
+
+            result = {
+                "requested_world_cell": {"x": target_x, "y": target_y},
+                "resolved_world_cell": None
+                if resolved_world_cell is None
+                else grid_point_dict(resolved_world_cell),
+                "target_out_of_visible_area": target_out_of_visible_area,
+                "requested_target_reached": requested_target_reached,
+                "resolved_target_reached": resolved_target_reached,
+                "planned_path": planned_path,
+                "executed_actions": executed_actions,
+                "steps_taken": len(executed_actions),
+                "navigation_segments": navigation_segments,
+                "navigation_replans": max(0, len(navigation_segments) - 1),
+                "stop_reason": stop_reason,
+                "before_observation": current_observation,
+                "after_observation": after_observation,
+            }
             return result
 
     def _move_to_walk_cell(self, target_x: int, target_y: int) -> dict[str, Any]:
@@ -819,6 +897,7 @@ class PokemonSession:
         planned_screen_path = [grid_point_dict(point) for point in map(_walk_cell_to_screen_dict_point, plan.path)]
         executed_actions: list[dict[str, Any]] = []
         stop_reason = plan.stop_reason
+        initial_map_id = _map_id_from_observation(before)
 
         world_goal = _world_goal_from_observation(before, plan.resolved_walk_cell)
         if stop_reason == "path_found":
@@ -827,6 +906,9 @@ class PokemonSession:
 
             for direction in directions[:MAX_MOVE_PATH_STEPS]:
                 current = self.observe(refresh_control_panel=False)
+                if _map_changed(initial_map_id, current):
+                    stop_reason = "interrupted_map_change"
+                    break
                 if world_goal is not None and _position_from_observation(current) == world_goal:
                     stop_reason = "target_reached"
                     break
@@ -866,6 +948,9 @@ class PokemonSession:
 
                 after_step = self.observe(refresh_control_panel=False)
                 after_step_position = _position_from_observation(after_step)
+                if _map_changed(initial_map_id, after_step):
+                    stop_reason = "interrupted_map_change"
+                    break
                 if world_goal is not None and after_step_position == world_goal:
                     stop_reason = "target_reached"
                     break
@@ -1472,6 +1557,44 @@ def _same_position(left: Any, right: Any) -> bool:
         and int(left.x) == int(right.x)
         and int(left.y) == int(right.y)
     )
+
+
+def _map_id_from_observation(observation: dict[str, Any]) -> int | None:
+    return _int_or_none(observation.get("state", {}).get("map_id"))
+
+
+def _map_changed(initial_map_id: int | None, observation: dict[str, Any]) -> bool:
+    current_map_id = _map_id_from_observation(observation)
+    return initial_map_id is not None and current_map_id is not None and current_map_id != initial_map_id
+
+
+def _resolved_world_cell(result: dict[str, Any], player_position: GridPoint) -> GridPoint | None:
+    resolved_walk = result.get("resolved_target", {}).get("walk_cell")
+    if not isinstance(resolved_walk, dict):
+        return None
+    return walk_cell_to_map_position(
+        GridPoint(int(resolved_walk["x"]), int(resolved_walk["y"])),
+        player_position,
+    )
+
+
+def _world_path_for_segment(result: dict[str, Any], player_position: GridPoint) -> list[dict[str, int]]:
+    return [
+        grid_point_dict(
+            walk_cell_to_map_position(
+                GridPoint(int(point["x"]), int(point["y"])),
+                player_position,
+            )
+        )
+        for point in result.get("planned_path", [])
+        if isinstance(point, dict) and point.get("x") is not None and point.get("y") is not None
+    ]
+
+
+def _extend_unique_path(path: list[dict[str, int]], segment: list[dict[str, int]]) -> None:
+    for point in segment:
+        if not path or path[-1] != point:
+            path.append(point)
 
 
 def _world_goal_from_observation(observation: dict[str, Any], target_walk_cell: Any) -> Position | None:

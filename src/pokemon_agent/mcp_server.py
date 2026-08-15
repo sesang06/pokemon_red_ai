@@ -148,7 +148,7 @@ def move_to_world_cell(
     target_x: int,
     target_y: int,
 ) -> dict[str, Any]:
-    """Move toward a current-map/world coordinate through the realtime ticker."""
+    """Move toward a current-map world coordinate with automatic screen-by-screen replanning."""
 
     return _run_logged_tool(
         "move_to_world_cell",
