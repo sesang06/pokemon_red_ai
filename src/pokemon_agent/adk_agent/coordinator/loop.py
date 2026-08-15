@@ -16,6 +16,7 @@ from pokemon_agent.adk_agent.coordinator.action_cycle import (
 from pokemon_agent.adk_agent.client import PokemonToolClient
 from pokemon_agent.adk_agent.agents.planner.schema import (
     ActionPlanner,
+    DEFAULT_MAX_STEPS,
     DEFAULT_OBJECTIVE,
     PokemonAgentState,
     classify_mode,
@@ -69,7 +70,7 @@ class PokemonAdkLoop:
         self,
         *,
         objective: str = DEFAULT_OBJECTIVE,
-        max_steps: int = 20,
+        max_steps: int = DEFAULT_MAX_STEPS,
         checkpoint_every: int = 10,
         initial_runtime_state: PokemonAgentState | None = None,
     ) -> PokemonAgentState:
@@ -170,7 +171,7 @@ class PokemonAdkLoop:
         else:
             stuck_score = max(0, stuck_score - 1)
 
-        max_steps_reached = state.get("step_count", 0) >= state.get("max_steps", 20)
+        max_steps_reached = state.get("step_count", 0) >= state.get("max_steps", DEFAULT_MAX_STEPS)
         done = goal_completed or max_steps_reached
         termination_reason = "goal_completed" if goal_completed else "max_steps_reached" if max_steps_reached else None
         transitions, history_summary = append_transition(
@@ -223,12 +224,19 @@ class PokemonAdkLoop:
         return self.result_interpreter_agent.interpret(state)
 
     def _checkpoint(self, state: PokemonAgentState) -> PokemonAgentState:
+        fixed_result = self.client.save_state(kind="fixed")
+        updates: PokemonAgentState = {
+            "fixed_state_path": fixed_result.get("path"),
+            "checkpoint_path": state.get("checkpoint_path"),
+        }
+
         every = state.get("checkpoint_every", 10)
         step_count = state.get("step_count", 0)
         if every <= 0 or step_count <= 0 or step_count % every != 0:
-            return {"checkpoint_path": state.get("checkpoint_path")}
+            return updates
         result = self.client.save_state(kind="last")
-        return {"checkpoint_path": result.get("path")}
+        updates["checkpoint_path"] = result.get("path")
+        return updates
 
 
 def position_tuple(observation: dict[str, Any]) -> tuple[int, int] | None:

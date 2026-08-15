@@ -16,6 +16,7 @@ from pokemon_agent.adk_agent.agents.planner.schema import (
     sanitize_planned_action,
 )
 from pokemon_agent.adk_agent.agents.shared import (
+    MAX_AUTOMATIC_FUNCTION_CALLS,
     event_finish_reason,
     event_text,
     event_thinking_summary,
@@ -115,6 +116,10 @@ def test_adk_planner_uses_sse_streaming_by_default() -> None:
     )
     assert planner.app.events_compaction_config.event_retention_size == 20
     assert planner.agent.generate_content_config.thinking_config.include_thoughts is True
+    assert (
+        planner.agent.generate_content_config.automatic_function_calling.maximum_remote_calls
+        == MAX_AUTOMATIC_FUNCTION_CALLS
+    )
     assert planner.agent.generate_content_config.response_mime_type is None
     planner_tool_names = {
         getattr(tool, "name", getattr(tool, "__name__", "")) for tool in planner.agent.tools
@@ -123,6 +128,10 @@ def test_adk_planner_uses_sse_streaming_by_default() -> None:
 
     interpreter = GoogleAdkResultInterpreter()
     assert interpreter.agent.generate_content_config.thinking_config.include_thoughts is True
+    assert (
+        interpreter.agent.generate_content_config.automatic_function_calling.maximum_remote_calls
+        == MAX_AUTOMATIC_FUNCTION_CALLS
+    )
     assert interpreter.agent.generate_content_config.response_mime_type is None
     interpreter_tool_names = {
         getattr(tool, "name", getattr(tool, "__name__", "")) for tool in interpreter.agent.tools
@@ -270,7 +279,7 @@ def test_turn_compaction_runs_at_five_turn_intervals_with_one_turn_overlap() -> 
         config.summarizer = summarizer
         app = App(
             name="test_app",
-            root_agent=Agent(name="test_agent", model="gemini-2.5-flash"),
+            root_agent=Agent(name="test_agent", model="gemini-3.5-flash"),
             events_compaction_config=config,
         )
         service = InMemorySessionService()
@@ -554,11 +563,47 @@ def test_planner_payload_uses_canonical_mode_dependent_game_state() -> None:
     assert "battle" not in dialog_payload["state"]
     assert "menu" not in dialog_payload["state"]
 
+    closed_dialog_payload = compact_state_for_prompt(
+        {
+            "mode": "overworld",
+            "observation": {"state": base_state},
+            "transition_history": [
+                {
+                    "before": {
+                        **base_state,
+                        "dialog_open": True,
+                        "dialog_text": "Which POKEMON do you want?",
+                    },
+                    "after": base_state,
+                }
+            ],
+        }
+    )
+    assert closed_dialog_payload["last_dialog"] == {
+        "text": "Which POKEMON do you want?",
+        "status": "recently_closed",
+    }
+
     battle_state = dict(base_state)
     battle_state.update(
         {
             "in_battle": True,
-            "battle": {"active": True, "kind": 1, "type": 2, "turns": 3},
+            "battle": {
+                "active": True,
+                "kind": 1,
+                "type": 2,
+                "turns": 3,
+                "opponent": {
+                    "species": "Rattata",
+                    "level": 4,
+                    "hp": 9,
+                    "max_hp": 15,
+                    "status": "OK",
+                    "types": ["Normal"],
+                    "moves": ["Tackle"],
+                    "move_pp": [34],
+                },
+            },
             "party": [{"species": "Bulbasaur", "level": 5, "hp": 19, "max_hp": 19}],
         }
     )
@@ -567,6 +612,14 @@ def test_planner_payload_uses_canonical_mode_dependent_game_state() -> None:
         "kind": 1,
         "type": 2,
         "turns": 3,
+        "opponent": {
+            "species": "Rattata",
+            "level": 4,
+            "hp": 9,
+            "max_hp": 15,
+            "status": "OK",
+            "types": ["Normal"],
+        },
         "party": [{"species": "Bulbasaur", "level": 5, "hp": 19, "max_hp": 19}],
     }
     assert "dialog" not in battle_payload["state"]

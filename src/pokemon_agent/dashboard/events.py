@@ -209,9 +209,35 @@ class LiveEventHub:
                 source=role,
             )
 
-    def publish_memory_snapshot(self, items: dict[str, dict[str, Any]]) -> None:
+    def publish_memory_snapshot(
+        self,
+        items: dict[str, dict[str, Any]],
+        *,
+        priority_keys: list[str] | None = None,
+    ) -> None:
         with self._lock:
-            self._state["memory"]["recent"] = memory_recent(items)
+            if priority_keys is None:
+                activity = self._state["memory"].get("last_activity") or {}
+                priority_keys = list(activity.get("keys") or [])
+            self._state["memory"]["recent"] = memory_recent(items, priority_keys=priority_keys)
+            self._state["updated_at"] = now_iso()
+            self._emit_state_if_due(force=True)
+
+    def publish_memory_activity(
+        self,
+        items: dict[str, dict[str, Any]],
+        activity: dict[str, Any],
+    ) -> None:
+        key = str(activity.get("key") or "").strip()
+        if not key:
+            return
+        with self._lock:
+            self._state["memory"]["last_activity"] = {
+                "type": str(activity.get("tool") or activity.get("phase") or "memory"),
+                "keys": [key],
+                "at": now_iso(),
+            }
+            self._state["memory"]["recent"] = memory_recent(items, priority_keys=[key])
             self._state["updated_at"] = now_iso()
             self._emit_state_if_due(force=True)
 

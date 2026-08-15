@@ -14,6 +14,24 @@ from pokemon_agent.session import BUTTON_HOLD_FRAMES, INPUT_AFTER_FRAMES, Pokemo
 from tests.fakes import FakePokemonEnvironment, fake_session_paths
 
 
+def test_start_with_control_ui_uses_windowless_qt_audio_backend(monkeypatch, tmp_path: Path) -> None:
+    fake_env = FakePokemonEnvironment()
+    requested_windows: list[str] = []
+    fake_panel = type("FakePanel", (), {"close": lambda self: None})()
+    session = PokemonSession(
+        paths=fake_session_paths(tmp_path),
+        env_factory=lambda rom, window: requested_windows.append(window) or fake_env,
+    )
+    monkeypatch.setattr(session, "_ensure_control_panel", lambda: setattr(session, "control_panel", fake_panel))
+    monkeypatch.setattr(session, "_refresh_control_panel", lambda *args, **kwargs: None)
+
+    session.start(window="SDL2", load_fixed=False, control_ui=True)
+
+    assert requested_windows == ["qt"]
+    assert session.window == "qt"
+    session.stop(save_final=False)
+
+
 def test_observe_returns_png_base64_and_screen_data(tmp_path: Path) -> None:
     fake_env = FakePokemonEnvironment()
     session = PokemonSession(
@@ -53,10 +71,40 @@ def test_observe_returns_png_base64_and_screen_data(tmp_path: Path) -> None:
     assert observation["state_events"][0]["type"] == "initial_observation"
     assert observation["state"]["events"] == observation["state_events"]
     assert observation["state"]["dialog"]["open"] is False
-    assert observation["state"]["battle"]["active"] is False
+    assert "battle" not in observation["state"]
     assert observation["state"]["map"]["name"] == "Pallet Town"
     assert observation["state"]["position_detail"]["tile"] == {"x": 5, "y": 6}
     assert observation["state"]["counts"]["party"] == 0
+
+
+def test_observe_only_sends_battle_opponent_during_battle(tmp_path: Path) -> None:
+    fake_env = FakePokemonEnvironment()
+    session = PokemonSession(paths=fake_session_paths(tmp_path), env_factory=lambda rom, window: fake_env)
+    session.start(load_fixed=False)
+
+    assert "battle" not in session.observe()["state"]
+
+    fake_env.memory[0xD057] = 1
+    fake_env.memory[0xCFE5] = 0xA5
+    fake_env.memory[0xCFE7] = 9
+    fake_env.memory[0xCFE9] = 0x08
+    fake_env.memory[0xCFEA] = 0x00
+    fake_env.memory[0xCFEB] = 0x00
+    fake_env.memory[0xCFF3] = 4
+    fake_env.memory[0xCFF5] = 15
+    _wait_for_next_frame(session)
+
+    battle = session.observe()["state"]["battle"]
+    assert battle["opponent"] == {
+        "species": "Rattata",
+        "level": 4,
+        "hp": 9,
+        "max_hp": 15,
+        "status": "Poison",
+        "types": ["Normal"],
+    }
+    assert "moves" not in battle["opponent"]
+    assert "move_pp" not in battle["opponent"]
 
 
 def test_observe_tracks_ram_derived_state_events(tmp_path: Path) -> None:
@@ -229,7 +277,42 @@ def test_out_of_view_target_does_not_report_current_cell_as_reached(tmp_path: Pa
 
     visible_result = session.move_to_world_cell(6, 6)
     assert visible_result["executed_actions"] == []
-    assert visible_result["stop_reason"] == "no_path"
+    assert visible_result["requested_target_reached"] is False
+    assert visible_result["resolved_target_reached"] is True
+    assert visible_result["stop_reason"] == "target_reached"
+
+
+def test_occupied_world_target_succeeds_at_nearest_reachable_cell_even_when_dialog_opens(
+    tmp_path: Path,
+) -> None:
+    fake_env = FakePokemonEnvironment()
+    fake_env.collision = [[0 for _ in range(20)] for _ in range(18)]
+    for walk_x, walk_y in ((4, 4), (4, 3)):
+        for tile_y in (walk_y * 2, walk_y * 2 + 1):
+            for tile_x in (walk_x * 2, walk_x * 2 + 1):
+                fake_env.collision[tile_y][tile_x] = 1
+    session = PokemonSession(
+        paths=fake_session_paths(tmp_path),
+        env_factory=lambda rom, window: fake_env,
+    )
+    session.start(load_fixed=False)
+    original_read = session.reader.read
+
+    def read_with_arrival_dialog(memory):
+        state = original_read(memory)
+        if state.position is not None and state.position.y == 5:
+            state.dialog_open = True
+            state.mode = GameMode.TALK
+        return state
+
+    session.reader.read = read_with_arrival_dialog  # type: ignore[method-assign]
+    result = session.move_to_world_cell(5, 4)
+
+    assert result["requested_world_cell"] == {"x": 5, "y": 4}
+    assert result["resolved_world_cell"] == {"x": 5, "y": 5}
+    assert result["requested_target_reached"] is False
+    assert result["resolved_target_reached"] is True
+    assert result["stop_reason"] == "target_reached"
 
 
 def test_navigation_learns_a_blocked_directional_edge_and_replans(

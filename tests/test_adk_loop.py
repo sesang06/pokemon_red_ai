@@ -29,6 +29,7 @@ class FakeClient:
         self.x = 5
         self.y = 6
         self.saved = 0
+        self.saved_kinds: list[str] = []
         self.loaded = 0
         self.world_move_calls: list[dict[str, int]] = []
 
@@ -43,7 +44,8 @@ class FakeClient:
 
     def save_state(self, kind: str = "snapshot", path: str | None = None):
         self.saved += 1
-        return {"path": "states/last.state"}
+        self.saved_kinds.append(kind)
+        return {"path": f"states/{'fixed_start' if kind == 'fixed' else kind}.state"}
 
     def load_state(self, kind: str = "fixed", path: str | None = None):
         self.loaded += 1
@@ -113,6 +115,20 @@ def test_adk_loop_uses_action_planner_when_available(tmp_path: Path) -> None:
     assert result["active_action_plan"]["action"]["reason"] == "observe_once"
     assert result["plan_decision"]["agent"] == "pokemon_red_planning_agent"
     assert result["execution_report"]["agent"] == "pokemon_red_execution_agent"
+
+
+def test_adk_loop_saves_fixed_state_after_every_completed_turn(tmp_path: Path) -> None:
+    client = FakeClient()
+
+    result = PokemonAdkLoop(
+        client,
+        action_planner=WaitPlanner(),
+        memory_store=FileLongTermMemory(tmp_path / "memory.json"),
+    ).run(max_steps=3, checkpoint_every=2)
+
+    assert client.saved_kinds == ["fixed", "fixed", "last", "fixed"]
+    assert result["fixed_state_path"] == "states/fixed_start.state"
+    assert result["checkpoint_path"] == "states/last.state"
 
 
 def test_adk_loop_exposes_empty_llm_decision_as_plan_error(tmp_path: Path) -> None:

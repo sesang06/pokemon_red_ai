@@ -6,6 +6,7 @@ from typing import Callable, Protocol
 from pokemon_agent.memory.memory_reader import (
     ITEM_NAMES,
     MOVE_NAMES,
+    PLAYER_FACING_DIRECTIONS,
     POKEMON_RED_MAP_NAMES,
     POKEMON_SPECIES_NAMES,
     POKEMON_TYPE_NAMES,
@@ -166,6 +167,11 @@ def _hex_byte(memory: MemoryView, address: int, _width: int) -> str:
     return f"0x{_read_u8(memory, address):02X}"
 
 
+def _facing_direction(memory: MemoryView, address: int, _width: int) -> str:
+    value = _read_u8(memory, address)
+    return f"0x{value:02X} ({PLAYER_FACING_DIRECTIONS.get(value, 'unknown')})"
+
+
 def _u16_be(memory: MemoryView, address: int, _width: int) -> str:
     return str(_read_u16_be(memory, address))
 
@@ -304,6 +310,7 @@ RAM_WATCH_SECTIONS: tuple[RamWatchSection, ...] = (
     RamWatchSection(
         "Player / Map",
         (
+            RamWatchField(0xC109, "Player facing direction", formatter=_facing_direction),
             RamWatchField(0xD35E, "Current Map Number", formatter=_map_id),
             RamWatchField(0xD361, "Current Player Y-Position"),
             RamWatchField(0xD362, "Current Player X-Position"),

@@ -17,6 +17,7 @@ PokemonMode = Literal["battle", "dialog", "menu", "overworld", "unknown"]
 ALLOWED_BUTTON_TOKENS = frozenset(BUTTON_TOKENS)
 PROMPT_TRANSITION_LIMIT = 2
 DEFAULT_OBJECTIVE = "complete_pokemon_red"
+DEFAULT_MAX_STEPS = 10_000
 
 
 class ActionPlanner(Protocol):
@@ -58,6 +59,7 @@ class PokemonAgentState(TypedDict, total=False):
     max_steps: int
     checkpoint_every: int
     checkpoint_path: str | None
+    fixed_state_path: str | None
     plan_error: str | None
     termination_reason: str | None
     done: bool
@@ -66,7 +68,7 @@ class PokemonAgentState(TypedDict, total=False):
 def initial_state(
     *,
     objective: str = DEFAULT_OBJECTIVE,
-    max_steps: int = 20,
+    max_steps: int = DEFAULT_MAX_STEPS,
     checkpoint_every: int = 10,
 ) -> PokemonAgentState:
     return {
@@ -78,6 +80,7 @@ def initial_state(
         "max_steps": max_steps,
         "checkpoint_every": checkpoint_every,
         "checkpoint_path": None,
+        "fixed_state_path": None,
         "plan_error": None,
         "planner_call_count": 0,
         "llm_planner_call_count": 0,
@@ -197,6 +200,11 @@ def compact_state_for_prompt(state: dict[str, Any]) -> dict[str, Any]:
         ),
     }
 
+    if not bool(game_state.get("dialog_open")):
+        last_dialog = _last_closed_dialog_for_prompt(state.get("transition_history"))
+        if last_dialog is not None:
+            context["last_dialog"] = last_dialog
+
     if mode == "overworld":
         context["world_map"] = _world_map_for_prompt(observation.get("world_map"))
         context["navigation"] = _navigation_for_prompt(observation)
@@ -292,11 +300,13 @@ def _canonical_game_state_for_prompt(game_state: dict[str, Any], *, mode: str) -
         )
     if in_battle or mode == "battle":
         battle = game_state.get("battle") if isinstance(game_state.get("battle"), dict) else {}
+        opponent = battle.get("opponent") if isinstance(battle.get("opponent"), dict) else {}
         compact["battle"] = _without_empty(
             {
                 "kind": battle.get("kind"),
                 "type": battle.get("type"),
                 "turns": battle.get("turns"),
+                "opponent": _compact_battle_opponent(opponent),
                 "party": [_compact_party_member(member) for member in party[:6] if isinstance(member, dict)],
             }
         )
@@ -318,6 +328,19 @@ def _compact_party_member(member: dict[str, Any]) -> dict[str, Any]:
             "hp": member.get("hp"),
             "max_hp": member.get("max_hp"),
             "status": member.get("status"),
+        }
+    )
+
+
+def _compact_battle_opponent(opponent: dict[str, Any]) -> dict[str, Any]:
+    return _without_empty(
+        {
+            "species": opponent.get("species"),
+            "level": opponent.get("level"),
+            "hp": opponent.get("hp"),
+            "max_hp": opponent.get("max_hp"),
+            "status": opponent.get("status"),
+            "types": opponent.get("types"),
         }
     )
 
@@ -372,9 +395,27 @@ def _compact_transition_state(state: Any) -> dict[str, Any] | None:
             "position": state.get("position"),
             "mode": state.get("mode"),
             "dialog_open": state.get("dialog_open"),
+            "dialog_text": state.get("dialog_text"),
             "in_battle": state.get("in_battle"),
         }
     )
+
+
+def _last_closed_dialog_for_prompt(history: Any) -> dict[str, str] | None:
+    if not isinstance(history, list):
+        return None
+    for entry in reversed(history[-PROMPT_TRANSITION_LIMIT:]):
+        if not isinstance(entry, dict):
+            continue
+        before = entry.get("before") if isinstance(entry.get("before"), dict) else {}
+        after = entry.get("after") if isinstance(entry.get("after"), dict) else {}
+        text = before.get("dialog_text")
+        if before.get("dialog_open") and not after.get("dialog_open") and text:
+            return {
+                "text": " ".join(str(text).split()),
+                "status": "recently_closed",
+            }
+    return None
 
 
 def _without_empty(values: dict[str, Any]) -> dict[str, Any]:

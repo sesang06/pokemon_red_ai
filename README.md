@@ -290,16 +290,17 @@ Run the Google ADK-backed safe loop:
 .\.venv\Scripts\pokemon-adk.exe
 ```
 
-By default, this uses `--steps 100 --window null --control-ui
+By default, this uses `--steps 10000 --window SDL2 --control-ui
 --realtime-ticks --realtime-fps 60 --ui-refresh-hz 30 --adk-model
-"gemini-2.5-flash" --adk-vision`. Use `--window SDL2` if you also want to see
-the emulator window.
+"gemini-3.5-flash" --adk-vision`. With the control UI enabled, the game and
+collision overlay are rendered in one Qt window while a windowless SDL audio
+device plays BGM and sound effects. Use `--window null` for silent headless execution.
 
 Run with a Google ADK model planner:
 
 ```powershell
 $env:GOOGLE_API_KEY="your-api-key"
-.\.venv\Scripts\python.exe -m pokemon_agent.adk_agent.runner --steps 20 --window null --control-ui --adk-model "gemini-2.5-flash"
+.\.venv\Scripts\python.exe -m pokemon_agent.adk_agent.runner --steps 20 --window SDL2 --control-ui --adk-model "gemini-3.5-flash"
 ```
 
 You can also create a local `.env` file. It is ignored by git:
@@ -307,13 +308,13 @@ You can also create a local `.env` file. It is ignored by git:
 ```powershell
 $env:GOOGLE_API_KEY="your-api-key"
 Set-Content .env "GOOGLE_API_KEY=$env:GOOGLE_API_KEY"
-Add-Content .env "POKEMON_AGENT_ADK_MODEL=gemini-2.5-flash"
+Add-Content .env "POKEMON_AGENT_ADK_MODEL=gemini-3.5-flash"
 ```
 
 Then run:
 
 ```powershell
-$env:POKEMON_AGENT_ADK_MODEL="gemini-2.5-flash"
+$env:POKEMON_AGENT_ADK_MODEL="gemini-3.5-flash"
 .\.venv\Scripts\python.exe -m pokemon_agent.adk_agent.runner
 ```
 
@@ -375,14 +376,18 @@ image payload.
 - The Google ADK planner produces one bounded `buttons` or `move` ActionPlan.
 - Python validates each action once and owns collision checks and pathfinding.
 - RAM-derived GameState deterministically verifies action results and Goal success.
-- The Planner reads only the current map's memory through `search_memory(map_name)`.
-- The result interpreter uses `search_memory` and `save_memory`; persisted keys are always `map:<map_name>`.
+- The Planner reads relevant map, NPC, Pokemon, and event memories through
+  `search_memory(memory_type, name)`.
+- The result interpreter uses `search_memory` and `save_memory`; persisted keys are generated internally as
+  `map:<name>`, `npc:<name>`, `pokemon:<name>`, or `event:<name>`.
 - Navigation is deterministic A* over a walkability grid.
 - Battle and dialog are isolated because they use different observations and
   menu timing than overworld movement.
 - RAM reads are the source of truth for state such as map id and coordinates.
 - Screen/tile reads are supporting evidence for local terrain and UI state.
 - Save states are explicit checkpoints for retries.
+- After every completed agent turn, the current emulator state overwrites `states\fixed_start.state`; the periodic
+  `--checkpoint-every` backup to `states\last.state` remains separate.
 
 Useful upstream references:
 

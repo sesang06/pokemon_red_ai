@@ -10,9 +10,9 @@ from pokemon_agent.adk_agent.runner import parse_args
 def test_adk_runner_defaults_to_live_vision_loop() -> None:
     args = parse_args([])
 
-    assert args.steps == 100
+    assert args.steps == 10_000
     assert args.objective == DEFAULT_OBJECTIVE
-    assert args.window == "null"
+    assert args.window == "SDL2"
     assert args.control_ui is True
     assert args.realtime_ticks is True
     assert args.realtime_fps == 60.0

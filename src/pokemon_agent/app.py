@@ -40,7 +40,8 @@ def run_rom(
     tick_frames: int,
     control_panel: QtStateControlPanel | None = None,
 ) -> None:
-    env = PyBoyEnvironment(rom_path=rom, window=window)
+    emulator_window = "qt" if control_panel is not None and window == "SDL2" else window
+    env = PyBoyEnvironment(rom_path=rom, window=emulator_window)
     reader = PokemonRedMemoryReader()
     capture = CaptureRecorder(env, capture_config)
     last_ram_update = 0.0

@@ -287,7 +287,7 @@ pokemon-adk
 |---|---|
 | model agent | `pokemon_red_planner` |
 | 직접 호출문 | `src/pokemon_agent/adk_agent/agents/planner/agent.py:275` |
-| 활성화 조건 | `--adk-model` 값이 있을 때. 기본값은 `gemini-2.5-flash`; `--no-adk-model`이면 생성하지 않음 |
+| 활성화 조건 | `--adk-model` 값이 있을 때. 기본값은 `gemini-3.5-flash`; `--no-adk-model`이면 생성하지 않음 |
 | 호출 조건 | 현재 Task가 없거나, Task가 terminal 상태이거나, `replan_required=true`일 때 |
 | 호출하지 않는 경우 | 진행 중인 Task가 있으면 action마다 다시 부르지 않음 |
 | 입력 | Goal, Task/TaskResult, compact GameState, 최근 transition, 관련 장기기억, story dependency |

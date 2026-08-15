@@ -60,6 +60,8 @@ def initial_live_state() -> dict[str, Any]:
             "action": None,
             "result": None,
             "pipeline": pipeline_for_phase("not_started"),
+            "current_step": 0,
+            "max_steps": None,
             "planner_calls": 0,
             "executor_actions": 0,
             "interpreter_calls": 0,
@@ -168,6 +170,8 @@ def runtime_state(state: dict[str, Any], *, phase: str) -> dict[str, Any]:
             "action": action,
             "result": outcome or _compact_action_result(result),
             "pipeline": pipeline_for_phase(phase),
+            "current_step": int(state.get("step_count", 0)),
+            "max_steps": state.get("max_steps"),
             "planner_calls": int(state.get("planner_call_count", 0)),
             "executor_actions": int(state.get("step_count", 0)),
             "interpreter_calls": int(state.get("interpreter_call_count", 0)),
@@ -191,7 +195,12 @@ def navigation_from_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def memory_recent(items: dict[str, dict[str, Any]], *, limit: int = 8) -> list[dict[str, Any]]:
+def memory_recent(
+    items: dict[str, dict[str, Any]],
+    *,
+    limit: int = 8,
+    priority_keys: list[str] | None = None,
+) -> list[dict[str, Any]]:
     entries = [
         {
             "key": str(key),
@@ -202,8 +211,18 @@ def memory_recent(items: dict[str, dict[str, Any]], *, limit: int = 8) -> list[d
         for key, item in items.items()
         if isinstance(item, dict)
     ]
-    entries.sort(key=lambda entry: str(entry.get("updated_at") or ""), reverse=True)
-    return entries[:limit]
+    by_key = {entry["key"]: entry for entry in entries}
+    prioritized = [
+        by_key.pop(key)
+        for key in dict.fromkeys(priority_keys or [])
+        if key in by_key
+    ]
+    remaining = sorted(
+        by_key.values(),
+        key=lambda entry: str(entry.get("updated_at") or ""),
+        reverse=True,
+    )
+    return (prioritized + remaining)[:limit]
 
 
 def state_event_record(event: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:

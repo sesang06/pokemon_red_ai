@@ -29,6 +29,45 @@ def test_memory_reader_builds_base_world_state() -> None:
     assert state.raw["collision_ptr"] == 0x1234
 
 
+def test_memory_reader_decodes_player_facing_direction() -> None:
+    ram = PokemonRedRamMap()
+    reader = PokemonRedMemoryReader(ram)
+
+    for raw_value, expected in ((0x00, "down"), (0x04, "up"), (0x08, "left"), (0x0C, "right")):
+        state = reader.read(FakeMemory({ram.player_facing: raw_value}))
+        assert state.facing == expected
+        assert state.raw["player_facing"] == raw_value
+
+
+def test_memory_reader_only_decodes_opponent_during_battle() -> None:
+    ram = PokemonRedRamMap()
+    reader = PokemonRedMemoryReader(ram)
+    enemy_memory = {
+        ram.enemy_species: 0xA5,
+        ram.enemy_hp: 0x00,
+        ram.enemy_hp + 1: 9,
+        ram.enemy_status: 0x08,
+        ram.enemy_type_1: 0x00,
+        ram.enemy_type_2: 0x00,
+        ram.enemy_level: 4,
+        ram.enemy_max_hp: 0x00,
+        ram.enemy_max_hp + 1: 15,
+    }
+
+    assert reader.read(FakeMemory(enemy_memory)).battle_opponent is None
+
+    opponent = reader.read(FakeMemory({**enemy_memory, ram.battle_type: 1})).battle_opponent
+    assert opponent is not None
+    assert opponent.species == "Rattata"
+    assert opponent.level == 4
+    assert opponent.hp == 9
+    assert opponent.max_hp == 15
+    assert opponent.status == "Poison"
+    assert opponent.types == ["Normal"]
+    assert not hasattr(opponent, "moves")
+    assert not hasattr(opponent, "move_pp")
+
+
 def test_memory_reader_builds_detailed_world_state() -> None:
     memory = FakeMemory()
     memory.update(

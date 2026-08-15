@@ -139,7 +139,40 @@ def test_runtime_state_store_publishes_file_state_and_memory() -> None:
     snapshot = hub.snapshot()["state"]
     assert published[0][1] == "interpreted"
     assert snapshot["agent"]["task"]["id"] == "complete_pokemon_red"
+    assert snapshot["agent"]["current_step"] == 1
+    assert snapshot["agent"]["max_steps"] is None
     assert snapshot["memory"]["recent"][0]["key"] == "map:Pallet Town"
+
+
+def test_memory_activity_immediately_prioritizes_latest_loaded_value() -> None:
+    hub = LiveEventHub()
+    items = {
+        "map:Pallet Town": {
+            "value": "newer by write time",
+            "updated_at": "2026-08-15T02:00:00Z",
+            "source": "result_interpreter",
+        },
+        "npc:Professor Oak": {
+            "value": "recently loaded content",
+            "updated_at": "2026-08-15T01:00:00Z",
+            "source": "result_interpreter",
+        },
+    }
+
+    hub.publish_memory_activity(
+        items,
+        {"tool": "search_memory", "key": "npc:Professor Oak"},
+    )
+    hub.publish_memory_snapshot(items)
+
+    memory = hub.snapshot()["state"]["memory"]
+    assert memory["last_activity"]["type"] == "search_memory"
+    assert memory["recent"][0] == {
+        "key": "npc:Professor Oak",
+        "value": "recently loaded content",
+        "source": "result_interpreter",
+        "updated_at": "2026-08-15T01:00:00Z",
+    }
 
 
 def test_trace_events_only_expose_structured_public_fields() -> None:

@@ -30,11 +30,11 @@ class QtStateControlPanel:
                 QApplication,
                 QCheckBox,
                 QGridLayout,
+                QHBoxLayout,
                 QLabel,
                 QLineEdit,
                 QPlainTextEdit,
                 QPushButton,
-                QScrollArea,
                 QSpinBox,
                 QTabWidget,
                 QVBoxLayout,
@@ -52,8 +52,9 @@ class QtStateControlPanel:
         self.app = QApplication.instance() or QApplication([])
 
         self.window = QWidget()
-        self.window.setWindowTitle("Pokemon Red State Control")
-        self.window.setFixedSize(760, 980)
+        self.window.setWindowTitle("Pokemon Red")
+        self.window.resize(1160, 900)
+        self.window.setMinimumSize(900, 700)
         self.window.move(40, 40)
         self.window.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
 
@@ -68,11 +69,30 @@ class QtStateControlPanel:
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
+        visual_layout = QHBoxLayout()
+        layout.addLayout(visual_layout)
+
+        screen_layout = QVBoxLayout()
+        screen_title = QLabel("Game Screen")
+        screen_layout.addWidget(screen_title)
         self.screen_label = QLabel("Waiting for screen...")
         self.screen_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.screen_label.setFixedSize(320, 288)
+        self.screen_label.setMinimumSize(320, 288)
+        self.screen_label.setMaximumSize(560, 504)
         self.screen_label.setStyleSheet("background: #111; color: #ddd; border: 1px solid #444;")
-        layout.addWidget(self.screen_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+        screen_layout.addWidget(self.screen_label)
+        visual_layout.addLayout(screen_layout, 1)
+
+        overlay_layout = QVBoxLayout()
+        overlay_title = QLabel("Collision Overlay + World Coordinates")
+        overlay_layout.addWidget(overlay_title)
+        self.overlay_label = QLabel("Waiting for collision overlay...")
+        self.overlay_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.overlay_label.setMinimumSize(320, 288)
+        self.overlay_label.setMaximumSize(560, 504)
+        self.overlay_label.setStyleSheet("background: #111; color: #ddd; border: 1px solid #444;")
+        overlay_layout.addWidget(self.overlay_label)
+        visual_layout.addLayout(overlay_layout, 1)
 
         button_grid = QGridLayout()
         layout.addLayout(button_grid)
@@ -159,27 +179,8 @@ class QtStateControlPanel:
         self._prepare_text_box(self.mcp_log_text, "Waiting for MCP tool calls...")
         tabs.addTab(self.mcp_log_text, "MCP Log")
 
-        self.overlay_window = QWidget()
-        self.overlay_window.setWindowTitle("Pokemon Red Collision Overlay")
-        self.overlay_window.setFixedSize(660, 620)
-        self.overlay_window.move(820, 40)
-        self.overlay_window.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        overlay_layout = QVBoxLayout()
-        self.overlay_window.setLayout(overlay_layout)
-
-        self.overlay_label = QLabel("Waiting for collision overlay...")
-        self.overlay_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.overlay_label.setFixedSize(640, 576)
-        self.overlay_label.setStyleSheet("background: #111; color: #ddd; border: 1px solid #444;")
-        overlay_scroll = QScrollArea()
-        overlay_scroll.setWidget(self.overlay_label)
-        overlay_scroll.setWidgetResizable(False)
-        overlay_layout.addWidget(overlay_scroll)
-
         self.window.closeEvent = self._handle_close_event
-        self.overlay_window.closeEvent = self._handle_overlay_close_event
         self.window.show()
-        self.overlay_window.show()
 
     def poll(self, state: GameState) -> list[ControlCommand]:
         self.last_state = state
@@ -252,7 +253,6 @@ class QtStateControlPanel:
 
     def close(self) -> None:
         self.closing = True
-        self.overlay_window.close()
         self.window.close()
         self.app.processEvents()
 
@@ -317,15 +317,6 @@ class QtStateControlPanel:
                 event.accept()
             return
         self._queue_stop()
-        if hasattr(event, "ignore"):
-            event.ignore()
-
-    def _handle_overlay_close_event(self, event: object) -> None:
-        if self.closing:
-            if hasattr(event, "accept"):
-                event.accept()
-            return
-        self.overlay_window.hide()
         if hasattr(event, "ignore"):
             event.ignore()
 

@@ -9,7 +9,7 @@ from typing import Any
 
 from pokemon_agent.adk_agent.agents.interpreter.agent import GoogleAdkResultInterpreter
 from pokemon_agent.adk_agent.agents.planner.agent import DEFAULT_ADK_MODEL, GoogleAdkPlanner
-from pokemon_agent.adk_agent.agents.planner.schema import DEFAULT_OBJECTIVE
+from pokemon_agent.adk_agent.agents.planner.schema import DEFAULT_MAX_STEPS, DEFAULT_OBJECTIVE
 from pokemon_agent.adk_agent.client import InProcessPokemonMcpClient
 from pokemon_agent.adk_agent.coordinator.loop import PokemonAdkLoop
 from pokemon_agent.adk_agent.runtime.logging import DateGroupedActionLogger
@@ -23,7 +23,7 @@ from pokemon_agent.dashboard.server import (
 )
 from pokemon_agent.memory.file_memory import DEFAULT_LONG_TERM_MEMORY_PATH, FileLongTermMemory
 
-DEFAULT_STEPS = 100
+DEFAULT_WINDOW = "SDL2"
 DEFAULT_CONTROL_UI = True
 DEFAULT_REALTIME_TICKS = True
 DEFAULT_ADK_VISION = True
@@ -45,8 +45,12 @@ def load_project_env() -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the MCP-backed Google ADK Pokemon Red agent loop.")
-    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="Maximum number of agent action cycles.")
-    parser.add_argument("--window", default="null", help="PyBoy window backend, for example null or SDL2.")
+    parser.add_argument("--steps", type=int, default=DEFAULT_MAX_STEPS, help="Maximum number of agent action cycles.")
+    parser.add_argument(
+        "--window",
+        default=DEFAULT_WINDOW,
+        help="PyBoy backend. With control UI, SDL2 is merged into Qt while audio stays enabled; null is silent/headless.",
+    )
     parser.add_argument("--objective", default=DEFAULT_OBJECTIVE, help="Agent objective label.")
     parser.add_argument("--checkpoint-every", type=int, default=10, help="Save PyBoy state every N loop actions.")
     parser.add_argument("--no-load-fixed", action="store_true", help="Start without loading states/fixed_start.state.")
@@ -193,6 +197,12 @@ def main() -> None:
                 dashboard.attach_session(mcp_server.get_session())
                 dashboard.hub.publish_memory_snapshot(memory_store.items())
                 dashboard.start()
+                memory_activity_sink = lambda event: dashboard.hub.publish_memory_activity(
+                    memory_store.items(),
+                    event,
+                )
+                action_planner.memory_activity_callback = memory_activity_sink
+                result_interpreter.memory_activity_callback = memory_activity_sink
                 trace_sink = compose_trace_sinks(trace_printer, dashboard.hub.publish_trace)
                 runtime_state_store = DashboardRuntimeStateStore(
                     file_runtime_state_store,
@@ -239,6 +249,7 @@ def summarize_result(result: dict[str, Any]) -> dict[str, Any]:
         "mode": result.get("mode"),
         "stuck_score": result.get("stuck_score"),
         "checkpoint_path": result.get("checkpoint_path"),
+        "fixed_state_path": result.get("fixed_state_path"),
         "memory_path": result.get("memory_path"),
         "state": observation.get("state"),
         "current_goal": result.get("current_goal"),

@@ -75,6 +75,8 @@ export type LiveState = {
     action: Record<string, unknown> | null;
     result: Record<string, unknown> | null;
     pipeline: Record<string, PipelineStatus>;
+    current_step: number;
+    max_steps: number | null;
     planner_calls: number;
     executor_actions: number;
     interpreter_calls: number;

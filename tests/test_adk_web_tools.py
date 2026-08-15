@@ -5,6 +5,7 @@ from pathlib import Path
 from pokemon_agent import mcp_server
 from pokemon_agent.adk_agent.agents.planner.prompt import PLANNING_AGENT_PROMPT
 from pokemon_agent.adk_agent.agents.interpreter.prompt import RESULT_INTERPRETER_PROMPT
+from pokemon_agent.adk_agent.agents.shared import MAX_AUTOMATIC_FUNCTION_CALLS
 from pokemon_agent.input_contract import BUTTON_TOKENS, MAX_BUTTONS_PER_ACTION, MAX_MOVE_PATH_STEPS
 from pokemon_agent.adk_agent.runtime.state import FileAgentRuntimeState
 from pokemon_agent.adk_agent.web import tools as web_tools
@@ -47,7 +48,7 @@ def test_adk_web_tools_observe_returns_compact_screenshot(tmp_path: Path) -> Non
     assert {"direction": "right", "x": 6, "y": 6} in observation["safe_neighbor_world_cells"]
     assert observation["state_events"][0]["type"] == "initial_observation"
     assert observation["state"]["dialog"]["open"] is False
-    assert observation["state"]["battle"]["active"] is False
+    assert "battle" not in observation["state"]
     assert observation["state"]["counts"]["party"] == 0
     assert "raw" not in observation["state"]
 
@@ -131,18 +132,18 @@ def test_adk_web_tools_save_screenshot_uses_date_folder(tmp_path: Path) -> None:
     assert saved_path.suffix == ".png"
 
 
-def test_adk_web_memory_tools_are_map_scoped(tmp_path: Path, monkeypatch) -> None:
+def test_adk_web_memory_tools_support_validated_memory_types(tmp_path: Path, monkeypatch) -> None:
     store = FileLongTermMemory(tmp_path / "long_term_memory.json")
     monkeypatch.setattr(web_tools, "_memory_store", lambda: store)
 
-    write_result = web_tools.save_memory("Oak's Lab", "starter location")
-    search_result = web_tools.search_memory("Oak's Lab")
+    write_result = web_tools.save_memory("event", "starter_selection", "Bulbasaur was chosen")
+    search_result = web_tools.search_memory("event", "starter_selection")
 
     assert write_result["phase"] == "memory_write"
-    assert write_result["key"] == "map:Oak's Lab"
-    assert search_result["key"] == "map:Oak's Lab"
-    assert search_result["item"]["value"] == "starter location"
-    assert list(store.items()) == ["map:Oak's Lab"]
+    assert write_result["key"] == "event:starter_selection"
+    assert search_result["key"] == "event:starter_selection"
+    assert search_result["item"]["value"] == "Bulbasaur was chosen"
+    assert list(store.items()) == ["event:starter_selection"]
 
 
 def test_adk_web_tools_read_shared_cli_runtime_history(tmp_path: Path, monkeypatch) -> None:
@@ -201,7 +202,7 @@ def test_runtime_state_publish_retries_windows_replace_contention(tmp_path: Path
 
 
 def test_adk_web_root_agent_exposes_only_llm_decision_sub_agents() -> None:
-    root_agent = build_root_agent(model="gemini-2.5-flash")
+    root_agent = build_root_agent(model="gemini-3.5-flash")
 
     assert root_agent.name == "pokemon_red_team"
     assert [agent.name for agent in root_agent.sub_agents] == [
@@ -225,7 +226,7 @@ def test_adk_web_root_agent_exposes_only_llm_decision_sub_agents() -> None:
 
 
 def test_adk_web_exports_compacted_app() -> None:
-    configured = build_app(model="gemini-2.5-flash")
+    configured = build_app(model="gemini-3.5-flash")
 
     assert app.root_agent is not None
     assert configured.name == "adk_agent"
@@ -234,11 +235,16 @@ def test_adk_web_exports_compacted_app() -> None:
     assert configured.events_compaction_config.overlap_size == 1
     assert configured.events_compaction_config.token_threshold is not None
     assert configured.events_compaction_config.event_retention_size == 20
+    for agent in (configured.root_agent, *configured.root_agent.sub_agents):
+        assert (
+            agent.generate_content_config.automatic_function_calling.maximum_remote_calls
+            == MAX_AUTOMATIC_FUNCTION_CALLS
+        )
 
 
 def test_adk_web_planning_prompt_documents_direct_action_contract() -> None:
-    assert '"action": {"type":"buttons"' in PLANNING_AGENT_PROMPT
-    assert '["a","wait","a","wait","a"]' in PLANNING_AGENT_PROMPT
+    assert '{"type":"buttons","buttons"' in PLANNING_AGENT_PROMPT
+    assert '["right","wait","right","wait","a"]' in PLANNING_AGENT_PROMPT
     assert '["right","wait","right","wait","right"]' in PLANNING_AGENT_PROMPT
     assert "same button token may appear multiple times" in PLANNING_AGENT_PROMPT
     assert "executor runs it exactly once" in PLANNING_AGENT_PROMPT
@@ -248,18 +254,31 @@ def test_adk_web_planning_prompt_documents_direct_action_contract() -> None:
     assert '"screen_description"' in PLANNING_AGENT_PROMPT
     assert '"current_location"' in PLANNING_AGENT_PROMPT
     assert '"thought_summary"' in PLANNING_AGENT_PROMPT
-    assert "public 1-2 sentence decision summary" in PLANNING_AGENT_PROMPT
+    assert "one detailed paragraph each" in PLANNING_AGENT_PROMPT
+    assert "using 3-5 complete sentences" in PLANNING_AGENT_PROMPT
     assert "decision_trace" not in PLANNING_AGENT_PROMPT
     assert "session_dialog" not in PLANNING_AGENT_PROMPT
     assert "RAM/GameState" in PLANNING_AGENT_PROMPT
     assert "repeat_until" not in PLANNING_AGENT_PROMPT
     assert "max_repeats" not in PLANNING_AGENT_PROMPT
-    assert "search_memory(map_name=state.map_name)" in PLANNING_AGENT_PROMPT
-    assert "map:<map_name>" in PLANNING_AGENT_PROMPT
+    assert 'search_memory(memory_type="map", name=state.map_name)' in PLANNING_AGENT_PROMPT
+    for memory_type in ("map", "npc", "pokemon", "event"):
+        assert f"`{memory_type}`" in PLANNING_AGENT_PROMPT
+    assert "<memory_type>:<name>" in PLANNING_AGENT_PROMPT
+    assert "Professor Oak" in RESULT_INTERPRETER_PROMPT
+    assert "starter_selection" in RESULT_INTERPRETER_PROMPT
     assert "verified world-coordinate routes" in PLANNING_AGENT_PROMPT
     assert "navigation.reachable_targets" in PLANNING_AGENT_PROMPT
     assert "state.controls_locked" in PLANNING_AGENT_PROMPT
     assert "wait_for_scripted_transition" in PLANNING_AGENT_PROMPT
+    assert "Dialog understanding policy" in PLANNING_AGENT_PROMPT
+    assert "Which POKEMON do you want?" in PLANNING_AGENT_PROMPT
+    assert "last_dialog" in PLANNING_AGENT_PROMPT
+    assert "approach_bulbasaur_poke_ball" in PLANNING_AGENT_PROMPT
+    assert "Starter selection is a multi-observation workflow" in PLANNING_AGENT_PROMPT
+    assert "select the visible YES option" in PLANNING_AGENT_PROMPT
+    assert '"reason":"advance_dialog"' not in PLANNING_AGENT_PROMPT
+    assert "starter-ball confirmation names the candidate species" in RESULT_INTERPRETER_PROMPT
     assert "route: [from_x,from_y] -> [to_x,to_y]" in RESULT_INTERPRETER_PROMPT
     assert "Merge and deduplicate coordinates" in RESULT_INTERPRETER_PROMPT
     assert "zero-step move adds no route knowledge" in RESULT_INTERPRETER_PROMPT
@@ -285,8 +304,8 @@ def test_planner_and_interpreter_prompts_share_complete_input_and_navigation_con
     assert "instead of oscillating back" in PLANNING_AGENT_PROMPT
     assert "Never output prose labels" in PLANNING_AGENT_PROMPT
     assert "Do not use Markdown fences" in PLANNING_AGENT_PROMPT
-    assert "concise English" in PLANNING_AGENT_PROMPT
-    assert "concise English" in RESULT_INTERPRETER_PROMPT
+    assert "one detailed paragraph each" in PLANNING_AGENT_PROMPT
+    assert "one detailed paragraph each" in RESULT_INTERPRETER_PROMPT
     assert not any("\uac00" <= char <= "\ud7a3" for char in PLANNING_AGENT_PROMPT)
     assert not any("\uac00" <= char <= "\ud7a3" for char in RESULT_INTERPRETER_PROMPT)
     assert "max_steps_reached" in RESULT_INTERPRETER_PROMPT

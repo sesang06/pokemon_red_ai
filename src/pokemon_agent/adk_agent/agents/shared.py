@@ -10,6 +10,7 @@ from typing import Any
 
 TraceSink = Callable[[dict[str, Any]], None]
 PUBLIC_OUTPUT_FIELDS = ("screen_description", "current_location", "thought_summary")
+MAX_AUTOMATIC_FUNCTION_CALLS = 6
 
 
 class ConsoleTokenStream:
@@ -110,7 +111,7 @@ def public_output_fields(
         "screen_description": _public_text(
             source.get("screen_description"),
             default=f"Current game screen in {map_name}, mode={mode}",
-            limit=500,
+            limit=1200,
         ),
         "current_location": _public_text(
             source.get("current_location"),
@@ -120,7 +121,7 @@ def public_output_fields(
         "thought_summary": _public_text(
             source.get("thought_summary"),
             default=default_thought,
-            limit=500,
+            limit=1200,
         ),
     }
 

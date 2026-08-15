@@ -18,6 +18,7 @@ from pokemon_agent.adk_agent.agents.interpreter.prompt import RESULT_INTERPRETER
 from pokemon_agent.adk_agent.agents.planner.schema import PokemonAgentState
 from pokemon_agent.adk_agent.agents.shared import (
     ConsoleTokenStream,
+    MAX_AUTOMATIC_FUNCTION_CALLS,
     TraceSink,
     emit_trace,
     event_finish_reason,
@@ -230,18 +231,35 @@ def compact_interpreter_context(state: dict[str, Any]) -> dict[str, Any]:
     if movement_result:
         last_result["movement"] = movement_result
 
-    transition = _last_transition(state.get("transition_history"))
+    transition_history = state.get("transition_history")
+    transition = _last_transition(transition_history)
+    compact_state: dict[str, Any] = {
+        "map": game_state.get("map_name"),
+        "pos": _position_list(game_state.get("position")),
+        "mode": game_state.get("mode") or state.get("mode") or "unknown",
+        "dialog": bool(game_state.get("dialog_open", False)),
+        "battle": bool(game_state.get("in_battle", False)),
+        "flags": _relevant_flags(game_state, action_plan, state.get("current_goal")),
+        "party_count": _party_count(game_state),
+    }
+    dialog_text = game_state.get("dialog_text")
+    if dialog_text:
+        compact_state["dialog_text"] = " ".join(str(dialog_text).split())
+    recent_dialog = _recent_dialog_text(transition_history)
+    if recent_dialog and recent_dialog != compact_state.get("dialog_text"):
+        compact_state["recent_dialog"] = recent_dialog
+    party = _compact_party_for_memory(game_state.get("party"))
+    if party:
+        compact_state["party"] = party
+    if compact_state["battle"]:
+        battle = game_state.get("battle") if isinstance(game_state.get("battle"), dict) else {}
+        opponent = battle.get("opponent") if isinstance(battle.get("opponent"), dict) else None
+        if opponent is not None:
+            compact_state["opponent"] = _compact_opponent_for_interpreter(opponent)
+
     return {
         "step": int(state.get("step_count", 0)),
-        "state": {
-            "map": game_state.get("map_name"),
-            "pos": _position_list(game_state.get("position")),
-            "mode": game_state.get("mode") or state.get("mode") or "unknown",
-            "dialog": bool(game_state.get("dialog_open", False)),
-            "battle": bool(game_state.get("in_battle", False)),
-            "flags": _relevant_flags(game_state, action_plan, state.get("current_goal")),
-            "party_count": _party_count(game_state),
-        },
+        "state": compact_state,
         "action_plan": {
             "action": action_plan.get("action"),
             "status": action_plan.get("status"),
@@ -249,6 +267,14 @@ def compact_interpreter_context(state: dict[str, Any]) -> dict[str, Any]:
         "last_result": last_result,
         "state_changes": _compact_state_changes(state_diff),
         "last_transition": transition,
+    }
+
+
+def _compact_opponent_for_interpreter(opponent: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: opponent.get(key)
+        for key in ("species", "level", "hp", "max_hp", "status", "types")
+        if opponent.get(key) is not None
     }
 
 
@@ -348,6 +374,37 @@ def _last_transition(history: Any) -> dict[str, Any] | None:
     }
 
 
+def _recent_dialog_text(history: Any) -> str | None:
+    if not isinstance(history, list):
+        return None
+    for transition in reversed(history[-2:]):
+        if not isinstance(transition, dict):
+            continue
+        for state_name in ("after", "before"):
+            snapshot = transition.get(state_name)
+            if not isinstance(snapshot, dict) or not snapshot.get("dialog_text"):
+                continue
+            return " ".join(str(snapshot["dialog_text"]).split())
+    return None
+
+
+def _compact_party_for_memory(party: Any) -> list[dict[str, Any]]:
+    if not isinstance(party, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for member in party[:6]:
+        if not isinstance(member, dict):
+            continue
+        compact = {
+            key: member.get(key)
+            for key in ("species", "nickname", "level", "status")
+            if member.get(key) not in (None, "")
+        }
+        if compact:
+            result.append(compact)
+    return result
+
+
 def _relevant_flags(game_state: dict[str, Any], action_plan: dict[str, Any], goal: Any) -> dict[str, bool]:
     flags = game_state.get("flags") if isinstance(game_state.get("flags"), dict) else {}
     explicit: list[str] = []
@@ -425,6 +482,7 @@ class GoogleAdkResultInterpreter:
     last_interpret_error: str | None = field(init=False, default=None)
     last_thinking_summary: str | None = field(init=False, default=None)
     thinking_summary_callback: Callable[[str], None] | None = field(init=False, default=None, repr=False)
+    memory_activity_callback: Callable[[dict[str, Any]], None] | None = field(init=False, default=None, repr=False)
     memory_tool_activity: list[dict[str, Any]] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
@@ -440,6 +498,9 @@ class GoogleAdkResultInterpreter:
         config_kwargs: dict[str, Any] = {
             "temperature": self.temperature,
             "maxOutputTokens": self.max_output_tokens,
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                maximum_remote_calls=MAX_AUTOMATIC_FUNCTION_CALLS,
+            ),
         }
         if self.thinking_budget is not None:
             config_kwargs["thinking_config"] = types.ThinkingConfig(
@@ -462,11 +523,16 @@ class GoogleAdkResultInterpreter:
             instruction=INTERPRETER_PROMPT,
             generate_content_config=generate_config,
             tools=[
-                build_search_memory_tool(self.memory_store, activity=self.memory_tool_activity),
+                build_search_memory_tool(
+                    self.memory_store,
+                    activity=self.memory_tool_activity,
+                    on_activity=self._publish_memory_activity,
+                ),
                 build_save_memory_tool(
                     self.memory_store,
                     source="result_interpreter",
                     activity=self.memory_tool_activity,
+                    on_activity=self._publish_memory_activity,
                 ),
             ],
         )
@@ -479,6 +545,10 @@ class GoogleAdkResultInterpreter:
             streaming_mode=StreamingMode.SSE if self.stream_output else StreamingMode.NONE,
         )
         self._session_created = False
+
+    def _publish_memory_activity(self, event: dict[str, Any]) -> None:
+        if self.memory_activity_callback is not None:
+            self.memory_activity_callback(dict(event))
 
     @classmethod
     def from_env(

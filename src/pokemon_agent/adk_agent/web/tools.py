@@ -6,7 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pokemon_agent.adk_agent.agents.memory_tools import save_map_memory, search_map_memory
+from pokemon_agent.adk_agent.agents.memory_tools import (
+    MemoryType,
+    save_memory_entry,
+    search_memory_entry,
+)
 from pokemon_agent.adk_agent.runtime.state import FileAgentRuntimeState
 from pokemon_agent.memory.file_memory import FileLongTermMemory
 
@@ -176,25 +180,25 @@ def recent_agent_actions(limit: int = 20) -> dict[str, Any]:
     }
 
 
-def search_memory(map_name: str) -> dict[str, Any]:
-    """Load the single file-backed memory entry for an exact Pokemon map name."""
+def search_memory(memory_type: MemoryType, name: str) -> dict[str, Any]:
+    """Load one file-backed map, NPC, Pokemon, or event memory by canonical name."""
 
     store = _memory_store()
     return {
         "agent": "pokemon_red_planning_agent",
         "path": str(store.path),
-        **search_map_memory(store, map_name),
+        **search_memory_entry(store, memory_type, name),
     }
 
 
-def save_memory(map_name: str, value: str) -> dict[str, Any]:
-    """Save consolidated memory under the exact Pokemon map name."""
+def save_memory(memory_type: MemoryType, name: str, value: str) -> dict[str, Any]:
+    """Save one consolidated map, NPC, Pokemon, or event memory."""
 
     store = _memory_store()
     return {
         "agent": "pokemon_red_result_interpreter_agent",
         "path": str(store.path),
-        **save_map_memory(store, map_name, value, source="adk_web"),
+        **save_memory_entry(store, memory_type, name, value, source="adk_web"),
     }
 
 
@@ -264,7 +268,7 @@ def _compact_image_payload(image: dict[str, Any], *, include_base64: bool = Fals
 
 
 def _compact_state(state: dict[str, Any]) -> dict[str, Any]:
-    return {
+    compact = {
         "map_id": state.get("map_id"),
         "map_name": state.get("map_name"),
         "position": state.get("position"),
@@ -285,7 +289,6 @@ def _compact_state(state: dict[str, Any]) -> dict[str, Any]:
         "warps": state.get("warps"),
         "dialog_text": state.get("dialog_text"),
         "dialog": state.get("dialog"),
-        "battle": state.get("battle"),
         "menu": state.get("menu"),
         "map": state.get("map"),
         "counts": state.get("counts"),
@@ -295,6 +298,25 @@ def _compact_state(state: dict[str, Any]) -> dict[str, Any]:
         "items": state.get("items"),
         "nearby_npcs": state.get("nearby_npcs"),
         "nearby_exits": state.get("nearby_exits"),
+    }
+    if bool(state.get("in_battle")) and isinstance(state.get("battle"), dict):
+        battle = state["battle"]
+        opponent = battle.get("opponent") if isinstance(battle.get("opponent"), dict) else None
+        compact["battle"] = {
+            "active": True,
+            "type": battle.get("type"),
+            "kind": battle.get("kind"),
+            "turns": battle.get("turns"),
+            **({"opponent": _compact_battle_opponent(opponent)} if opponent is not None else {}),
+        }
+    return compact
+
+
+def _compact_battle_opponent(opponent: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: opponent.get(key)
+        for key in ("species", "level", "hp", "max_hp", "status", "types")
+        if opponent.get(key) is not None
     }
 
 

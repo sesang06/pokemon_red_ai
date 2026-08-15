@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         description="Run Pokemon Red from a fixed relative ROM and fixed PyBoy save-state."
     )
     parser.add_argument("--steps", type=int, default=36000, help="Number of loop steps to run.")
-    parser.add_argument("--window", default="SDL2", help="PyBoy window backend.")
+    parser.add_argument("--window", default="SDL2", help="PyBoy backend; the control UI merges SDL2 output into Qt.")
     parser.add_argument("--no-render", action="store_true", help="Disable rendering.")
     parser.add_argument("--fix-current", action="store_true", help="Copy src/pokered.gb.state into states/fixed_start.state and exit.")
     parser.add_argument("--save-fixed-on-exit", action="store_true", help="Overwrite states/fixed_start.state with the current emulator state when the run exits.")

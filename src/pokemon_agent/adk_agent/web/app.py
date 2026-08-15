@@ -10,6 +10,7 @@ from google.genai import types
 from pokemon_agent.adk_agent.agents.interpreter.prompt import RESULT_INTERPRETER_PROMPT
 from pokemon_agent.adk_agent.agents.planner.agent import DEFAULT_ADK_MODEL
 from pokemon_agent.adk_agent.agents.planner.prompt import PLANNING_AGENT_PROMPT
+from pokemon_agent.adk_agent.agents.shared import MAX_AUTOMATIC_FUNCTION_CALLS
 from pokemon_agent.adk_agent.runtime.session import ADK_WEB_APP_NAME, build_events_compaction_config
 from pokemon_agent.adk_agent.web.prompt import WEB_AGENT_PROMPT
 from pokemon_agent.adk_agent.web.tools import (
@@ -47,6 +48,9 @@ def build_root_agent(model: str | None = None) -> Agent:
         temperature=0.2,
         maxOutputTokens=900,
         thinking_config=types.ThinkingConfig(include_thoughts=True),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+            maximum_remote_calls=MAX_AUTOMATIC_FUNCTION_CALLS,
+        ),
     )
     planning_agent = Agent(
         name="pokemon_red_planning_agent",

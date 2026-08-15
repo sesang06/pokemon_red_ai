@@ -40,6 +40,16 @@ class PartyMember:
 
 
 @dataclass(frozen=True)
+class BattleOpponent:
+    species: str
+    level: int
+    hp: int
+    max_hp: int
+    status: str
+    types: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class ItemStack:
     name: str
     quantity: int
@@ -67,6 +77,7 @@ class GameState:
     facing: str | None = None
     mode: GameMode = GameMode.START
     in_battle: bool = False
+    battle_opponent: BattleOpponent | None = None
     dialog_open: bool = False
     player_name: str | None = None
     rival_name: str | None = None

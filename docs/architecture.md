@@ -11,8 +11,8 @@ Goal
   -> PokemonSession.observe() (RAM + vision)
   -> deterministic StateDiff and action/Goal verifier
   -> Result Interpreter (LLM only on failure or a durable event)
-       -> search_memory(current map)
-       -> save_memory(current map, consolidated value) when needed
+       -> search_memory(relevant map/NPC/Pokemon/event)
+       -> save_memory(type, canonical name, consolidated value) when needed
   -> next Planner call with fresh state
 ```
 
@@ -180,9 +180,10 @@ action failure or a durable/unexpected event, and it may explain verified facts.
 It cannot override deterministic outcomes.
 
 Long-term memory is accessed only through ADK tools. The Planner calls
-`search_memory(map_name)` and the interpreter calls `search_memory(map_name)`
-before optionally calling `save_memory(map_name, value)`. Neither tool accepts an
-arbitrary key. Storage is always the single `map:<map_name>` entry for that map.
+`search_memory(memory_type, name)` and the interpreter searches the same identity
+before optionally calling `save_memory(memory_type, name, value)`. Neither tool
+accepts an arbitrary key. `memory_type` is restricted to `map`, `npc`, `pokemon`,
+or `event`, and the tool generates `<memory_type>:<name>` internally.
 
 Full actions remain in date-grouped JSONL and ADK SQLite. The model receives a
 short state-transition context, while deterministic compression bounds recent

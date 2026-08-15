@@ -10,6 +10,7 @@ from typing import Any
 
 
 DEFAULT_LONG_TERM_MEMORY_PATH = Path(__file__).resolve().parents[3] / "data" / "long_term_memory.json"
+MEMORY_TYPES = ("map", "npc", "pokemon", "event")
 
 
 class FileLongTermMemory:
@@ -35,7 +36,7 @@ class FileLongTermMemory:
             loaded["items"] = {
                 str(key): value
                 for key, value in items.items()
-                if str(key).lower().startswith("map:") and isinstance(value, dict)
+                if _is_supported_memory_key(str(key)) and isinstance(value, dict)
             }
         loaded.setdefault("version", 1)
         loaded.setdefault("updated_at", None)
@@ -45,13 +46,20 @@ class FileLongTermMemory:
         raw_items = self.read_all().get("items", {})
         return {str(key): dict(value) for key, value in raw_items.items() if isinstance(value, dict)}
 
-    def get_map(self, map_name: str) -> dict[str, Any] | None:
-        return self.items().get(map_memory_key(map_name))
+    def get(self, memory_type: str, name: str) -> dict[str, Any] | None:
+        return self.items().get(memory_key(memory_type, name))
 
-    def remember_map(self, map_name: str, value: Any, *, source: str = "result_interpreter") -> str:
-        key = map_memory_key(map_name)
+    def remember(
+        self,
+        memory_type: str,
+        name: str,
+        value: Any,
+        *,
+        source: str = "result_interpreter",
+    ) -> str:
+        key = memory_key(memory_type, name)
         if value is None or (isinstance(value, str) and not value.strip()):
-            raise ValueError("map memory value must not be empty")
+            raise ValueError("memory value must not be empty")
         store = self.read_all()
         items = store.setdefault("items", {})
         now = _now_iso()
@@ -83,13 +91,25 @@ class FileLongTermMemory:
                 os.unlink(temp_name)
 
 
-def map_memory_key(map_name: str) -> str:
-    normalized = re.sub(r"\s+", " ", str(map_name).strip())
-    if normalized.lower().startswith("map:"):
-        normalized = normalized.split(":", 1)[1].strip()
+def memory_key(memory_type: str, name: str) -> str:
+    normalized_type = str(memory_type).strip().lower()
+    if normalized_type not in MEMORY_TYPES:
+        raise ValueError(f"memory_type must be one of: {', '.join(MEMORY_TYPES)}")
+
+    normalized = re.sub(r"\s+", " ", str(name).strip())
+    prefix, separator, remainder = normalized.partition(":")
+    if separator and prefix.lower() in MEMORY_TYPES:
+        if prefix.lower() != normalized_type:
+            raise ValueError("memory name prefix does not match memory_type")
+        normalized = remainder.strip()
     if not normalized:
-        raise ValueError("map_name must not be empty")
-    return f"map:{normalized}"
+        raise ValueError("memory name must not be empty")
+    return f"{normalized_type}:{normalized}"
+
+
+def _is_supported_memory_key(key: str) -> bool:
+    prefix, separator, name = key.partition(":")
+    return bool(separator and name.strip() and prefix.lower() in MEMORY_TYPES)
 
 
 def _empty_store() -> dict[str, Any]:

@@ -3,7 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
-from pokemon_agent.memory.world_state import GameMode, GameState, ItemStack, PartyMember, Position
+from pokemon_agent.memory.world_state import BattleOpponent, GameMode, GameState, ItemStack, PartyMember, Position
+
+
+PLAYER_FACING_DIRECTIONS = {
+    0x00: "down",
+    0x04: "up",
+    0x08: "left",
+    0x0C: "right",
+}
 
 
 class MemoryView(Protocol):
@@ -547,6 +555,7 @@ PARTY_NICKNAME_BASES = (0xD2B5, 0xD2C0, 0xD2CB, 0xD2D6, 0xD2E1, 0xD2EC)
 
 @dataclass(frozen=True)
 class PokemonRedRamMap:
+    player_facing: int = 0xC109
     current_map: int = 0xD35E
     player_y: int = 0xD361
     player_x: int = 0xD362
@@ -563,6 +572,13 @@ class PokemonRedRamMap:
     battle_type: int = 0xD057
     battle_kind: int = 0xD05A
     battle_turns: int = 0xCCD5
+    enemy_species: int = 0xCFE5
+    enemy_hp: int = 0xCFE6
+    enemy_status: int = 0xCFE9
+    enemy_type_1: int = 0xCFEA
+    enemy_type_2: int = 0xCFEB
+    enemy_level: int = 0xCFF3
+    enemy_max_hp: int = 0xCFF4
     menu_selection: int = 0xCC26
     start_menu_cursor: int = 0xCC2D
     money: int = 0xD347
@@ -605,8 +621,10 @@ class PokemonRedMemoryReader:
             map_id=map_id,
             map_name=POKEMON_RED_MAP_NAMES.get(map_id, f"Map {map_id:#04x}"),
             position=position,
+            facing=PLAYER_FACING_DIRECTIONS.get(int(raw["player_facing"])),
             mode=mode,
             in_battle=in_battle,
+            battle_opponent=self.read_battle_opponent(memory) if in_battle else None,
             dialog_open=dialog_open,
             player_name=self.read_player_name(memory),
             rival_name=self.read_rival_name(memory),
@@ -633,6 +651,7 @@ class PokemonRedMemoryReader:
         collision_ptr = self._read_u16_le(memory, addresses.collision_ptr_lo)
         dialog_text, dialog_box_detected = self._read_dialog(memory)
         return {
+            "player_facing": self._read_u8(memory, addresses.player_facing),
             "current_map": self._read_u8(memory, addresses.current_map),
             "player_y": self._read_u8(memory, addresses.player_y),
             "player_x": self._read_u8(memory, addresses.player_x),
@@ -681,6 +700,27 @@ class PokemonRedMemoryReader:
 
     def read_party_size(self, memory: MemoryView) -> int:
         return self._bounded_count(self._read_u8(memory, self.ram_map.party_count), maximum=6)
+
+    def read_battle_opponent(self, memory: MemoryView) -> BattleOpponent | None:
+        addresses = self.ram_map
+        species_id = self._read_u8(memory, addresses.enemy_species)
+        if species_id in {0x00, 0xFF}:
+            return None
+
+        type_1 = self._read_u8(memory, addresses.enemy_type_1)
+        type_2 = self._read_u8(memory, addresses.enemy_type_2)
+        types = [_type_name(type_1)]
+        if type_2 != type_1:
+            types.append(_type_name(type_2))
+
+        return BattleOpponent(
+            species=_species_name(species_id),
+            level=self._read_u8(memory, addresses.enemy_level),
+            hp=self._read_u16_be(memory, addresses.enemy_hp),
+            max_hp=self._read_u16_be(memory, addresses.enemy_max_hp),
+            status=_status_name(self._read_u8(memory, addresses.enemy_status)),
+            types=types,
+        )
 
     def read_party_pokemon(self, memory: MemoryView) -> list[PartyMember]:
         party: list[PartyMember] = []

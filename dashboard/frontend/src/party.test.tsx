@@ -41,6 +41,14 @@ describe("PartyRow", () => {
     expect(html).toContain("체력 23 / 23");
   });
 
+  it("places the sprite and Pokemon name in the same identity row", () => {
+    const html = renderToStaticMarkup(<PartyRow member={member("Bulbasaur", 1, 5, 20)} />);
+
+    expect(html).toContain('class="party-identity"');
+    expect(html).toMatch(/class="party-identity">.*<img.*class="party-name">/);
+    expect(html).toContain('title="Bulbasaur"');
+  });
+
   it("renders all six party members without an internal scroll viewport", () => {
     const party = [
       member("Bulbasaur", 1, 5, 20),

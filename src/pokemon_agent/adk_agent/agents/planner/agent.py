@@ -21,6 +21,7 @@ from pokemon_agent.adk_agent.agents.planner.schema import (
 )
 from pokemon_agent.adk_agent.agents.shared import (
     ConsoleTokenStream,
+    MAX_AUTOMATIC_FUNCTION_CALLS,
     TraceSink,
     emit_trace,
     event_finish_reason,
@@ -193,6 +194,7 @@ class GoogleAdkPlanner:
     last_finish_reason: str | None = field(init=False, default=None)
     last_thinking_summary: str | None = field(init=False, default=None)
     thinking_summary_callback: Callable[[str], None] | None = field(init=False, default=None, repr=False)
+    memory_activity_callback: Callable[[dict[str, Any]], None] | None = field(init=False, default=None, repr=False)
     memory_tool_activity: list[dict[str, Any]] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
@@ -209,6 +211,9 @@ class GoogleAdkPlanner:
         config_kwargs: dict[str, Any] = {
             "temperature": self.temperature,
             "maxOutputTokens": self.max_output_tokens,
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                maximum_remote_calls=MAX_AUTOMATIC_FUNCTION_CALLS,
+            ),
         }
         if self.thinking_budget is not None:
             config_kwargs["thinking_config"] = types.ThinkingConfig(
@@ -230,7 +235,13 @@ class GoogleAdkPlanner:
             description="Creates one bounded Pokemon Red direct action plan for one-shot execution as JSON.",
             instruction=SYSTEM_PROMPT,
             generate_content_config=generate_config,
-            tools=[build_search_memory_tool(self.memory_store, activity=self.memory_tool_activity)],
+            tools=[
+                build_search_memory_tool(
+                    self.memory_store,
+                    activity=self.memory_tool_activity,
+                    on_activity=self._publish_memory_activity,
+                )
+            ],
         )
         self.app = App(
             name=self.app_name,
@@ -248,6 +259,10 @@ class GoogleAdkPlanner:
             streaming_mode=StreamingMode.SSE if self.stream_output else StreamingMode.NONE,
         )
         self._session_created = False
+
+    def _publish_memory_activity(self, event: dict[str, Any]) -> None:
+        if self.memory_activity_callback is not None:
+            self.memory_activity_callback(dict(event))
 
     @classmethod
     def from_env(

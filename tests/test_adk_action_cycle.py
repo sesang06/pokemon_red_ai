@@ -132,7 +132,81 @@ def test_interpreter_context_contains_action_outcome_without_task_fields() -> No
     assert payload["last_result"]["status"] == "single_action_complete"
     assert "repeat" not in str(payload)
     assert "task" not in payload
+
+
+def test_interpreter_context_only_keeps_allowed_battle_opponent_fields() -> None:
+    current = observation(dialog_open=False)
+    current["state"].update(
+        {
+            "in_battle": True,
+            "mode": "battle",
+            "battle": {
+                "active": True,
+                "opponent": {
+                    "species": "Rattata",
+                    "level": 4,
+                    "hp": 9,
+                    "max_hp": 15,
+                    "status": "OK",
+                    "types": ["Normal"],
+                    "moves": ["Tackle"],
+                    "move_pp": [34],
+                },
+            },
+        }
+    )
+
+    payload = compact_interpreter_context({"observation": current})
+
+    assert payload["state"]["opponent"] == {
+        "species": "Rattata",
+        "level": 4,
+        "hp": 9,
+        "max_hp": 15,
+        "status": "OK",
+        "types": ["Normal"],
+    }
     assert "failed_preconditions" not in str(payload)
+
+
+def test_interpreter_context_includes_compact_dialog_and_party_memory_evidence() -> None:
+    current = observation(dialog_open=True)
+    current["state"].update(
+        {
+            "dialog_text": "So! You want BULBASAUR?",
+            "counts": {"party": 1},
+            "party": [
+                {
+                    "species": "Bulbasaur",
+                    "nickname": "BULBASAUR",
+                    "level": 5,
+                    "status": "OK",
+                    "hp": 19,
+                    "max_hp": 19,
+                }
+            ],
+        }
+    )
+
+    payload = compact_interpreter_context(
+        {
+            "step_count": 5,
+            "observation": current,
+            "active_action_plan": action_plan(),
+            "action_outcome": {"status": "single_action_complete"},
+            "state_diff": {},
+        }
+    )
+
+    assert payload["state"]["dialog_text"] == "So! You want BULBASAUR?"
+    assert payload["state"]["party"] == [
+        {
+            "species": "Bulbasaur",
+            "nickname": "BULBASAUR",
+            "level": 5,
+            "status": "OK",
+        }
+    ]
 
 
 def test_interpreter_context_keeps_compact_bounded_movement_result() -> None:

@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
@@ -60,8 +60,10 @@ export default function App() {
           <Card className="inspector-card">
             <ScrollArea className="inspector-scroll">
               <CardContent className="inspector-content">
-                <StatePanel state={state} />
-                <ActionPanel state={state} />
+                <div className="inspector-overview">
+                  <StatePanel state={state} />
+                  <ActionPanel state={state} />
+                </div>
                 <ThinkingPanel state={state} />
                 <MemoryPanel state={state} />
                 {debugMode && <DebugPanel state={state} />}
@@ -81,7 +83,7 @@ export default function App() {
   );
 }
 
-function Header({
+export function Header({
   state,
   connection,
   debugMode,
@@ -94,41 +96,48 @@ function Header({
 }) {
   const emulatorStatus = state?.emulator.status ?? "waiting";
   const runtime = formatDuration(state?.emulator.frame_index ?? 0, state?.emulator.fps ?? 60);
+  const currentStep = state?.agent.current_step ?? 0;
+  const maxSteps = state?.agent.max_steps;
   return (
-    <header className="topbar">
-      <div className="brand-block">
-        <span className="brand-mark" aria-hidden="true">R</span>
+    <header className="topbar-shell">
+      <Card className="topbar">
+      <CardHeader className="brand-block">
+        <Badge className="brand-mark" aria-hidden="true">R</Badge>
         <div>
-          <h1>포켓몬 레드</h1>
-          <span>실시간 디버거</span>
+          <CardTitle>포켓몬 레드</CardTitle>
+          <CardDescription>실시간 디버거</CardDescription>
         </div>
-      </div>
-      <div className="header-readouts">
+      </CardHeader>
+      <CardContent className="header-readouts">
         <Readout label="지도" value={state?.game.map_name ?? "신호 없음"} />
+        <Readout label="스텝" value={`${currentStep} / ${maxSteps ?? "--"}`} />
         <Readout label="에뮬레이터" value={statusText(emulatorStatus)} tone={emulatorStatus === "running" ? "ok" : "warn"} />
         <Readout label="실행 시간" value={runtime} />
         <Readout label="연결" value={statusText(connection)} tone={connection === "connected" ? "ok" : "error"} />
-      </div>
-      <Tabs
-        value={debugMode ? "debug" : "live"}
-        onValueChange={(value) => setDebugMode(value === "debug")}
-        className="mode-tabs"
-      >
-        <TabsList aria-label="점검 모드">
-          <TabsTrigger value="live">실시간</TabsTrigger>
-          <TabsTrigger value="debug"><Bug aria-hidden="true" /> 디버그</TabsTrigger>
-        </TabsList>
-      </Tabs>
+      </CardContent>
+      <CardFooter className="header-actions">
+        <Tabs
+          value={debugMode ? "debug" : "live"}
+          onValueChange={(value) => setDebugMode(value === "debug")}
+          className="mode-tabs"
+        >
+          <TabsList aria-label="점검 모드">
+            <TabsTrigger value="live">실시간</TabsTrigger>
+            <TabsTrigger value="debug"><Bug aria-hidden="true" /> 디버그</TabsTrigger>
+          </TabsList>
+        </Tabs>
+      </CardFooter>
+      </Card>
     </header>
   );
 }
 
 function Readout({ label, value, tone = "neutral" }: { label: string; value: string; tone?: string }) {
   return (
-    <div className={`readout ${tone}`}>
-      <span>{label}</span>
-      <Badge variant="outline" className="readout-value">{value}</Badge>
-    </div>
+    <CardHeader className={`readout ${tone}`}>
+      <CardDescription>{label}</CardDescription>
+      <CardTitle><Badge variant="outline" className="readout-value">{value}</Badge></CardTitle>
+    </CardHeader>
   );
 }
 
@@ -139,11 +148,11 @@ export function GameViewport({ state }: { state: LiveState | null }) {
     <Card className="panel viewport-panel">
       <PanelHeader icon={<Gamepad2 size={15} />} title="게임 화면" meta={state ? `프레임 ${pad(state.emulator.frame_index, 8)}` : "대기 중"} />
       <div className="viewport-stage viewport-stage-dual">
-        <ViewportFeed label="현재 화면" imageUrl={screenshotUrl} alt="실시간 포켓몬 레드 게임 화면" />
+        <ViewportFeed primary label="현재 화면" imageUrl={screenshotUrl} alt="실시간 포켓몬 레드 게임 화면" />
         <div className="viewport-side-column">
           <ViewportFeed compact label="충돌 영역 + 월드 좌표" imageUrl={overlayUrl} alt="실시간 충돌 영역과 월드 좌표 오버레이" />
-          <PartyPanel state={state} />
         </div>
+        <PartyPanel state={state} />
       </div>
     </Card>
   );
@@ -154,14 +163,16 @@ function ViewportFeed({
   imageUrl,
   alt,
   compact = false,
+  primary = false,
 }: {
   label: string;
   imageUrl: string | null;
   alt: string;
   compact?: boolean;
+  primary?: boolean;
 }) {
   return (
-    <div className={`viewport-feed${compact ? " viewport-feed-compact" : ""}`}>
+    <div className={`viewport-feed${compact ? " viewport-feed-compact" : ""}${primary ? " viewport-feed-primary" : ""}`}>
       <div className="viewport-feed-label"><span>{label}</span><i aria-hidden="true" /></div>
       <div className="game-frame">
         {imageUrl ? (
@@ -176,26 +187,25 @@ function ViewportFeed({
 
 export function StatePanel({ state }: { state: LiveState | null }) {
   const game = state?.game;
-  const cells: Array<[string, unknown]> = [
-    ["지도", game?.map_name],
-    ["지도 ID", game?.map_id],
-    ["현재 좌표", pointText(game?.position)],
-    ["바라보는 방향", directionText(game?.facing)],
-    ["게임 모드", modeText(game?.mode)],
-    ["대화", game?.dialog_open ? "열림" : "닫힘"],
-    ["전투", game?.in_battle ? "진행 중" : "없음"],
-    ["파티", `${game?.party.length ?? 0} / 6`],
+  const cells: Array<[string, unknown, boolean?]> = [
+    ["지도", game?.map_name, true],
+    ["좌표", pointText(game?.position)],
+    ["방향", directionText(game?.facing)],
+    ["상태", gameStatusText(game)],
     ["배지", `${game?.badges?.length ?? 0} / 8`],
   ];
   return (
     <InspectorSection title="현재 상태">
       <dl className="state-grid">
-        {cells.map(([label, value]) => (
-          <div className="state-cell" key={label}>
-            <dt>{label}</dt>
-            <dd>{displayValue(value)}</dd>
-          </div>
-        ))}
+        {cells.map(([label, value, wide]) => {
+          const text = displayValue(value);
+          return (
+            <div className={`state-cell${wide ? " state-cell-wide" : ""}`} key={label}>
+              <dt>{label}</dt>
+              <dd title={text}>{text}</dd>
+            </div>
+          );
+        })}
       </dl>
       {game?.dialog_open && game.dialog_text && (
         <div className="dialog-readout"><Badge variant="outline">대화</Badge>{game.dialog_text}</div>
@@ -266,11 +276,16 @@ export function PartyRow({ member }: { member: PartyMember }) {
   const hpPercent = member.hp !== null && member.max_hp ? Math.max(0, Math.min(100, member.hp / member.max_hp * 100)) : 0;
   return (
     <div className="party-row">
-      <div className="sprite-box">
-        {sprite ? <img src={sprite} alt={`${member.species} 1세대 스프라이트`} onError={() => setFailed(true)} /> : <span>?</span>}
+      <div className="party-identity">
+        <div className="sprite-box">
+          {sprite ? <img src={sprite} alt={`${member.species} 1세대 스프라이트`} onError={() => setFailed(true)} /> : <span>?</span>}
+        </div>
+        <div className="party-name">
+          <strong title={member.nickname || member.species}>{member.nickname || member.species}</strong>
+          <span>레벨 {member.level ?? "?"}</span>
+        </div>
       </div>
       <div className="party-data">
-        <div><strong>{member.nickname || member.species}</strong><span>레벨 {member.level ?? "?"}</span></div>
         <div className="hp-line"><span>체력 {member.hp ?? "?"} / {member.max_hp ?? "?"}</span><span>{member.status || "정상"}</span></div>
         <Progress className="hp-track" value={hpPercent} aria-label={`${member.nickname || member.species} 체력`} />
       </div>
@@ -284,10 +299,13 @@ function MemoryPanel({ state }: { state: LiveState | null }) {
   return (
     <InspectorSection title="장기 기억" icon={<MemoryStick size={14} />}>
       {activity && (
-        <div className="memory-activity"><Badge variant="secondary">{memoryActivityText(activity.type)}</Badge>{activity.keys.join(", ")}</div>
+        <div className="memory-activity">
+          <Badge variant="secondary">{memoryActivityText(activity.type)}</Badge>
+          <span className="memory-activity-keys">{activity.keys.join(", ")}</span>
+        </div>
       )}
       <div className="memory-list">
-        {recent.length ? recent.slice(0, 3).map((item) => (
+        {recent.length ? recent.slice(0, 5).map((item) => (
           <div key={item.key}><strong>{item.key}</strong><span>{formatMemoryValue(item.value)}</span></div>
         )) : <EmptyLine value="기억 활동이 없습니다" />}
       </div>
@@ -468,6 +486,14 @@ function modeText(value: string | null | undefined): string {
     unknown: "알 수 없음",
   };
   return value ? labels[value.toLowerCase()] ?? value : "--";
+}
+
+function gameStatusText(game: LiveState["game"] | null | undefined): string {
+  const mode = game?.mode?.toLowerCase();
+  if (game?.in_battle || mode === "battle") return "전투";
+  if (game?.dialog_open || mode === "dialog" || mode === "talk") return "대화";
+  if (mode === "menu" || mode === "inventory") return "메뉴";
+  return modeText(game?.mode);
 }
 
 function statusText(value: string): string {

@@ -196,8 +196,8 @@ class PokemonSession:
 
         self.paths.state_dir.mkdir(parents=True, exist_ok=True)
         with self._env_lock:
-            self.window = window
-            self.env = self._env_factory(self.paths.rom, window)
+            self.window = "qt" if control_ui and window == "SDL2" else window
+            self.env = self._env_factory(self.paths.rom, self.window)
             self._previous_state_snapshot = None
             self._blocked_world_edges.clear()
             self._navigation_attempt_index = 0
@@ -746,14 +746,7 @@ class PokemonSession:
             if target_out_of_visible_area:
                 result["target_out_of_visible_area"] = True
 
-            after_position = _position_from_observation(result.get("after_observation", {}))
-            if (
-                result.get("stop_reason") == "target_reached"
-                and not result.get("executed_actions")
-                and after_position != requested_world_cell
-            ):
-                result["stop_reason"] = "no_path"
-
+            resolved_world = None
             resolved_walk = result.get("resolved_target", {}).get("walk_cell")
             if isinstance(resolved_walk, dict):
                 resolved_world = walk_cell_to_map_position(
@@ -761,6 +754,18 @@ class PokemonSession:
                     player_position,
                 )
                 result["resolved_world_cell"] = grid_point_dict(resolved_world)
+            after_position = _position_from_observation(result.get("after_observation", {}))
+            result["requested_target_reached"] = _same_position(after_position, requested_world_cell)
+            result["resolved_target_reached"] = (
+                resolved_world is not None and _same_position(after_position, resolved_world)
+            )
+            if (
+                target_out_of_visible_area
+                and result.get("stop_reason") == "target_reached"
+                and not result.get("executed_actions")
+                and not result["requested_target_reached"]
+            ):
+                result["stop_reason"] = "no_path"
             result["planned_path"] = [
                 grid_point_dict(
                     walk_cell_to_map_position(
@@ -822,13 +827,13 @@ class PokemonSession:
 
             for direction in directions[:MAX_MOVE_PATH_STEPS]:
                 current = self.observe(refresh_control_panel=False)
+                if world_goal is not None and _position_from_observation(current) == world_goal:
+                    stop_reason = "target_reached"
+                    break
+
                 interruption = _interruption_reason(current)
                 if interruption is not None:
                     stop_reason = interruption
-                    break
-
-                if world_goal is not None and _position_from_observation(current) == world_goal:
-                    stop_reason = "target_reached"
                     break
 
                 before_step_position = _position_from_observation(current)
@@ -860,6 +865,10 @@ class PokemonSession:
                         break
 
                 after_step = self.observe(refresh_control_panel=False)
+                after_step_position = _position_from_observation(after_step)
+                if world_goal is not None and after_step_position == world_goal:
+                    stop_reason = "target_reached"
+                    break
                 interruption = _interruption_reason(after_step)
                 if interruption is not None:
                     stop_reason = interruption
@@ -869,16 +878,12 @@ class PokemonSession:
                     if stop_reason == "movement_blocked":
                         self._record_blocked_world_edge(current, direction)
                     break
-                after_step_position = _position_from_observation(after_step)
                 if before_step_position is not None and after_step_position == before_step_position:
                     if _controls_locked(after_step):
                         stop_reason = "controls_locked"
                     else:
                         self._record_blocked_world_edge(current, direction)
                         stop_reason = "movement_blocked"
-                    break
-                if world_goal is not None and _position_from_observation(after_step) == world_goal:
-                    stop_reason = "target_reached"
                     break
             else:
                 if len(executed_actions) < len(directions):
@@ -1122,7 +1127,7 @@ def _game_state_dict(state: GameState) -> dict[str, Any]:
     last_map_id = _int_or_none(raw.get("last_map"))
     block_position = _position_dict(raw.get("player_x_block"), raw.get("player_y_block"))
     dialog_text = state.dialog_text
-    return {
+    payload = {
         "map_id": state.map_id,
         "map_name": state.map_name,
         "position": None if state.position is None else {"x": state.position.x, "y": state.position.y},
@@ -1171,12 +1176,6 @@ def _game_state_dict(state: GameState) -> dict[str, Any]:
             "has_text": bool(dialog_text),
             "text_length": 0 if dialog_text is None else len(dialog_text),
         },
-        "battle": {
-            "active": state.in_battle,
-            "type": _int_or_none(raw.get("battle_type")),
-            "kind": _int_or_none(raw.get("battle_kind")),
-            "turns": _int_or_none(raw.get("battle_turns")),
-        },
         "menu": {
             "active": state.mode == GameMode.INVENTORY,
             "selection": _int_or_none(raw.get("menu_selection")),
@@ -1192,6 +1191,24 @@ def _game_state_dict(state: GameState) -> dict[str, Any]:
         "raw": raw,
         "summary": state.summary(),
     }
+    if state.in_battle:
+        battle: dict[str, Any] = {
+            "active": True,
+            "type": _int_or_none(raw.get("battle_type")),
+            "kind": _int_or_none(raw.get("battle_kind")),
+            "turns": _int_or_none(raw.get("battle_turns")),
+        }
+        if state.battle_opponent is not None:
+            battle["opponent"] = {
+                "species": state.battle_opponent.species,
+                "level": state.battle_opponent.level,
+                "hp": state.battle_opponent.hp,
+                "max_hp": state.battle_opponent.max_hp,
+                "status": state.battle_opponent.status,
+                "types": list(state.battle_opponent.types),
+            }
+        payload["battle"] = battle
+    return payload
 
 
 def _visible_world_cells(position: Position | None, walk_area_collision: list[list[int]]) -> list[list[dict[str, Any]]]:
@@ -1446,6 +1463,15 @@ def _position_from_observation(observation: dict[str, Any]) -> Position | None:
     if position is None:
         return None
     return Position(x=int(position["x"]), y=int(position["y"]))
+
+
+def _same_position(left: Any, right: Any) -> bool:
+    return bool(
+        left is not None
+        and right is not None
+        and int(left.x) == int(right.x)
+        and int(left.y) == int(right.y)
+    )
 
 
 def _world_goal_from_observation(observation: dict[str, Any], target_walk_cell: Any) -> Position | None:
