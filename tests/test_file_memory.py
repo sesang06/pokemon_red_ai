@@ -58,6 +58,60 @@ def test_file_memory_overwrites_the_single_entry_for_an_identity(tmp_path: Path)
     assert store.get("npc", "Professor Oak")["value"] == "offers a starter in the lab"
 
 
+def test_file_memory_writes_a_valid_batch_atomically(tmp_path: Path, monkeypatch) -> None:
+    store = FileLongTermMemory(tmp_path / "memory.json")
+    writes = 0
+    real_write = store._write_store
+
+    def count_write(payload):
+        nonlocal writes
+        writes += 1
+        real_write(payload)
+
+    monkeypatch.setattr(store, "_write_store", count_write)
+    keys = store.remember_many(
+        [
+            {"memory_type": "map", "name": "Oak's Lab", "value": "exit at [5,11]"},
+            {"memory_type": "npc", "name": "Professor Oak", "value": "stands near [5,2]"},
+        ],
+        source="test",
+    )
+
+    assert writes == 1
+    assert keys == ["map:Oak's Lab", "npc:Professor Oak"]
+    assert set(store.items()) == set(keys)
+
+
+def test_file_memory_rejects_entire_invalid_batch_before_writing(tmp_path: Path) -> None:
+    store = FileLongTermMemory(tmp_path / "memory.json")
+    store.remember("map", "Pallet Town", "north exit", source="test")
+
+    with pytest.raises(ValueError):
+        store.remember_many(
+            [
+                {"memory_type": "npc", "name": "Professor Oak", "value": "runs the lab"},
+                {"memory_type": "item", "name": "Potion", "value": "unsupported"},
+            ]
+        )
+
+    assert list(store.items()) == ["map:Pallet Town"]
+
+
+def test_file_memory_batch_merge_preserves_distinct_existing_facts(tmp_path: Path) -> None:
+    store = FileLongTermMemory(tmp_path / "memory.json")
+    store.remember("map", "Oak's Lab", "Professor Oak stands near [5,2].", source="test")
+
+    store.remember_many(
+        [{"memory_type": "map", "name": "Oak's Lab", "value": "The exit is at [5,11]."}],
+        source="result_interpreter",
+        merge_existing=True,
+    )
+
+    assert store.get("map", "Oak's Lab")["value"] == (
+        "Professor Oak stands near [5,2].\nThe exit is at [5,11]."
+    )
+
+
 def test_file_memory_keeps_supported_namespaces_and_hides_unknown_keys(tmp_path: Path) -> None:
     path = tmp_path / "memory.json"
     path.write_text(

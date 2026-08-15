@@ -20,7 +20,7 @@ dev = [
 ]
 
 [project.scripts]
-fixed-pokered = "pokemon_agent.fixed_pokered:main"
+pokemon-play = "pokemon_agent.cli.manual_play:main"
 pokemon-agent = "pokemon_agent.app:main"
 pokemon-adk = "pokemon_agent.adk_agent.runner:main"
 pokemon-mcp = "pokemon_agent.mcp_server:main"

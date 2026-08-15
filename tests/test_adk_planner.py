@@ -118,12 +118,13 @@ def test_adk_planner_uses_sse_streaming_by_default() -> None:
         planner.app.events_compaction_config.token_threshold
         == DEFAULT_COMPACTION_TOKEN_THRESHOLD
     )
-    assert planner.app.events_compaction_config.event_retention_size == 20
+    assert planner.app.events_compaction_config.event_retention_size == 8
     assert planner.agent.generate_content_config.thinking_config.include_thoughts is True
     assert (
         planner.agent.generate_content_config.automatic_function_calling.maximum_remote_calls
         == MAX_AUTOMATIC_FUNCTION_CALLS
     )
+    assert MAX_AUTOMATIC_FUNCTION_CALLS == 4
     assert planner.agent.generate_content_config.response_mime_type is None
     planner_tool_names = {
         getattr(tool, "name", getattr(tool, "__name__", "")) for tool in planner.agent.tools
@@ -140,7 +141,7 @@ def test_adk_planner_uses_sse_streaming_by_default() -> None:
     interpreter_tool_names = {
         getattr(tool, "name", getattr(tool, "__name__", "")) for tool in interpreter.agent.tools
     }
-    assert interpreter_tool_names == {"search_memory", "save_memory"}
+    assert interpreter_tool_names == {"save_memory"}
 
 
 def test_adk_planner_prints_partial_tokens_and_parses_final_json(capsys) -> None:
@@ -340,7 +341,7 @@ def test_turn_compaction_runs_at_five_turn_intervals_with_one_turn_overlap() -> 
     assert DEFAULT_COMPACTION_INTERVAL == 5
     assert DEFAULT_COMPACTION_OVERLAP_SIZE == 1
     assert DEFAULT_COMPACTION_TOKEN_THRESHOLD > 0
-    assert DEFAULT_EVENT_RETENTION_SIZE == 20
+    assert DEFAULT_EVENT_RETENTION_SIZE == 8
     assert before_interval == []
     assert before_second_interval == []
     assert len(first) == 1
@@ -472,7 +473,10 @@ def test_planner_payload_removes_observation_blobs_from_history() -> None:
     assert "base64" not in serialized
     assert "before_observation" not in serialized
     assert "after_observation" not in serialized
-    assert payload["recent_state_transitions"][0]["after"]["position"] == {"x": 5, "y": 6}
+    transition = payload["recent_state_transitions"][0]
+    assert transition["state"]["position"] == {"x": 5, "y": 6}
+    assert "before" not in transition
+    assert "after" not in transition
 
 
 def test_planner_payload_compacts_last_action_plan_and_outcome() -> None:

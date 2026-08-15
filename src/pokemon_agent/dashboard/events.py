@@ -228,16 +228,16 @@ class LiveEventHub:
         items: dict[str, dict[str, Any]],
         activity: dict[str, Any],
     ) -> None:
-        key = str(activity.get("key") or "").strip()
-        if not key:
+        keys = [str(key).strip() for key in activity.get("keys", []) if str(key).strip()]
+        if not keys:
             return
         with self._lock:
             self._state["memory"]["last_activity"] = {
                 "type": str(activity.get("tool") or activity.get("phase") or "memory"),
-                "keys": [key],
+                "keys": keys,
                 "at": now_iso(),
             }
-            self._state["memory"]["recent"] = memory_recent(items, priority_keys=[key])
+            self._state["memory"]["recent"] = memory_recent(items, priority_keys=keys)
             self._state["updated_at"] = now_iso()
             self._emit_state_if_due(force=True)
 

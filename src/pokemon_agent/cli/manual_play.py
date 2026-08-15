@@ -3,12 +3,8 @@ from __future__ import annotations
 import argparse
 import logging
 import shutil
-import sys
 from dataclasses import dataclass
 from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pokemon_agent.app import run_rom
 from pokemon_agent.emulator.pyboy_env import PyBoyEnvironment
@@ -17,18 +13,18 @@ from pokemon_agent.vision.capture import CaptureConfig
 
 
 @dataclass(frozen=True)
-class FixedPokeredPaths:
+class ManualPlayPaths:
     project_root: Path
     rom: Path
     fixed_state: Path
     pyboy_hotkey_state: Path
 
 
-def default_paths() -> FixedPokeredPaths:
-    source_root = Path(__file__).resolve().parents[2]
+def default_paths() -> ManualPlayPaths:
+    source_root = Path(__file__).resolve().parents[3]
     project_root = Path.cwd() if (Path.cwd() / "src" / "pokered.gb").exists() else source_root
     rom = project_root / "src" / "pokered.gb"
-    return FixedPokeredPaths(
+    return ManualPlayPaths(
         project_root=project_root,
         rom=rom,
         fixed_state=project_root / "states" / "fixed_start.state",
@@ -36,7 +32,7 @@ def default_paths() -> FixedPokeredPaths:
     )
 
 
-def ensure_fixed_state(paths: FixedPokeredPaths, force_boot_state: bool = False) -> Path:
+def ensure_fixed_state(paths: ManualPlayPaths, force_boot_state: bool = False) -> Path:
     if not paths.rom.exists():
         raise SystemExit(f"ROM not found: {paths.rom}")
 
@@ -61,7 +57,7 @@ def ensure_fixed_state(paths: FixedPokeredPaths, force_boot_state: bool = False)
     return paths.fixed_state
 
 
-def fix_current_state(paths: FixedPokeredPaths) -> Path:
+def fix_current_state(paths: ManualPlayPaths) -> Path:
     if not paths.pyboy_hotkey_state.exists():
         raise SystemExit(
             "No PyBoy hotkey state found. Run the emulator, press Z to save, "

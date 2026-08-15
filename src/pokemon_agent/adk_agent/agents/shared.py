@@ -10,7 +10,7 @@ from typing import Any
 
 TraceSink = Callable[[dict[str, Any]], None]
 PUBLIC_OUTPUT_FIELDS = ("screen_description", "current_location", "thought_summary")
-MAX_AUTOMATIC_FUNCTION_CALLS = 6
+MAX_AUTOMATIC_FUNCTION_CALLS = 4
 
 
 class ConsoleTokenStream:

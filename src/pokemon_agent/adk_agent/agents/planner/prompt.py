@@ -18,7 +18,7 @@ Read these inputs carefully:
 - canonical CURRENT GAME STATE from RAM, without duplicate summary/debug fields
 - the previous action plan and its deterministic outcome
 - at most two recent state transitions
-- relevant `search_memory` tool results for the current map, named NPCs, Pokemon species, and active story events
+- one batched `search_memory` result for the current map, named NPCs, Pokemon species, and active story events
 - compact world-map context in overworld mode and dialog/battle/menu detail only while that mode is active
 - latest screenshot and latest collision/world-coordinate overlay
 
@@ -26,7 +26,9 @@ The JSON is Planner Context, not executor debug state. Python retains collision 
 and full execution history separately. Do not ask for omitted raw fields or reconstruct low-level routes yourself.
 
 Memory tool contract:
-- Call `search_memory(memory_type="map", name=state.map_name)` when `state.map_name` is available.
+- Call `search_memory(queries=[{"memory_type":"map","name":state.map_name}, ...])` exactly once when at least one
+  relevant identity is available. Put the current map and every other relevant NPC, Pokemon, or event identity in that
+  same `queries` array. Do not make separate searches.
 - The only valid `memory_type` values are `map`, `npc`, `pokemon`, and `event`. The tool generates keys internally as
   `<memory_type>:<name>`; never construct or pass a raw key.
 - Also search a relevant `npc` when a canonical NPC name is visible or present in dialog/action context, a relevant
@@ -34,9 +36,8 @@ Memory tool contract:
   story interaction has a stable concise name such as `starter_selection`. Do not search guessed or unnamed entities.
 - Use canonical names consistently: `Professor Oak`, `Bulbasaur`, and lower_snake_case event names. Limit searches to
   entities that can affect the next action rather than loading unrelated memory.
-- During one Planner invocation, search each exact `(memory_type, name)` identity at most once. A tool result with
-  `found=false` still completes that search. Never repeat the same call after receiving its result, and never call a
-  tool merely to restate a result already present in the current tool context.
+- During one Planner invocation, include each exact `(memory_type, name)` identity at most once in the batch. A result
+  with `found=false` still completes that search. Never call `search_memory` a second time during the invocation.
 - Tool calls are an intermediate step, not the final answer. After the relevant searches finish, stop calling tools and
   emit the required four-field ActionPlan JSON. Do not emit a prose draft alongside a tool call.
 - Map memory contains verified world-coordinate routes, traversable coordinate sequences, blocked edges, landmarks,

@@ -161,7 +161,7 @@ def test_memory_activity_immediately_prioritizes_latest_loaded_value() -> None:
 
     hub.publish_memory_activity(
         items,
-        {"tool": "search_memory", "key": "npc:Professor Oak"},
+        {"tool": "search_memory", "keys": ["npc:Professor Oak"]},
     )
     hub.publish_memory_snapshot(items)
 

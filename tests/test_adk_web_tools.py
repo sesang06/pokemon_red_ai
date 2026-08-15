@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from pokemon_agent import mcp_server
@@ -13,14 +14,23 @@ from pokemon_agent.input_contract import (
     MAX_WORLD_NAVIGATION_SEGMENTS,
 )
 from pokemon_agent.adk_agent.runtime.state import FileAgentRuntimeState
+from pokemon_agent.adk_agent.agent import app as entrypoint_app
+from pokemon_agent.adk_agent.agent import root_agent as entrypoint_root_agent
 from pokemon_agent.adk_agent.web import tools as web_tools
 from pokemon_agent.adk_agent.web.app import app, build_app, build_root_agent
+from pokemon_agent.adk_agent.web.prompt import WEB_AGENT_PROMPT
 import pokemon_agent.adk_agent.runtime.state as runtime_state_module
 from pokemon_agent.memory.file_memory import FileLongTermMemory
 import pokemon_agent.session as session_module
 from pokemon_agent.session import PokemonSession
 
 from tests.fakes import FakePokemonEnvironment, fake_session_paths
+
+
+def test_adk_dev_ui_entrypoint_exports_the_compacted_team_app() -> None:
+    assert entrypoint_app.name == "adk_agent"
+    assert entrypoint_app.root_agent is entrypoint_root_agent
+    assert entrypoint_root_agent.name == "pokemon_red_team"
 
 
 def test_adk_web_tools_observe_returns_compact_screenshot(tmp_path: Path) -> None:
@@ -141,14 +151,24 @@ def test_adk_web_memory_tools_support_validated_memory_types(tmp_path: Path, mon
     store = FileLongTermMemory(tmp_path / "long_term_memory.json")
     monkeypatch.setattr(web_tools, "_memory_store", lambda: store)
 
-    write_result = web_tools.save_memory("event", "starter_selection", "Bulbasaur was chosen")
-    search_result = web_tools.search_memory("event", "starter_selection")
+    write_result = web_tools.save_memory(
+        entries=[
+            {"memory_type": "event", "name": "starter_selection", "value": "Bulbasaur was chosen"},
+            {"memory_type": "pokemon", "name": "Bulbasaur", "value": "chosen as starter"},
+        ]
+    )
+    search_result = web_tools.search_memory(
+        queries=[
+            {"memory_type": "event", "name": "starter_selection"},
+            {"memory_type": "pokemon", "name": "Bulbasaur"},
+        ]
+    )
 
     assert write_result["phase"] == "memory_write"
-    assert write_result["key"] == "event:starter_selection"
-    assert search_result["key"] == "event:starter_selection"
-    assert search_result["item"]["value"] == "Bulbasaur was chosen"
-    assert list(store.items()) == ["event:starter_selection"]
+    assert write_result["keys"] == ["event:starter_selection", "pokemon:Bulbasaur"]
+    assert search_result["keys"] == ["event:starter_selection", "pokemon:Bulbasaur"]
+    assert search_result["results"][0]["item"]["value"] == "Bulbasaur was chosen"
+    assert set(store.items()) == {"event:starter_selection", "pokemon:Bulbasaur"}
 
 
 def test_adk_web_tools_read_shared_cli_runtime_history(tmp_path: Path, monkeypatch) -> None:
@@ -171,6 +191,100 @@ def test_adk_web_tools_read_shared_cli_runtime_history(tmp_path: Path, monkeypat
     assert status["phase"] == "executed"
     assert status["step_count"] == 7
     assert actions["actions"] == [{"step": 7}]
+
+
+def test_adk_web_starts_exact_cli_runner_once(tmp_path: Path, monkeypatch) -> None:
+    class FakeProcess:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    runner_state = web_tools._AgentRunnerProcess()
+    log_path = tmp_path / "runner.log"
+    captured: dict[str, object] = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["cwd"] = kwargs["cwd"]
+        captured["stderr"] = kwargs["stderr"]
+        captured["stdout_path"] = kwargs["stdout"].name
+        return FakeProcess()
+
+    monkeypatch.setattr(web_tools, "_AGENT_RUNNER", runner_state)
+    monkeypatch.setattr(web_tools, "_runner_log_path", lambda started_at: log_path)
+    monkeypatch.setattr(web_tools.subprocess, "Popen", fake_popen)
+
+    started = web_tools.start_agent_runner(steps=100)
+    repeated = web_tools.start_agent_runner(steps=200)
+
+    assert captured["command"] == [
+        web_tools.sys.executable,
+        "-m",
+        "pokemon_agent.adk_agent.runner",
+        "--steps",
+        "100",
+        "--objective",
+        "complete_pokemon_red",
+    ]
+    assert captured["cwd"] == str(web_tools.PROJECT_ROOT)
+    assert captured["stderr"] is subprocess.STDOUT
+    assert Path(str(captured["stdout_path"])) == log_path
+    assert started["started"] is True
+    assert started["pid"] == 4242
+    assert started["defaults"] == {
+        "window": "SDL2",
+        "control_ui": True,
+        "realtime_ticks": True,
+        "vision": True,
+        "thinking_budget": -1,
+        "checkpoint_every": 10,
+    }
+    assert repeated["started"] is False
+    assert repeated["already_running"] is True
+    assert repeated["steps"] == 100
+
+
+def test_adk_web_runner_status_reports_progress_and_log(tmp_path: Path, monkeypatch) -> None:
+    class CompletedProcess:
+        pid = 4242
+
+        def poll(self):
+            return 0
+
+    runtime_store = FileAgentRuntimeState(tmp_path / "runtime.json")
+    runtime_store.publish(
+        {
+            "step_count": 100,
+            "mode": "overworld",
+            "done": True,
+            "termination_reason": "max_steps_reached",
+        },
+        phase="completed",
+    )
+    log_path = tmp_path / "runner.log"
+    log_path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    runner_state = web_tools._AgentRunnerProcess()
+    runner_state.process = CompletedProcess()
+    runner_state.metadata = {
+        "pid": 4242,
+        "steps": 100,
+        "objective": "complete_pokemon_red",
+        "started_at": "2026-08-15T17:00:00",
+        "log_path": str(log_path),
+    }
+    monkeypatch.setattr(web_tools, "_AGENT_RUNNER", runner_state)
+    monkeypatch.setattr(web_tools, "_runtime_store", lambda: runtime_store)
+
+    status = web_tools.agent_runner_status(log_lines=2)
+
+    assert status["status"] == "completed"
+    assert status["running"] is False
+    assert status["return_code"] == 0
+    assert status["progress"]["step_count"] == 100
+    assert status["progress"]["max_steps"] == 100
+    assert status["progress"]["termination_reason"] == "max_steps_reached"
+    assert status["log_tail"] == ["two", "three"]
 
 
 def test_recent_agent_actions_is_capped_at_twenty_turns(tmp_path: Path, monkeypatch) -> None:
@@ -223,11 +337,30 @@ def test_adk_web_root_agent_exposes_only_llm_decision_sub_agents() -> None:
         for tool in root_agent.sub_agents[1].tools
     }
     assert "search_memory" in planner_tools
-    assert {"search_memory", "save_memory"} <= interpreter_tools
+    assert interpreter_tools == {"observe_game", "recent_game_commands", "save_memory"}
     tool_names = {getattr(tool, "name", getattr(tool, "__name__", "")) for tool in root_agent.tools}
-    assert {"agent_runtime_status", "recent_agent_actions", "buttons", "move", "wait"} <= tool_names
+    assert {
+        "start_agent_runner",
+        "agent_runner_status",
+        "agent_runtime_status",
+        "recent_agent_actions",
+        "buttons",
+        "move",
+        "wait",
+    } <= tool_names
+    assert "start_agent_runner" not in planner_tools
+    assert "agent_runner_status" not in planner_tools
     assert "run_rule_based_step" not in tool_names
     assert "run_team_step" not in tool_names
+
+
+def test_adk_web_prompt_routes_bounded_play_requests_to_cli_runner() -> None:
+    assert "in any language" in WEB_AGENT_PROMPT
+    assert "start_agent_runner(steps=<requested count>)" in WEB_AGENT_PROMPT
+    assert "exactly once" in WEB_AGENT_PROMPT
+    assert "pokemon_agent.adk_agent.runner" in WEB_AGENT_PROMPT
+    assert "Do not imitate a multi-step run" in WEB_AGENT_PROMPT
+    assert "agent_runner_status" in WEB_AGENT_PROMPT
 
 
 def test_adk_web_exports_compacted_app() -> None:
@@ -239,7 +372,7 @@ def test_adk_web_exports_compacted_app() -> None:
     assert configured.events_compaction_config.compaction_interval == 5
     assert configured.events_compaction_config.overlap_size == 1
     assert configured.events_compaction_config.token_threshold is not None
-    assert configured.events_compaction_config.event_retention_size == 20
+    assert configured.events_compaction_config.event_retention_size == 8
     for agent in (configured.root_agent, *configured.root_agent.sub_agents):
         assert (
             agent.generate_content_config.automatic_function_calling.maximum_remote_calls
@@ -266,7 +399,9 @@ def test_adk_web_planning_prompt_documents_direct_action_contract() -> None:
     assert "RAM/GameState" in PLANNING_AGENT_PROMPT
     assert "repeat_until" not in PLANNING_AGENT_PROMPT
     assert "max_repeats" not in PLANNING_AGENT_PROMPT
-    assert 'search_memory(memory_type="map", name=state.map_name)' in PLANNING_AGENT_PROMPT
+    assert 'search_memory(queries=[{"memory_type":"map","name":state.map_name}, ...])' in PLANNING_AGENT_PROMPT
+    assert "Never call `search_memory` a second time" in PLANNING_AGENT_PROMPT
+    assert "save_memory(entries=" in RESULT_INTERPRETER_PROMPT
     for memory_type in ("map", "npc", "pokemon", "event"):
         assert f"`{memory_type}`" in PLANNING_AGENT_PROMPT
     assert "<memory_type>:<name>" in PLANNING_AGENT_PROMPT

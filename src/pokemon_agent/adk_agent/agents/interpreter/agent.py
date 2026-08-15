@@ -10,7 +10,6 @@ from typing import Any
 
 from pokemon_agent.adk_agent.agents.memory_tools import (
     build_save_memory_tool,
-    build_search_memory_tool,
 )
 from pokemon_agent.adk_agent.agents.interpreter.schema import ResultSummarizer
 from pokemon_agent.adk_agent.agents.planner.agent import DEFAULT_ADK_MODEL
@@ -300,8 +299,8 @@ def _movement_result_for_interpreter(
     return {key: value for key, value in values.items() if value is not None}
 
 
-def _compact_state_changes(state_diff: dict[str, Any]) -> list[dict[str, Any]]:
-    changes: list[dict[str, Any]] = []
+def _compact_state_changes(state_diff: dict[str, Any]) -> list[str]:
+    changes: list[str] = []
     seen: set[str] = set()
     events = state_diff.get("events") if isinstance(state_diff.get("events"), list) else []
     for event in events:
@@ -310,27 +309,19 @@ def _compact_state_changes(state_diff: dict[str, Any]) -> list[dict[str, Any]]:
         field = _event_field(str(event.get("type") or ""))
         if not field or field in seen:
             continue
-        entry: dict[str, Any] = {"field": field}
-        before = _change_value(field, event.get("from"))
-        after = _change_value(field, event.get("to"))
-        if before is not None or after is not None:
-            entry.update({"from": before, "to": after})
-        changes.append(entry)
+        changes.append(field)
         seen.add(field)
 
     changed_fields = state_diff.get("changes") if isinstance(state_diff.get("changes"), dict) else {}
-    before_state = state_diff.get("before") if isinstance(state_diff.get("before"), dict) else {}
-    after_state = state_diff.get("after") if isinstance(state_diff.get("after"), dict) else {}
     for raw_field, changed in changed_fields.items():
-        field = "map" if raw_field == "map_id" else str(raw_field)
+        field = {
+            "map_id": "map",
+            "dialog_open": "dialog",
+            "in_battle": "battle",
+        }.get(str(raw_field), str(raw_field))
         if not changed or field in seen:
             continue
-        entry = {"field": field}
-        before = _change_value(field, before_state.get("map_name") if field == "map" else before_state.get(raw_field))
-        after = _change_value(field, after_state.get("map_name") if field == "map" else after_state.get(raw_field))
-        if before is not None or after is not None:
-            entry.update({"from": before, "to": after})
-        changes.append(entry)
+        changes.append(field)
         seen.add(field)
     return changes
 
@@ -355,16 +346,6 @@ def _event_field(event_type: str) -> str:
         "event_flags_changed": "flags",
     }
     return mappings.get(event_type, event_type.removesuffix("_changed"))
-
-
-def _change_value(field: str, value: Any) -> Any:
-    if field == "position":
-        return _position_list(value)
-    if field in {"flags", "items", "party", "badges", "warps", "dialog_text"}:
-        return None
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return None
 
 
 def _last_transition(history: Any) -> dict[str, Any] | None:
@@ -526,11 +507,6 @@ class GoogleAdkResultInterpreter:
             instruction=INTERPRETER_PROMPT,
             generate_content_config=generate_config,
             tools=[
-                build_search_memory_tool(
-                    self.memory_store,
-                    activity=self.memory_tool_activity,
-                    on_activity=self._publish_memory_activity,
-                ),
                 build_save_memory_tool(
                     self.memory_store,
                     source="result_interpreter",
@@ -655,9 +631,10 @@ class GoogleAdkResultInterpreter:
     def last_saved_memory_keys(self) -> list[str]:
         return list(
             dict.fromkeys(
-                str(entry["key"])
+                str(key)
                 for entry in self.memory_tool_activity
-                if entry.get("tool") == "save_memory" and entry.get("key")
+                if entry.get("tool") == "save_memory"
+                for key in entry.get("keys", [])
             )
         )
 

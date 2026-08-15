@@ -1,18 +1,33 @@
 from __future__ import annotations
 
 import base64
+import os
 import re
+import subprocess
+import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from pokemon_agent.adk_agent.agents.memory_tools import (
-    MemoryType,
-    save_memory_entry,
-    search_memory_entry,
+    save_memory_entries,
+    search_memory_entries,
 )
+from pokemon_agent.adk_agent.agents.planner.schema import DEFAULT_MAX_STEPS, DEFAULT_OBJECTIVE
+from pokemon_agent.adk_agent.runtime.session import PROJECT_ROOT
 from pokemon_agent.adk_agent.runtime.state import FileAgentRuntimeState
 from pokemon_agent.memory.file_memory import FileLongTermMemory
+
+
+class _AgentRunnerProcess:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.process: subprocess.Popen[str] | None = None
+        self.metadata: dict[str, Any] = {}
+
+
+_AGENT_RUNNER = _AgentRunnerProcess()
 
 
 def start_game(
@@ -180,25 +195,96 @@ def recent_agent_actions(limit: int = 20) -> dict[str, Any]:
     }
 
 
-def search_memory(memory_type: MemoryType, name: str) -> dict[str, Any]:
-    """Load one file-backed map, NPC, Pokemon, or event memory by canonical name."""
+def start_agent_runner(steps: int = 100, objective: str = DEFAULT_OBJECTIVE) -> dict[str, Any]:
+    """Start the real pokemon-adk CLI runner with its normal UI, vision, thinking, and dashboard defaults."""
+
+    bounded_steps = max(1, min(int(steps), DEFAULT_MAX_STEPS))
+    normalized_objective = str(objective).strip() or DEFAULT_OBJECTIVE
+    with _AGENT_RUNNER.lock:
+        existing = _runner_status_locked(log_lines=0)
+        if existing.get("running"):
+            return {
+                **existing,
+                "started": False,
+                "already_running": True,
+                "message": "The pokemon-adk runner is already active. Use agent_runner_status to monitor it.",
+            }
+
+        started_at = datetime.now()
+        log_path = _runner_log_path(started_at)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            sys.executable,
+            "-m",
+            "pokemon_agent.adk_agent.runner",
+            "--steps",
+            str(bounded_steps),
+            "--objective",
+            normalized_objective,
+        ]
+        popen_kwargs: dict[str, Any] = {
+            "cwd": str(PROJECT_ROOT),
+            "stderr": subprocess.STDOUT,
+            "text": True,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        with log_path.open("a", encoding="utf-8") as output:
+            process = subprocess.Popen(command, stdout=output, **popen_kwargs)
+
+        _AGENT_RUNNER.process = process
+        _AGENT_RUNNER.metadata = {
+            "pid": process.pid,
+            "steps": bounded_steps,
+            "objective": normalized_objective,
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "log_path": str(log_path.resolve()),
+            "command": command,
+        }
+        return {
+            "started": True,
+            "already_running": False,
+            "running": True,
+            **_public_runner_metadata(_AGENT_RUNNER.metadata),
+            "dashboard_url": "http://127.0.0.1:8765/",
+            "dev_ui_sessions": ["pokemon-red-planner", "pokemon-red-result-interpreter"],
+            "defaults": {
+                "window": "SDL2",
+                "control_ui": True,
+                "realtime_ticks": True,
+                "vision": True,
+                "thinking_budget": -1,
+                "checkpoint_every": 10,
+            },
+        }
+
+
+def agent_runner_status(log_lines: int = 20) -> dict[str, Any]:
+    """Return progress and recent log output for the pokemon-adk runner started from Dev UI."""
+
+    with _AGENT_RUNNER.lock:
+        return _runner_status_locked(log_lines=max(0, min(int(log_lines), 100)))
+
+
+def search_memory(queries: list[dict[str, str]]) -> dict[str, Any]:
+    """Load multiple file-backed map, NPC, Pokemon, or event memories in one call."""
 
     store = _memory_store()
     return {
         "agent": "pokemon_red_planning_agent",
         "path": str(store.path),
-        **search_memory_entry(store, memory_type, name),
+        **search_memory_entries(store, queries),
     }
 
 
-def save_memory(memory_type: MemoryType, name: str, value: str) -> dict[str, Any]:
-    """Save one consolidated map, NPC, Pokemon, or event memory."""
+def save_memory(entries: list[dict[str, str]]) -> dict[str, Any]:
+    """Atomically save multiple consolidated map, NPC, Pokemon, or event memories."""
 
     store = _memory_store()
     return {
         "agent": "pokemon_red_result_interpreter_agent",
         "path": str(store.path),
-        **save_memory_entry(store, memory_type, name, value, source="adk_web"),
+        **save_memory_entries(store, entries, source="adk_web"),
     }
 
 
@@ -351,3 +437,60 @@ def _memory_store() -> FileLongTermMemory:
 
 def _runtime_store() -> FileAgentRuntimeState:
     return FileAgentRuntimeState()
+
+
+def _runner_status_locked(*, log_lines: int) -> dict[str, Any]:
+    process = _AGENT_RUNNER.process
+    if process is None:
+        return {"status": "not_started", "running": False}
+
+    return_code = process.poll()
+    metadata = _public_runner_metadata(_AGENT_RUNNER.metadata)
+    runtime = _runtime_store().read()
+    result: dict[str, Any] = {
+        "status": "running" if return_code is None else "completed" if return_code == 0 else "failed",
+        "running": return_code is None,
+        "return_code": return_code,
+        **metadata,
+        "progress": {
+            "step_count": runtime.get("step_count"),
+            "max_steps": metadata.get("steps"),
+            "phase": runtime.get("phase"),
+            "mode": runtime.get("mode"),
+            "done": runtime.get("done"),
+            "termination_reason": runtime.get("termination_reason"),
+            "updated_at": runtime.get("updated_at"),
+        },
+        "dashboard_url": "http://127.0.0.1:8765/",
+        "dev_ui_sessions": ["pokemon-red-planner", "pokemon-red-result-interpreter"],
+    }
+    if log_lines:
+        result["log_tail"] = _runner_log_tail(metadata.get("log_path"), limit=log_lines)
+    return result
+
+
+def _public_runner_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: metadata.get(key)
+        for key in ("pid", "steps", "objective", "started_at", "log_path")
+        if metadata.get(key) is not None
+    }
+
+
+def _runner_log_path(started_at: datetime) -> Path:
+    return (
+        PROJECT_ROOT
+        / "logs"
+        / "adk_web"
+        / started_at.strftime("%Y%m%d")
+        / f"runner_{started_at.strftime('%H%M%S_%f')[:-3]}.log"
+    )
+
+
+def _runner_log_tail(path: Any, *, limit: int) -> list[str]:
+    if not path:
+        return []
+    try:
+        return Path(str(path)).read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    except OSError:
+        return []

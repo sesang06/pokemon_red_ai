@@ -352,8 +352,7 @@ def _compact_transition_for_prompt(entry: dict[str, Any]) -> dict[str, Any]:
         {
             "step": entry.get("step"),
             "action": _compact_action(entry.get("action")),
-            "before": _compact_transition_state(entry.get("before")),
-            "after": _compact_transition_state(entry.get("after")),
+            "state": _compact_transition_state(entry.get("after")),
             "state_changes": entry.get("state_changes"),
             "action_status": entry.get("action_status"),
         }

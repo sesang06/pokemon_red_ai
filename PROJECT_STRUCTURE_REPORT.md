@@ -57,8 +57,8 @@ flowchart LR
 
 | 목적 | 진입점 | 특징 |
 |---|---|---|
-| 고정 ROM 수동 플레이 | `python run_fixed_pokered.py` | Qt 게임/제어 창, 키보드 입력, 저장/불러오기, 이동 및 버튼 배열 입력 |
-| 패키지 수동 실행 | `fixed-pokered` | `pokemon_agent.fixed_pokered:main` 진입점 |
+| 고정 ROM 수동 플레이 | `python run_pokemon_play.py` | Qt 게임/제어 창, 키보드 입력, 저장/불러오기, 이동 및 버튼 배열 입력 |
+| 패키지 수동 실행 | `pokemon-play` | `pokemon_agent.cli.manual_play:main` 진입점 |
 | MCP 서버 | `pokemon-mcp` 또는 `python -m pokemon_agent.mcp_server` | stdio 기본, SSE와 streamable HTTP 지원 |
 | ADK 자동 플레이 | `pokemon-adk` | 3단계 에이전트 루프, vision, 실시간 tick, 제어 UI 지원 |
 | ADK Dev UI | `run_adk_web.ps1` | 에이전트 이벤트, 현재 runtime 상태, 최근 행동/대화 확인 |
@@ -67,7 +67,7 @@ flowchart LR
 `pyproject.toml`에 등록된 콘솔 스크립트는 다음 네 개다.
 
 ```text
-fixed-pokered = pokemon_agent.fixed_pokered:main
+pokemon-play = pokemon_agent.cli.manual_play:main
 pokemon-agent = pokemon_agent.app:main
 pokemon-adk = pokemon_agent.adk_agent.runner:main
 pokemon-mcp = pokemon_agent.mcp_server:main
@@ -87,7 +87,8 @@ New project 2/
 │     ├─ ui/                        # PySide6 제어 패널
 │     ├─ vision/                    # 캡처와 collision 오버레이
 │     ├─ app.py                     # 직접 수동 실행 루프와 UI 입력 큐
-│     ├─ fixed_pokered.py           # 고정 ROM 수동 플레이 진입점
+│     ├─ cli/
+│     │  └─ manual_play.py          # 고정 ROM 수동 플레이 진입점
 │     ├─ mcp_server.py              # MCP 도구/리소스 서버
 │     ├─ mcp_logging.py             # MCP 호출 로그
 │     └─ session.py                 # 통합 게임 세션
@@ -103,7 +104,7 @@ New project 2/
 ├─ docs/architecture.md             # 초기 아키텍처 문서
 ├─ prompts/planner.md               # 초기 planner 프롬프트 문서
 ├─ pyproject.toml                   # 패키지/의존성/CLI 설정
-├─ run_fixed_pokered.py             # 수동 실행 래퍼
+├─ run_pokemon_play.py              # 수동 실행 래퍼
 ├─ run_adk_web.ps1                  # ADK Dev UI 실행 스크립트
 └─ uv.lock                          # 잠금 파일
 ```
@@ -116,7 +117,7 @@ New project 2/
 |---|---|
 | `emulator/pyboy_env.py` | PyBoy 생성, memory 접근, 버튼, tick, 화면, tilemap, game area/collision, save/load/stop 제공 |
 | `session.py` | 활성 게임 세션의 중심. 관찰, 실시간 tick, UI, 명령 큐, 상태 저장, 경로 이동을 통합 |
-| `fixed_pokered.py` | 고정 ROM과 기본 state를 이용한 수동 플레이 CLI 구성 |
+| `cli/manual_play.py` | 고정 ROM과 기본 state를 이용한 수동 플레이 CLI 구성 |
 | `app.py` | 별도의 수동 실행 루프와 UI 입력 큐 |
 
 고정 경로 정책은 다음과 같다.
@@ -364,7 +365,7 @@ Dev UI 사용자 메시지
 
 ### 6.6 LLM을 호출하지 않는 경로
 
-- `python run_fixed_pokered.py`
+- `python run_pokemon_play.py`
 - `pokemon-agent`
 - `python -m pokemon_agent.mcp_server`
 - `pokemon-adk --no-adk-model`
@@ -493,7 +494,7 @@ RAM reader는 다음 종류의 상태를 지속적으로 갱신한다.
 
 ```powershell
 # 고정 ROM 수동 플레이와 Qt UI
-.\.venv\Scripts\python.exe run_fixed_pokered.py
+.\.venv\Scripts\python.exe run_pokemon_play.py
 
 # MCP 서버 + 실시간 tick + Qt UI
 .\.venv\Scripts\python.exe -m pokemon_agent.mcp_server `

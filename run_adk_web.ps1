@@ -10,4 +10,4 @@ $adkExecutable = Join-Path $projectRoot ".venv\Scripts\adk.exe"
     --port $Port `
     --no-reload `
     --session_service_uri "sqlite:///$databasePath" `
-    (Join-Path $projectRoot "src\pokemon_agent")
+    (Join-Path $projectRoot "src\pokemon_agent\adk_agent")

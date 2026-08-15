@@ -1,48 +1,72 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Literal
+from typing import Any
 
 from pokemon_agent.memory.file_memory import FileLongTermMemory, memory_key
 
 
 MemoryTool = Callable[..., dict[str, Any]]
-MemoryType = Literal["map", "npc", "pokemon", "event"]
-
-
-def search_memory_entry(
+def search_memory_entries(
     store: FileLongTermMemory,
-    memory_type: MemoryType,
-    name: str,
+    queries: list[dict[str, str]],
 ) -> dict[str, Any]:
-    key = memory_key(memory_type, name)
-    item = store.get(memory_type, name)
+    if not queries:
+        raise ValueError("at least one memory query is required")
+    items = store.items()
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for query in queries:
+        if not isinstance(query, dict):
+            raise ValueError("each memory query must be an object")
+        key = memory_key(str(query.get("memory_type", "")), str(query.get("name", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        memory_type, name = key.split(":", 1)
+        item = items.get(key)
+        results.append(
+            {
+                "memory_type": memory_type,
+                "name": name,
+                "key": key,
+                "found": item is not None,
+                "item": item,
+            }
+        )
     return {
         "phase": "memory_search",
-        "memory_type": key.split(":", 1)[0],
-        "name": key.split(":", 1)[1],
-        "key": key,
-        "found": item is not None,
-        "item": item,
+        "keys": [entry["key"] for entry in results],
+        "found_count": sum(bool(entry["found"]) for entry in results),
+        "results": results,
     }
 
 
-def save_memory_entry(
+def save_memory_entries(
     store: FileLongTermMemory,
-    memory_type: MemoryType,
-    name: str,
-    value: str,
+    entries: list[dict[str, str]],
     *,
     source: str,
 ) -> dict[str, Any]:
-    key = store.remember(memory_type, name, value, source=source)
+    previous_items = store.items()
+    keys = store.remember_many(entries, source=source, merge_existing=True)
+    items = store.items()
+    results = [
+        {
+            "memory_type": key.split(":", 1)[0],
+            "name": key.split(":", 1)[1],
+            "key": key,
+            "written": True,
+            "previous_item": previous_items.get(key),
+            "item": items.get(key),
+        }
+        for key in keys
+    ]
     return {
         "phase": "memory_write",
-        "memory_type": key.split(":", 1)[0],
-        "name": key.split(":", 1)[1],
-        "key": key,
-        "written": True,
-        "item": store.get(memory_type, name),
+        "keys": keys,
+        "written_count": len(keys),
+        "results": results,
     }
 
 
@@ -52,41 +76,12 @@ def build_search_memory_tool(
     activity: list[dict[str, Any]] | None = None,
     on_activity: Callable[[dict[str, Any]], None] | None = None,
 ) -> MemoryTool:
-    def search_memory(memory_type: MemoryType, name: str) -> dict[str, Any]:
-        """Load one map, NPC, Pokemon, or event memory by its canonical name."""
+    def search_memory(queries: list[dict[str, str]]) -> dict[str, Any]:
+        """Load multiple map, NPC, Pokemon, or event memories in one call."""
 
-        requested_key = memory_key(memory_type, name)
-        if activity is not None:
-            previous = next(
-                (
-                    entry
-                    for entry in reversed(activity)
-                    if entry.get("tool") == "search_memory" and entry.get("key") == requested_key
-                ),
-                None,
-            )
-            if previous is not None:
-                result = {
-                    key: previous.get(key)
-                    for key in ("phase", "memory_type", "name", "key", "found", "item")
-                }
-                result.update(
-                    {
-                        "already_searched": True,
-                        "next_step": (
-                            "Do not call search_memory again for this identity during this invocation. "
-                            "Use the returned memory and emit the required final JSON response now."
-                        ),
-                    }
-                )
-                activity.append({"tool": "search_memory", **result})
-                if on_activity is not None:
-                    on_activity({"tool": "search_memory", **result})
-                return result
-
-        result = search_memory_entry(store, memory_type, name)
+        result = search_memory_entries(store, queries)
         result["next_step"] = (
-            "This identity has now been searched for this invocation. Do not repeat the same search; "
+            "All requested identities have now been searched. Do not call search_memory again; "
             "continue reasoning and emit the required final JSON response."
         )
         if activity is not None:
@@ -105,10 +100,10 @@ def build_save_memory_tool(
     activity: list[dict[str, Any]] | None = None,
     on_activity: Callable[[dict[str, Any]], None] | None = None,
 ) -> MemoryTool:
-    def save_memory(memory_type: MemoryType, name: str, value: str) -> dict[str, Any]:
-        """Save one consolidated map, NPC, Pokemon, or event memory under a validated type and name."""
+    def save_memory(entries: list[dict[str, str]]) -> dict[str, Any]:
+        """Atomically save multiple consolidated map, NPC, Pokemon, or event memories."""
 
-        result = save_memory_entry(store, memory_type, name, value, source=source)
+        result = save_memory_entries(store, entries, source=source)
         if activity is not None:
             activity.append({"tool": "save_memory", **result})
         if on_activity is not None:

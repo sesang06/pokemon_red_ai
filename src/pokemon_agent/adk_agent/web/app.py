@@ -14,6 +14,7 @@ from pokemon_agent.adk_agent.agents.shared import MAX_AUTOMATIC_FUNCTION_CALLS
 from pokemon_agent.adk_agent.runtime.session import ADK_WEB_APP_NAME, build_events_compaction_config
 from pokemon_agent.adk_agent.web.prompt import WEB_AGENT_PROMPT
 from pokemon_agent.adk_agent.web.tools import (
+    agent_runner_status,
     agent_runtime_status,
     buttons,
     move,
@@ -25,6 +26,7 @@ from pokemon_agent.adk_agent.web.tools import (
     save_current_screenshot,
     search_memory,
     set_realtime_ticks,
+    start_agent_runner,
     start_game,
     stop_game,
     wait,
@@ -76,7 +78,6 @@ def build_root_agent(model: str | None = None) -> Agent:
         tools=[
             observe_game,
             recent_game_commands,
-            search_memory,
             save_memory,
         ],
     )
@@ -87,6 +88,8 @@ def build_root_agent(model: str | None = None) -> Agent:
         instruction=WEB_AGENT_PROMPT,
         generate_content_config=generate_content_config,
         tools=[
+            start_agent_runner,
+            agent_runner_status,
             start_game,
             stop_game,
             set_realtime_ticks,

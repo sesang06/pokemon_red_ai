@@ -57,21 +57,52 @@ class FileLongTermMemory:
         *,
         source: str = "result_interpreter",
     ) -> str:
-        key = memory_key(memory_type, name)
-        if value is None or (isinstance(value, str) and not value.strip()):
-            raise ValueError("memory value must not be empty")
+        return self.remember_many(
+            [{"memory_type": memory_type, "name": name, "value": value}],
+            source=source,
+        )[0]
+
+    def remember_many(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        source: str = "result_interpreter",
+        merge_existing: bool = False,
+    ) -> list[str]:
+        """Validate and persist multiple memories with one atomic file replacement."""
+
+        validated: list[tuple[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("each memory entry must be an object")
+            key = memory_key(str(entry.get("memory_type", "")), str(entry.get("name", "")))
+            value = entry.get("value")
+            if value is None or (isinstance(value, str) and not value.strip()):
+                raise ValueError("memory value must not be empty")
+            validated.append((key, value))
+        if not validated:
+            raise ValueError("at least one memory entry is required")
+
         store = self.read_all()
         items = store.setdefault("items", {})
         now = _now_iso()
-        items[key] = {
-            "value": value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True),
-            "updated_at": now,
-            "source": source,
-        }
+        keys: list[str] = []
+        for key, value in validated:
+            if merge_existing:
+                existing = items.get(key)
+                existing_value = existing.get("value") if isinstance(existing, dict) else None
+                value = _merge_memory_values(existing_value, value)
+            items[key] = {
+                "value": value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True),
+                "updated_at": now,
+                "source": source,
+            }
+            if key not in keys:
+                keys.append(key)
         store["version"] = 1
         store["updated_at"] = now
         self._write_store(store)
-        return key
+        return keys
 
     def _write_store(self, store: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,3 +149,17 @@ def _empty_store() -> dict[str, Any]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _merge_memory_values(existing: Any, incoming: Any) -> Any:
+    if existing is None:
+        return incoming
+    existing_text = existing if isinstance(existing, str) else json.dumps(existing, ensure_ascii=False, sort_keys=True)
+    incoming_text = incoming if isinstance(incoming, str) else json.dumps(incoming, ensure_ascii=False, sort_keys=True)
+    existing_text = existing_text.strip()
+    incoming_text = incoming_text.strip()
+    if not existing_text or incoming_text == existing_text or incoming_text in existing_text:
+        return existing_text or incoming_text
+    if existing_text in incoming_text:
+        return incoming_text
+    return f"{existing_text}\n{incoming_text}"

@@ -130,6 +130,9 @@ def test_interpreter_context_contains_action_outcome_without_task_fields() -> No
 
     assert payload["action_plan"]["action"]["type"] == "buttons"
     assert payload["last_result"]["status"] == "single_action_complete"
+    assert payload["state_changes"] == ["dialog", "mode"]
+    assert "before" not in str(payload)
+    assert "after" not in str(payload)
     assert "repeat" not in str(payload)
     assert "task" not in payload
 

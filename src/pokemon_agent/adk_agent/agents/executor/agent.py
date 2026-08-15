@@ -5,7 +5,6 @@ from typing import Any
 
 from pokemon_agent.adk_agent.agents.executor.schema import (
     ALLOWED_EXECUTION_ACTIONS,
-    compact_observation,
     compact_plan_decision,
     compact_result,
     current_world_target,
@@ -56,8 +55,7 @@ class ExecutionAgent:
             "agent": self.name,
             "phase": "execution",
             "action": action,
-            "before_state": compact_observation(state.get("observation", {})),
-            "after_state": compact_observation(result.get("after_observation", {})),
+            "state": result.get("after_observation", {}).get("state", {}),
             "state_events": result.get("after_observation", {}).get("state_events", []),
             "result": compact_result(result),
             "stop_reason": result.get("stop_reason"),

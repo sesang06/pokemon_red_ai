@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pokemon_agent.input_contract import (
     BUTTON_TOKENS,
+
     MAX_BUTTONS_PER_ACTION,
     MAX_MOVE_PATH_STEPS,
     MAX_WORLD_NAVIGATION_SEGMENTS,
@@ -11,8 +12,8 @@ from pokemon_agent.input_contract import (
 RESULT_INTERPRETER_PROMPT = """You are pokemon_red_result_interpreter_agent.
 
 Interpret a verified single-action result or durable event from a compact canonical snapshot. The input contains the
-current state, direct action plan, deterministic last_result, compact state_changes, and one last_transition. Treat
-last_result.status and goal_completed as authoritative. Do not reconstruct full before/after states, executor traces,
+current state, direct action plan, deterministic last_result, changed field names, and one last_transition. Treat
+last_result.status and goal_completed as authoritative. Only the latest state is supplied; do not reconstruct before/after states, executor traces,
 or older transition history.
 
 Interpret results against the exact runtime action contract:
@@ -36,11 +37,12 @@ Interpret results against the exact runtime action contract:
 Memory tool contract:
 - The only valid `memory_type` values are `map`, `npc`, `pokemon`, and `event`. Tools generate the
   `<memory_type>:<name>` key internally; never construct or pass a raw key.
-- Before updating an entity, call `search_memory(memory_type=..., name=...)` with the same canonical identity, then call
-  `save_memory(memory_type=..., name=..., value=...)` only when the verified result adds durable reusable knowledge.
-- During one interpreter invocation, call each exact search or save operation at most once. A missing search result is
-  still complete. After tool calls finish, stop calling tools and emit the required six-field result JSON; never repeat
-  a call whose response is already in the current tool context.
+- When the verified result adds durable reusable knowledge, call
+  `save_memory(entries=[{"memory_type":...,"name":...,"value":...}, ...])` once with every relevant update. The tool
+  atomically reads existing entries, preserves distinct prior facts, merges the supplied facts, and returns both the
+  previous and updated values. Do not request a separate read before writing.
+- During one interpreter invocation, use at most one batch save. Never repeat the tool call; after it finishes, emit
+  the required six-field result JSON. If there is no durable update, skip the tool and return the JSON directly.
 - Use `map` for geography and routes, `npc` for a named character's verified identity/location/role/interactions,
   `pokemon` for an exact species and verified selection/encounter/party facts, and `event` for a stable story interaction,
   requirement, choice, progress marker, or outcome. Use canonical names such as `Professor Oak`, `Bulbasaur`, and a

@@ -363,9 +363,10 @@ class GoogleAdkPlanner:
     def last_memory_search_keys(self) -> list[str]:
         return list(
             dict.fromkeys(
-                str(entry["key"])
+                str(key)
                 for entry in self.memory_tool_activity
-                if entry.get("tool") == "search_memory" and entry.get("key")
+                if entry.get("tool") == "search_memory"
+                for key in entry.get("keys", [])
             )
         )
 

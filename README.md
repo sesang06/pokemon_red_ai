@@ -20,7 +20,7 @@ ROM files and copyrighted map data are intentionally not included.
 
 ## Quick Start
 
-Run the fixed Pokemon Red launcher. This always uses `src\pokered.gb` and
+Run the manual Pokemon Red launcher. This always uses `src\pokered.gb` and
 starts from `states\fixed_start.state`. It also opens a PySide6 control panel
 with buttons for `Save Fixed`, `Save Snapshot`, `Load Fixed`, `Move`, and `Quit`.
 The `Move` inputs use current map coordinates from the overlay/status; the code
@@ -30,7 +30,7 @@ text like `a, wait, b`, then sends one token at a time with a delay between
 tokens.
 
 ```powershell
-python run_fixed_pokered.py
+python run_pokemon_play.py
 ```
 
 The control panel updates once per second and has tabs for:
@@ -48,25 +48,25 @@ reader while keeping unknown values non-fatal.
 To run with the project's `.venv` interpreter directly:
 
 ```powershell
-.\run_fixed_pokered_qt.ps1
+.\run_pokemon_play_qt.ps1
 ```
 
 or:
 
 ```powershell
-.\run_fixed_pokered_qt.cmd
+.\run_pokemon_play_qt.cmd
 ```
 
 To run without the control panel:
 
 ```powershell
-python run_fixed_pokered.py --no-control-ui
+python run_pokemon_play.py --no-control-ui
 ```
 
 To play manually and overwrite the fixed starting state when you stop, run:
 
 ```powershell
-python run_fixed_pokered.py --set-fixed
+python run_pokemon_play.py --set-fixed
 ```
 
 When you reach the desired point, return to the terminal and press `Ctrl+C`.
@@ -76,13 +76,13 @@ The program will call PyBoy `save_state` and overwrite
 If a PyBoy hotkey save (`src\pokered.gb.state`) exists, you can import it with:
 
 ```powershell
-python run_fixed_pokered.py --fix-current
+python run_pokemon_play.py --fix-current
 ```
 
 To reset the fixed state back to the ROM boot state:
 
 ```powershell
-python run_fixed_pokered.py --boot-state
+python run_pokemon_play.py --boot-state
 ```
 
 Run against a legally obtained Pokemon Red ROM:
@@ -363,6 +363,11 @@ The root agent also exposes `agent_runtime_status` and `recent_agent_actions`. I
 Show the separately running CLI agent status and recent actions.
 ```
 
+To launch the exact `pokemon-adk` runner from Dev UI, ask `Play Pokemon for 100 steps.` The root agent calls
+`start_agent_runner(steps=100)`, which starts the normal SDL2/Qt control UI, vision-enabled planner/interpreter loop,
+checkpoints, action logs, shared SQLite sessions, and the dashboard at `http://127.0.0.1:8765/`. Ask for runner status
+to call `agent_runner_status` and inspect its current step or recent log output.
+
 ADK Web will show tool calls such as `start_game`, `observe_game`,
 `save_current_screenshot`, `move`, `buttons`, and `recent_game_commands` in the
 event history. Screenshot base64 is omitted from
@@ -376,9 +381,9 @@ image payload.
 - The Google ADK planner produces one bounded `buttons` action or one persistent current-map `move` ActionPlan.
 - Python validates each action once and owns collision checks, screen-by-screen Dijkstra replanning, and interruption handling.
 - RAM-derived GameState deterministically verifies action results and Goal success.
-- The Planner reads relevant map, NPC, Pokemon, and event memories through
-  `search_memory(memory_type, name)`.
-- The result interpreter uses `search_memory` and `save_memory`; persisted keys are generated internally as
+- The Planner reads relevant map, NPC, Pokemon, and event memories with one batched
+  `search_memory(queries=[...])` call.
+- The result interpreter uses at most one atomic `save_memory(entries=[...])` call, which reads and preserves existing values while applying all updates; persisted keys are generated internally as
   `map:<name>`, `npc:<name>`, `pokemon:<name>`, or `event:<name>`.
 - Navigation is deterministic Dijkstra over the latest visible walkability grid and automatically replans toward remote current-map coordinates.
 - Battle and dialog are isolated because they use different observations and
