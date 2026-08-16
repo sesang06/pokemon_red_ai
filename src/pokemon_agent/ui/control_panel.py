@@ -44,9 +44,12 @@ class QtStateControlPanel:
             raise RuntimeError("PySide6 is not installed. Run: uv sync") from exc
 
         self.state_dir = state_dir
+        self.capture_dir = state_dir.parent / "captures"
         self.fixed_state = fixed_state
         self.commands: list[ControlCommand] = []
         self.last_state: GameState | None = None
+        self.latest_screen_image: object | None = None
+        self.latest_overlay_image: object | None = None
         self._move_inputs_initialized = False
         self.closing = False
         self.app = QApplication.instance() or QApplication([])
@@ -160,6 +163,16 @@ class QtStateControlPanel:
         game_b_button.setToolTip("Press the Game Boy B button")
         button_grid.addWidget(game_b_button, 5, 1)
 
+        export_screen_button = QPushButton("Export Screenshot")
+        export_screen_button.clicked.connect(self._export_screen_image)
+        export_screen_button.setToolTip("Save the latest game screen as a timestamped PNG")
+        button_grid.addWidget(export_screen_button, 6, 0)
+
+        export_collision_button = QPushButton("Export Collision Map")
+        export_collision_button.clicked.connect(self._export_overlay_image)
+        export_collision_button.setToolTip("Save the latest collision overlay and world coordinates as a PNG")
+        button_grid.addWidget(export_collision_button, 6, 1)
+
         self.save_fixed_on_quit = QCheckBox("Save fixed state when quitting")
         layout.addWidget(self.save_fixed_on_quit)
 
@@ -256,9 +269,11 @@ class QtStateControlPanel:
         self._set_plain_text_preserving_view(self.mcp_log_text, text)
 
     def update_screen_image(self, image: object) -> None:
+        self.latest_screen_image = self._copy_image(image)
         self._set_image_label(self.screen_label, image, "Screen image unavailable")
 
     def update_overlay_image(self, image: object) -> None:
+        self.latest_overlay_image = self._copy_image(image)
         self._set_image_label(self.overlay_label, image, "Collision overlay unavailable")
 
     def close(self) -> None:
@@ -319,6 +334,35 @@ class QtStateControlPanel:
     def _queue_single_button(self, button: str) -> None:
         self.commands.append(ControlCommand("buttons", buttons=(button,)))
         self.status_label.setText(f"Queued button: {button}")
+
+    def _export_screen_image(self) -> Path | None:
+        return self._export_image(self.latest_screen_image, "game_screen")
+
+    def _export_overlay_image(self) -> Path | None:
+        return self._export_image(self.latest_overlay_image, "collision_map")
+
+    def _export_image(self, image: object | None, prefix: str) -> Path | None:
+        if image is None or not hasattr(image, "save"):
+            self.status_label.setText(f"Error: {prefix} image is not available yet")
+            return None
+
+        now = datetime.now()
+        directory = self.capture_dir / now.strftime("%Y%m%d")
+        directory.mkdir(parents=True, exist_ok=True)
+        timestamp = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        path = directory / f"{prefix}_{timestamp}.png"
+        try:
+            image.save(path, format="PNG")
+        except Exception as exc:
+            self.status_label.setText(f"Error: failed to export {prefix}: {exc}")
+            return None
+        self.status_label.setText(f"Exported: {path}")
+        return path
+
+    @staticmethod
+    def _copy_image(image: object) -> object:
+        copy_image = getattr(image, "copy", None)
+        return copy_image() if callable(copy_image) else image
 
     def _queue_stop(self) -> None:
         if self.save_fixed_on_quit.isChecked():

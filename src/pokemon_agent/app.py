@@ -14,14 +14,13 @@ from pokemon_agent.emulator.pyboy_env import PyBoyEnvironment
 from pokemon_agent.memory.memory_reader import PokemonRedMemoryReader
 from pokemon_agent.memory.ram_map import format_ram_watch
 from pokemon_agent.memory.world_state import GameMode, GameState
+from pokemon_agent.input_contract import MAX_MOVE_PATH_STEPS, MAX_WORLD_NAVIGATION_SEGMENTS
 from pokemon_agent.tools.pathfinding import directions_from_path
 from pokemon_agent.tools.screen_navigation import (
     PLAYER_WALK_CELL,
     grid_point_dict,
-    map_position_to_walk_cell,
-    plan_screen_path,
+    plan_world_path_segment,
     walk_cell_to_map_position,
-    walk_cell_to_screen_tile,
 )
 from pokemon_agent.ui.control_panel import ControlCommand, QtStateControlPanel
 from pokemon_agent.vision.capture import CaptureConfig, CaptureRecorder
@@ -137,6 +136,9 @@ class _QueuedControlInput:
     index: int = 0
     button_frames: int = 4
     after_frames: int = 20
+    target_world_cell: tuple[int, int] | None = None
+    initial_map_id: int | None = None
+    navigation_segments: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -220,7 +222,7 @@ def _handle_control_commands(
             logging.info("loaded state=%s", command.path)
         elif command.action == "move":
             try:
-                result, planned_input = _plan_control_move_from_command(
+                result, planned_input = _queue_control_move_from_command(
                     env,
                     command,
                     current_state=current_state,
@@ -265,7 +267,7 @@ def _handle_control_commands(
     return stop_requested, queued_input
 
 
-def _plan_control_move_from_command(
+def _queue_control_move_from_command(
     env: PyBoyEnvironment,
     command: ControlCommand,
     *,
@@ -277,28 +279,17 @@ def _plan_control_move_from_command(
 
     target_x = _bounded_int(command.target[0], minimum=0, maximum=255, name="target_x")
     target_y = _bounded_int(command.target[1], minimum=0, maximum=255, name="target_y")
-    max_steps = 8
     if current_state is None or current_state.position is None:
         raise ValueError("current player position is unknown")
 
     player_position = type(PLAYER_WALK_CELL)(current_state.position.x, current_state.position.y)
-    requested_map_position = type(PLAYER_WALK_CELL)(target_x, target_y)
-    target_walk_cell = map_position_to_walk_cell(requested_map_position, player_position)
-    if not (0 <= target_walk_cell.x <= 9 and 0 <= target_walk_cell.y <= 8):
-        raise ValueError(
-            "target map coordinate is outside the current visible walk area: "
-            f"map=({target_x}, {target_y}) player=({current_state.position.x}, {current_state.position.y}) "
-            f"walk=({target_walk_cell.x}, {target_walk_cell.y})"
-        )
-
-    screen_tile = walk_cell_to_screen_tile(target_walk_cell)
-    plan = plan_screen_path(
-        screen_tile.x,
-        screen_tile.y,
+    world_segment = plan_world_path_segment(
+        target_x,
+        target_y,
         env.game_area_collision(),
-        start=PLAYER_WALK_CELL,
-        accept_nearest=True,
+        player_position=player_position,
     )
+    plan = world_segment.screen_plan
     executed_actions: list[dict[str, Any]] = []
     planned_actions: list[dict[str, Any]] = []
     queued_directions: list[str] = []
@@ -310,19 +301,30 @@ def _plan_control_move_from_command(
         stop_reason = interruption
     elif stop_reason == "path_found":
         directions = directions_from_path(plan.path)
-        stop_reason = "target_reached" if not directions else "planned_path_exhausted"
+        if directions:
+            stop_reason = "planned_path_exhausted"
+        elif world_segment.target_out_of_visible_area:
+            stop_reason = "no_path"
+        else:
+            stop_reason = "target_reached"
         planned_stop_reason = stop_reason
 
-        queued_directions = list(directions[:max_steps])
+        queued_directions = list(directions[:MAX_MOVE_PATH_STEPS])
         planned_actions = [{"button": direction} for direction in queued_directions]
         if queued_directions:
             stop_reason = "queued_path"
             planned_stop_reason = "max_steps_reached" if len(queued_directions) < len(directions) else "planned_path_exhausted"
 
-    resolved_map_position = walk_cell_to_map_position(plan.resolved_walk_cell, player_position)
+    resolved_map_position = world_segment.resolved_world_cell
+    requested_target_reached = (
+        current_state.position.x == target_x and current_state.position.y == target_y
+    )
     result = {
         "requested_world_cell": {"x": target_x, "y": target_y},
         "resolved_world_cell": grid_point_dict(resolved_map_position),
+        "target_out_of_visible_area": world_segment.target_out_of_visible_area,
+        "requested_target_reached": requested_target_reached,
+        "resolved_target_reached": resolved_map_position == player_position,
         "planned_path": [
             grid_point_dict(walk_cell_to_map_position(point, player_position))
             for point in plan.path
@@ -333,6 +335,16 @@ def _plan_control_move_from_command(
         "executed_actions": executed_actions,
         "steps_taken": len(executed_actions),
         "stop_reason": stop_reason,
+        "navigation_segments": [
+            {
+                "index": 0,
+                "from": grid_point_dict(player_position),
+                "toward": grid_point_dict(resolved_map_position),
+                "to": None,
+                "planned_steps": len(queued_directions),
+            }
+        ],
+        "navigation_replans": 0,
     }
     queued_move = None
     if queued_directions:
@@ -341,6 +353,9 @@ def _plan_control_move_from_command(
             result=result,
             tokens=queued_directions,
             next_frame=current_frame,
+            target_world_cell=(target_x, target_y),
+            initial_map_id=current_state.map_id,
+            navigation_segments=1,
         )
     return result, queued_move
 
@@ -389,6 +404,14 @@ def _pump_control_input_queue(
 
     if queued_input.kind == "move":
         interruption = _interruption_reason(current_state)
+        if (
+            interruption is None
+            and queued_input.initial_map_id is not None
+            and current_state is not None
+            and current_state.map_id is not None
+            and current_state.map_id != queued_input.initial_map_id
+        ):
+            interruption = "interrupted_map_change"
     else:
         interruption = None
 
@@ -402,6 +425,19 @@ def _pump_control_input_queue(
             [action.get("button") for action in queued_input.result.get("executed_actions", [])],
         )
         return None
+
+    if queued_input.index >= len(queued_input.tokens):
+        if queued_input.kind != "move":
+            return None
+        if current_frame < queued_input.next_frame:
+            return queued_input
+        return _replan_queued_control_move(
+            env,
+            control_panel,
+            queued_input,
+            current_state=current_state,
+            current_frame=current_frame,
+        )
 
     if current_frame < queued_input.next_frame:
         return queued_input
@@ -417,7 +453,7 @@ def _pump_control_input_queue(
 
     queued_input.result.setdefault("executed_actions", []).append(action)
     queued_input.index += 1
-    queued_input.result["steps_taken"] = queued_input.index
+    queued_input.result["steps_taken"] = len(queued_input.result["executed_actions"])
     queued_input.result["stop_reason"] = _queued_stop_reason(queued_input)
     _notify_control_input_result(control_panel, queued_input)
     logging.info(
@@ -431,6 +467,9 @@ def _pump_control_input_queue(
     )
 
     if queued_input.index >= len(queued_input.tokens):
+        if queued_input.kind == "move":
+            queued_input.next_frame = next_frame
+            return queued_input
         logging.info(
             "%s completed stop_reason=%s steps=%s actions=%s",
             queued_input.kind,
@@ -444,11 +483,114 @@ def _pump_control_input_queue(
     return queued_input
 
 
+def _replan_queued_control_move(
+    env: PyBoyEnvironment,
+    control_panel: QtStateControlPanel,
+    queued_input: _QueuedControlInput,
+    *,
+    current_state: GameState | None,
+    current_frame: int,
+) -> _QueuedControlInput | None:
+    target = queued_input.target_world_cell
+    if target is None or current_state is None or current_state.position is None:
+        queued_input.result["stop_reason"] = "position_unknown"
+        _notify_control_input_result(control_panel, queued_input)
+        return None
+
+    segments = queued_input.result.get("navigation_segments", [])
+    segment_start = None
+    if segments and isinstance(segments[-1], dict):
+        segment_start = segments[-1].get("from")
+        segments[-1]["to"] = {
+            "x": current_state.position.x,
+            "y": current_state.position.y,
+        }
+        segments[-1]["steps_taken"] = queued_input.index
+
+    if (current_state.position.x, current_state.position.y) == target:
+        queued_input.result.update(
+            {
+                "resolved_world_cell": {"x": target[0], "y": target[1]},
+                "requested_target_reached": True,
+                "resolved_target_reached": True,
+                "stop_reason": "target_reached",
+            }
+        )
+        _notify_control_input_result(control_panel, queued_input)
+        return None
+
+    current_position = {"x": current_state.position.x, "y": current_state.position.y}
+    if queued_input.index > 0 and segment_start == current_position:
+        queued_input.result["stop_reason"] = "movement_blocked"
+        _notify_control_input_result(control_panel, queued_input)
+        return None
+
+    if queued_input.navigation_segments >= MAX_WORLD_NAVIGATION_SEGMENTS:
+        queued_input.result["stop_reason"] = "navigation_limit_reached"
+        _notify_control_input_result(control_panel, queued_input)
+        return None
+
+    next_result, next_input = _queue_control_move_from_command(
+        env,
+        ControlCommand("move", target=target),
+        current_state=current_state,
+        current_frame=current_frame,
+    )
+    queued_input.result["target_out_of_visible_area"] = bool(
+        queued_input.result.get("target_out_of_visible_area")
+        or next_result.get("target_out_of_visible_area")
+    )
+    queued_input.result["resolved_world_cell"] = next_result.get("resolved_world_cell")
+    queued_input.result["resolved_target_reached"] = next_result.get("resolved_target_reached", False)
+    _extend_unique_world_path(
+        queued_input.result.setdefault("planned_path", []),
+        next_result.get("planned_path", []),
+    )
+    queued_input.result.setdefault("planned_actions", []).extend(next_result.get("planned_actions", []))
+    queued_input.result["queued_steps"] = int(queued_input.result.get("queued_steps", 0)) + int(
+        next_result.get("queued_steps", 0)
+    )
+
+    next_segments = next_result.get("navigation_segments", [])
+    if next_segments and isinstance(next_segments[0], dict):
+        segment = dict(next_segments[0])
+        segment["index"] = queued_input.navigation_segments
+        queued_input.result.setdefault("navigation_segments", []).append(segment)
+    queued_input.result["navigation_replans"] = queued_input.navigation_segments
+
+    if next_input is None:
+        queued_input.result["stop_reason"] = next_result.get("stop_reason", "no_path")
+        _notify_control_input_result(control_panel, queued_input)
+        return None
+
+    queued_input.tokens = next_input.tokens
+    queued_input.index = 0
+    queued_input.next_frame = current_frame
+    queued_input.navigation_segments += 1
+    queued_input.result["stop_reason"] = "queued_path"
+    logging.info(
+        "move replanned segment=%s world_target=%s resolved_world=%s queued_actions=%s",
+        queued_input.navigation_segments,
+        target,
+        queued_input.result.get("resolved_world_cell"),
+        queued_input.tokens,
+    )
+    return queued_input
+
+
+def _extend_unique_world_path(path: list[dict[str, Any]], segment: Any) -> None:
+    if not isinstance(segment, list):
+        return
+    for point in segment:
+        if isinstance(point, dict) and (not path or path[-1] != point):
+            path.append(dict(point))
+
+
 def _queued_stop_reason(queued_input: _QueuedControlInput) -> str:
-    if queued_input.index < len(queued_input.tokens):
-        return "queued_path" if queued_input.kind == "move" else "queued_buttons"
     if queued_input.kind == "move":
-        return str(queued_input.result.get("planned_stop_reason", "planned_path_exhausted"))
+        return "queued_path"
+    if queued_input.index < len(queued_input.tokens):
+        return "queued_buttons"
     return "buttons_complete"
 
 

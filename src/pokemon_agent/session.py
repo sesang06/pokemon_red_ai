@@ -29,11 +29,14 @@ from pokemon_agent.tools.pathfinding import GridPoint, directions_from_path
 from pokemon_agent.tools.screen_navigation import (
     PLAYER_SCREEN_TILE,
     PLAYER_WALK_CELL,
+    ScreenPathPlan,
     compress_collision_to_walk_grid,
     grid_point_dict,
     matrix_to_rows,
+    plan_world_path_segment,
     plan_screen_path,
     map_position_to_walk_cell,
+    walk_cell_in_visible_area,
     walk_cell_to_map_position,
     walk_cell_to_screen_tile,
 )
@@ -762,16 +765,23 @@ class PokemonSession:
                     break
 
                 player_position = GridPoint(segment_position.x, segment_position.y)
-                requested_walk_cell = map_position_to_walk_cell(requested_world_cell, player_position)
-                segment_target_is_remote = not _walk_cell_in_visible_area(requested_walk_cell)
-                target_out_of_visible_area = target_out_of_visible_area or segment_target_is_remote
-                target_walk_cell = (
-                    _clamp_walk_cell_to_visible_area(requested_walk_cell)
-                    if segment_target_is_remote
-                    else requested_walk_cell
+                segment_plan = plan_world_path_segment(
+                    target_x,
+                    target_y,
+                    segment_before["game_area_collision"],
+                    player_position=player_position,
+                    blocked_edges=self._screen_blocked_edges(segment_before),
                 )
+                segment_target_is_remote = segment_plan.target_out_of_visible_area
+                target_out_of_visible_area = target_out_of_visible_area or segment_target_is_remote
+                target_walk_cell = segment_plan.segment_walk_cell
 
-                segment_result = self._move_to_walk_cell(target_walk_cell.x, target_walk_cell.y)
+                segment_result = self._move_to_walk_cell(
+                    target_walk_cell.x,
+                    target_walk_cell.y,
+                    before=segment_before,
+                    plan=segment_plan.screen_plan,
+                )
                 segment_after = segment_result.get("after_observation", {})
                 after_position = _position_from_observation(segment_after)
                 segment_resolved_world = _resolved_world_cell(segment_result, player_position)
@@ -859,13 +869,22 @@ class PokemonSession:
             }
             return result
 
-    def _move_to_walk_cell(self, target_x: int, target_y: int) -> dict[str, Any]:
+    def _move_to_walk_cell(
+        self,
+        target_x: int,
+        target_y: int,
+        *,
+        before: dict[str, Any] | None = None,
+        plan: ScreenPathPlan | None = None,
+    ) -> dict[str, Any]:
         target_x = _bounded_int(target_x, minimum=0, maximum=9, name="target_x")
         target_y = _bounded_int(target_y, minimum=0, maximum=8, name="target_y")
         screen_tile = walk_cell_to_screen_tile(type(PLAYER_WALK_CELL)(target_x, target_y))
         result = self._move_to_screen_target(
             target_x=screen_tile.x,
             target_y=screen_tile.y,
+            before=before,
+            plan=plan,
         )
         return result
 
@@ -873,10 +892,13 @@ class PokemonSession:
         self,
         target_x: int,
         target_y: int,
+        *,
+        before: dict[str, Any] | None = None,
+        plan: ScreenPathPlan | None = None,
     ) -> dict[str, Any]:
         self._navigation_attempt_index += 1
-        before = self.observe(refresh_control_panel=False)
-        plan = plan_screen_path(
+        before = before or self.observe(refresh_control_panel=False)
+        plan = plan or plan_screen_path(
             target_x,
             target_y,
             before["game_area_collision"],
@@ -1034,7 +1056,7 @@ class PokemonSession:
         for world_from, world_to in map_edges:
             screen_from = map_position_to_walk_cell(GridPoint(*world_from), player)
             screen_to = map_position_to_walk_cell(GridPoint(*world_to), player)
-            if _walk_cell_in_visible_area(screen_from) and _walk_cell_in_visible_area(screen_to):
+            if walk_cell_in_visible_area(screen_from) and walk_cell_in_visible_area(screen_to):
                 blocked.add((screen_from, screen_to))
         return blocked
 
@@ -1505,17 +1527,6 @@ def _map_name(map_id: int) -> str:
     from pokemon_agent.memory.memory_reader import POKEMON_RED_MAP_NAMES
 
     return POKEMON_RED_MAP_NAMES.get(map_id, f"Map {map_id:#04x}")
-
-
-def _walk_cell_in_visible_area(point: Any) -> bool:
-    return 0 <= int(point.x) <= 9 and 0 <= int(point.y) <= 8
-
-
-def _clamp_walk_cell_to_visible_area(point: Any) -> Any:
-    return type(PLAYER_WALK_CELL)(
-        max(0, min(9, int(point.x))),
-        max(0, min(8, int(point.y))),
-    )
 
 
 def _bounded_int(value: Any, *, minimum: int, maximum: int, name: str) -> int:

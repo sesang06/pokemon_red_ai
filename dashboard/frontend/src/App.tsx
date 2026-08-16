@@ -8,6 +8,7 @@ import {
   ListFilter,
   MemoryStick,
   Search,
+  Target,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -64,7 +65,10 @@ export default function App() {
                   <StatePanel state={state} />
                   <ActionPanel state={state} />
                 </div>
-                <ThinkingPanel state={state} />
+                <div className="inspector-thinking-goal">
+                  <ThinkingPanel state={state} />
+                  <GoalPanel state={state} />
+                </div>
                 <MemoryPanel state={state} />
                 {debugMode && <DebugPanel state={state} />}
               </CardContent>
@@ -251,6 +255,28 @@ export function ThinkingPanel({ state }: { state: LiveState | null }) {
           </ScrollArea>
         </div>
       ) : <EmptyLine value="아직 Gemini 생각 요약이 없습니다" />}
+    </InspectorSection>
+  );
+}
+
+export function GoalPanel({ state }: { state: LiveState | null }) {
+  const goal = state?.agent.goal;
+  return (
+    <InspectorSection title="현재 목표" icon={<Target size={14} />}>
+      <div className="goal-summary">
+        <ScrollArea className="goal-summary-scroll">
+          <dl>
+            <div className="goal-summary-item goal-summary-main">
+              <dt><Badge variant="outline">메인 목표</Badge></dt>
+              <dd>{goal?.main || "목표가 설정되지 않았습니다"}</dd>
+            </div>
+            <div className="goal-summary-item goal-summary-sub">
+              <dt><Badge variant="secondary">다음 목표</Badge></dt>
+              <dd>{goal?.sub || "다음 이정표를 탐색하는 중입니다"}</dd>
+            </div>
+          </dl>
+        </ScrollArea>
+      </div>
     </InspectorSection>
   );
 }

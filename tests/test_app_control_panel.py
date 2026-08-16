@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
+
 from pokemon_agent import app
 from pokemon_agent.ui.control_panel import ControlCommand, QtStateControlPanel, _parse_buttons_array
 from pokemon_agent.vision.capture import CaptureConfig
@@ -234,7 +236,38 @@ def test_run_rom_control_panel_move_command(monkeypatch: Any, tmp_path: Path) ->
     assert ("right", 4) in fake_env.buttons
     assert fake_env.ticks == [(1, True), (1, True)]
     assert control_panel.move_results[0]["requested_world_cell"] == {"x": 6, "y": 6}
-    assert control_panel.move_results[0]["stop_reason"] == "planned_path_exhausted"
+    assert control_panel.move_results[0]["stop_reason"] == "queued_path"
+
+
+def test_run_rom_control_panel_replans_to_out_of_view_world_target(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    fake_env = FakePokemonEnvironment()
+    control_panel = FakeControlPanel()
+    control_panel.commands.append(ControlCommand("move", target=(20, 6)))
+    monkeypatch.setattr(app, "PyBoyEnvironment", lambda rom_path, window: fake_env)
+
+    app.run_rom(
+        tmp_path / "pokered.gb",
+        steps=450,
+        window="null",
+        render=True,
+        capture_config=CaptureConfig(directory=tmp_path / "captures"),
+        state_dir=tmp_path / "states",
+        load_state=None,
+        save_final=None,
+        save_every=0,
+        tick_frames=1,
+        control_panel=control_panel,  # type: ignore[arg-type]
+    )
+
+    result = control_panel.move_results[-1]
+    assert fake_env.buttons == [("right", 4)] * 15
+    assert result["requested_world_cell"] == {"x": 20, "y": 6}
+    assert result["requested_target_reached"] is True
+    assert result["navigation_replans"] == 2
+    assert result["stop_reason"] == "target_reached"
 
 
 def test_run_rom_control_panel_move_command_waits_between_buttons(monkeypatch: Any, tmp_path: Path) -> None:
@@ -302,6 +335,24 @@ def test_control_panel_single_button_queues_game_button() -> None:
     panel._queue_single_button("b")
 
     assert [command.buttons for command in panel.commands] == [("a",), ("b",)]
+
+
+def test_control_panel_exports_latest_screen_and_collision_images(tmp_path: Path) -> None:
+    panel = QtStateControlPanel.__new__(QtStateControlPanel)
+    panel.capture_dir = tmp_path / "captures"
+    panel.latest_screen_image = Image.new("RGB", (160, 144), "red")
+    panel.latest_overlay_image = Image.new("RGB", (640, 576), "green")
+    panel.status_label = type("Status", (), {"setText": lambda self, text: setattr(self, "text", text)})()
+
+    screen_path = panel._export_screen_image()
+    collision_path = panel._export_overlay_image()
+
+    assert screen_path is not None and screen_path.is_file()
+    assert collision_path is not None and collision_path.is_file()
+    assert screen_path.parent.parent == panel.capture_dir
+    assert collision_path.parent == screen_path.parent
+    assert screen_path.name.startswith("game_screen_")
+    assert collision_path.name.startswith("collision_map_")
 
 
 def test_control_panel_text_update_preserves_scroll_position() -> None:

@@ -1,404 +1,345 @@
-# Pokemon Red Agent
+# Pokemon Red AI
 
-This repo is a concrete scaffold for a hierarchical Pokemon Red agent built on
-PyBoy. The design follows the attached plan:
+An experimental Pokemon Red agent runtime built with PyBoy, Google ADK, MCP,
+and a live React dashboard. The agent observes RAM and game images, plans a
+bounded action, executes it through deterministic controls, and interprets the
+result before the next cycle.
 
-Planner LLM -> bounded one-shot ActionPlan -> deterministic verification loop ->
-PyBoy -> Memory/Screen readers -> World State -> Memory DB.
+> This repository does not include a Pokemon Red ROM, save state, or copyrighted
+> game assets. Use a legally obtained ROM and keep it local.
 
-The first milestone is not end-to-end game completion. It is a reliable control
-loop that can:
+## Features
 
-- read Pokemon Red RAM into a stable `GameState`
-- use screen/tile APIs for local walkability
-- route movement through A*
-- isolate battle, dialog, inventory, and planning decisions
-- save and restore emulator state around risky actions
-- keep long-term observations in a replaceable memory store
+- Real-time Pokemon Red emulation through PyBoy
+- RAM-derived map, position, facing, dialog, battle, party, inventory, and event state
+- Color screenshots plus collision and world-coordinate overlays
+- Collision-aware Dijkstra navigation using current-map world coordinates
+- Automatic screen-by-screen replanning for destinations outside the current view
+- Google ADK Planner -> deterministic Executor -> Result Interpreter workflow
+- Gemini vision input for the latest screenshot and overlay
+- File-backed long-term memory for maps, NPCs, Pokemon, and events
+- Volatile main/sub goal state restored across runs
+- Save/load state controls and manual PySide6 UI
+- Local MCP server and ADK Dev UI integration
+- FastAPI/WebSocket dashboard at `http://127.0.0.1:8765`
 
-ROM files and copyrighted map data are intentionally not included.
+## Architecture
 
-## Quick Start
-
-Run the manual Pokemon Red launcher. This always uses `src\pokered.gb` and
-starts from `states\fixed_start.state`. It also opens a PySide6 control panel
-with buttons for `Save Fixed`, `Save Snapshot`, `Load Fixed`, `Move`, and `Quit`.
-The `Move` inputs use current map coordinates from the overlay/status; the code
-converts them to the visible 10x9 walk grid internally:
-The `Buttons` input accepts arrays such as `["a","wait"]` or comma-separated
-text like `a, wait, b`, then sends one token at a time with a delay between
-tokens.
-
-```powershell
-python run_pokemon_play.py
+```text
+Latest RAM + screenshot + collision overlay + goal
+                         |
+                         v
+                 Planning Agent (LLM)
+                         |
+             buttons or world-coordinate move
+                         |
+                         v
+              Deterministic Executor
+                         |
+              PyBoy / PokemonSession / MCP
+                         |
+                         v
+          Fresh observation and verified state diff
+                         |
+                         v
+              Result Interpreter (LLM)
+                 |                   |
+             update goal       search/save memory
+                         |
+                         v
+                    next cycle
 ```
 
-The control panel updates once per second and has tabs for:
+PyBoy runs on a dedicated real-time ticker. LLM latency does not advance frames
+in batches or block cached observations. Navigation plans one visible segment at
+a time, waits for real movement, refreshes collision data, and replans toward the
+same current-map world coordinate.
 
-- `RAM Map`: selected Data Crystal RAM-map fields read with `pyboy.memory[0xADDR]`
-- `Game Area`: live `pyboy.game_area()` matrix
-- `Collision`: live `pyboy.game_area_collision()` matrix
+See [docs/architecture.md](docs/architecture.md) for implementation details and
+[docs/realtime-dashboard.md](docs/realtime-dashboard.md) for the dashboard event
+contract.
 
-The structured RAM reader also decodes player/rival names, badges, money,
-coins, game time, tileset, party Pokemon details, moves, PP, status conditions,
-inventory item names, map warps, dialog text, and Pokedex caught count. The
-detail level follows the same style as cicero225's LLM Pokemon scaffold memory
-reader while keeping unknown values non-fatal.
+## Requirements
 
-To run with the project's `.venv` interpreter directly:
+- Windows, macOS, or Linux
+- Python 3.11+
+- A legally obtained English Pokemon Red ROM
+- Google Gemini API key for ADK planning
+- Node.js and pnpm only when rebuilding the dashboard frontend
+- ffmpeg only for optional MP4 capture
 
-```powershell
-.\run_pokemon_play_qt.ps1
-```
+## Installation
 
-or:
-
-```powershell
-.\run_pokemon_play_qt.cmd
-```
-
-To run without the control panel:
+Clone the repository and create one virtual environment:
 
 ```powershell
-python run_pokemon_play.py --no-control-ui
+python -m venv .venv
+.\.venv\Scripts\python.exe -m ensurepip --upgrade
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-To play manually and overwrite the fixed starting state when you stop, run:
-
-```powershell
-python run_pokemon_play.py --set-fixed
-```
-
-When you reach the desired point, return to the terminal and press `Ctrl+C`.
-The program will call PyBoy `save_state` and overwrite
-`states\fixed_start.state`.
-
-If a PyBoy hotkey save (`src\pokered.gb.state`) exists, you can import it with:
-
-```powershell
-python run_pokemon_play.py --fix-current
-```
-
-To reset the fixed state back to the ROM boot state:
-
-```powershell
-python run_pokemon_play.py --boot-state
-```
-
-Run against a legally obtained Pokemon Red ROM:
-
-```powershell
-python -m pokemon_agent.app --rom "C:\path\to\Pokemon Red.gb" --steps 500
-```
-
-Open a live emulator window while the agent runs:
-
-```powershell
-python -m pokemon_agent.app --rom .\src\pokered.gb --window SDL2 --render
-```
-
-PyBoy's SDL2 window also has built-in save-state hotkeys:
-
-- `Z`: save to `ROM.gb.state`
-- `X`: load from `ROM.gb.state`
-
-Run the emulator for 36,000 loop steps:
-
-```powershell
-python -m pokemon_agent.app --rom .\src\pokered.gb --window SDL2 --render --steps 36000
-```
-
-Autosave every 600 loop steps:
-
-```powershell
-python -m pokemon_agent.app --rom .\src\pokered.gb --window SDL2 --render --steps 36000 --save-every 600
-```
-
-Load from a previous PyBoy state and save again on exit:
-
-```powershell
-python -m pokemon_agent.app --rom .\src\pokered.gb --window SDL2 --render --load-state .\src\pokered.gb.state --save-final states\last.state
-```
-
-Save progress screenshots and a short GIF:
-
-```powershell
-python -m pokemon_agent.app --rom .\src\pokered.gb --steps 300 --screenshot-every 30 --record-gif captures\run.gif --video-every 2 --video-fps 15
-```
-
-Save an MP4 if `ffmpeg` is installed:
-
-```powershell
-python -m pokemon_agent.app --rom .\src\pokered.gb --steps 300 --record-mp4 captures\run.mp4 --video-every 2 --video-fps 30
-```
-
-If PyBoy prints warnings about missing `Pillow`, install/sync dependencies again:
+Alternatively, with `uv`:
 
 ```powershell
 uv sync --extra dev
 ```
 
+Place the ROM at:
+
+```text
+src/pokered.gb
+```
+
+The first run creates `states/fixed_start.state` when it does not exist. ROMs,
+states, captures, logs, API keys, SQLite sessions, and long-term memory are all
+ignored by Git.
+
+For Gemini, copy `.env.example` to `.env` and set:
+
+```dotenv
+GOOGLE_API_KEY=your-key
+POKEMON_AGENT_ADK_MODEL=gemini-3.5-flash
+```
+
+## Manual Play
+
+Launch Pokemon Red with the PySide6 control panel:
+
+```powershell
+.\.venv\Scripts\pokemon-play.exe
+```
+
 or:
 
 ```powershell
-python -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe run_pokemon_play.py
 ```
 
-Install for local development:
+The panel provides save/load controls, button-array input, RAM inspection,
+screenshots, and a collision/world-coordinate overlay. A move target is a
+current-map world coordinate. It may be outside the current screen; the runtime
+moves to the best visible frontier, refreshes the screen, and continues planning
+until it reaches the destination or encounters an interruption.
+
+Button arrays accept:
+
+```json
+["a", "wait", "right", "right", "start"]
+```
+
+Useful manual-play options:
 
 ```powershell
-python -m pip install -e ".[dev]"
-pytest
+# Save the final emulator state to states/last.state
+.\.venv\Scripts\pokemon-play.exe --save-final
+
+# Overwrite states/fixed_start.state when stopping
+.\.venv\Scripts\pokemon-play.exe --set-fixed
+
+# Run without the control panel
+.\.venv\Scripts\pokemon-play.exe --no-control-ui
 ```
 
-## Real-time Web Debugger
+## ADK Autoplay
 
-`pokemon-adk` serves a connected Pokemon Red runtime debugger at
-`http://127.0.0.1:8765` by default. The page displays the actual PyBoy frame,
-RAM-derived game state, current goal/action/result, visible world cells and
-path, party, inventory, agent pipeline, recent memory, and a bounded structured
-event log. Planner and interpreter use Gemini's medium thinking level, but
-private thought parts are not returned or streamed. Their explicit public
-`thought_summary` JSON fields remain available in completed agent events. The
-page is an observer only; closing or reloading it does not pause PyBoy or the agent.
+Start the vision-enabled three-agent loop with its live dashboard:
 
 ```powershell
 .\.venv\Scripts\pokemon-adk.exe
 ```
 
-Use `--no-dashboard` to disable the web server, or `--dashboard-host` and
-`--dashboard-port` to change its bind address. The production frontend is
-packaged with Python. To modify it locally:
+Current defaults include:
+
+- up to 10,000 action cycles
+- Gemini planning and result interpretation
+- medium thinking level without private thinking output
+- latest screenshot and collision overlay as transient vision input
+- continuous 60 FPS emulation and 30 Hz visual snapshots
+- PySide6 control UI and audio
+- dashboard at [http://127.0.0.1:8765](http://127.0.0.1:8765)
+
+Override the restored main goal when starting a run:
+
+```powershell
+.\.venv\Scripts\pokemon-adk.exe --main-goal "Complete Pokemon Red"
+```
+
+Run headless without vision or dashboard:
+
+```powershell
+.\.venv\Scripts\pokemon-adk.exe --window null --no-control-ui --no-adk-vision --no-dashboard
+```
+
+The Planner returns exactly one direct action:
+
+```json
+{"type":"buttons","buttons":["a","wait","a"],"reason":"advance_dialog"}
+```
+
+or:
+
+```json
+{
+  "type":"move",
+  "waypoints":[[9,5],[16,5]],
+  "target":[24,8],
+  "reason":"follow_the_route_exit"
+}
+```
+
+`target` and `waypoints` are current-map world coordinates, not screen tiles or
+the internal 10x9 walk grid. A map transition intentionally interrupts the
+current move because the coordinate system changes with `map_id`.
+
+## Live Dashboard
+
+The packaged dashboard shows:
+
+- current game screen and collision/world-coordinate overlay
+- RAM-derived state, mode, position, facing, dialog, and battle information
+- current main/sub goal and action result
+- party information and Pokemon sprites
+- Planner and Result Interpreter summaries
+- recently accessed long-term memory
+- current and maximum agent step counts
+
+To rebuild the frontend:
 
 ```powershell
 cd dashboard\frontend
 pnpm install
-pnpm dev
+pnpm build
 ```
 
-`pnpm dev` proxies `/api` and `/ws` to port 8765. Run `pnpm build` after a
-frontend change to regenerate `src\pokemon_agent\dashboard\static`.
+The production bundle is written to
+`src/pokemon_agent/dashboard/static` and included in the Python package.
 
-Party sprites are generated directly from the RAM-derived National Pokédex
-`species_id`; no REST lookup occurs on render. They use the pixel-art
-[PokéAPI Generation I Red/Blue sprite assets](https://github.com/PokeAPI/sprites/tree/master/sprites/pokemon/versions/generation-i/red-blue/transparent).
-Pokemon Red's internal party index is preserved separately as
-`internal_species_id` and normalized with the
-[pret/pokered Pokédex order table](https://github.com/pret/pokered/blob/master/data/pokemon/dex_order.asm).
+## ADK Dev UI
 
-See [docs/realtime-dashboard.md](docs/realtime-dashboard.md) for the transport,
-event contract, performance behavior, and verification commands.
-
-## MCP + Google ADK
-
-Run the Pokemon Red MCP server over local stdio. By default this starts the
-fixed ROM session and opens the PySide6 control panel, so the RAM Map, Game
-Area, Collision, World Map, MCP Log tabs, and live game-screen preview update
-whenever MCP tools observe or advance the game. The MCP Log tab shows each
-received tool call, its arguments, and the final `ok` or `error` status. The
-stdio server also keeps the Qt event loop
-pumped, so the panel remains responsive while the MCP server is running:
-
-```powershell
-.\.venv\Scripts\python.exe -m pokemon_agent.mcp_server
-```
-
-To also print MCP command logs in the terminal, run with `--log-level INFO`:
-
-```powershell
-.\.venv\Scripts\python.exe -m pokemon_agent.mcp_server --log-level INFO
-```
-
-To keep the game ticking and the control-panel screen updating even when no
-planner is sending actions, enable realtime ticks:
-
-```powershell
-.\.venv\Scripts\python.exe -m pokemon_agent.mcp_server --realtime-ticks --realtime-fps 60 --ui-refresh-hz 30
-```
-
-For a pure headless MCP server:
-
-```powershell
-.\.venv\Scripts\python.exe -m pokemon_agent.mcp_server --no-auto-start --no-control-ui
-```
-
-Register it with an MCP client using this shape:
-
-```json
-{
-  "mcpServers": {
-    "pokemon-red-pyboy": {
-      "command": "C:\\Users\\sesan\\Documents\\New project 2\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "pokemon_agent.mcp_server"],
-      "cwd": "C:\\Users\\sesan\\Documents\\New project 2"
-    }
-  }
-}
-```
-
-Important MCP tools:
-
-- `start_session(window="null", load_fixed=true, control_ui=true)`
-- `observe()`: returns RAM, `game_area`, `game_area_collision`, `visible_world_cells`, and PNG screenshot base64
-- `press_buttons(buttons)`: executes button and `wait` tokens through the realtime ticker
-- `wait()`: waits 300 milliseconds while the realtime ticker advances the game
-- `move_to_world_cell(target_x, target_y)`: collision-aware movement by current map/world coordinates
-- `save_state(kind="snapshot" | "fixed" | "last")`
-- `load_state(kind="fixed" | "last")`
-- `reset_to_fixed()`
-- `recent_mcp_commands(limit=50)`: returns the same recent command log shown in the control panel
-- `set_realtime_ticks(enabled=true, fps=60)`: keeps PyBoy ticking outside planner actions
-- `realtime_tick_status()`
-
-Starting a session starts a fixed-step realtime ticker immediately. The ticker
-advances exactly one frame per scheduled interval and drops missed wall-clock
-deadlines instead of batching catch-up frames. It also owns all runtime PyBoy
-button, save, and load calls. `observe()` returns the latest cached RAM and
-visual snapshot, so LLM latency and screenshot consumers do not pause the game.
-RAM-derived state is refreshed every frame; screenshots and overlays refresh at
-30 Hz. `pump_realtime()` only refreshes Qt/UI state and reports progress.
-
-The session converts the visible collision data internally and routes with
-Dijkstra before scheduling D-pad buttons. Agents and ADK Web use only
-`move_to_world_cell` or a `move` action with current map/world coordinates.
-
-The Python executor retains two action schemas:
-
-```json
-{"type":"buttons","buttons":["a","wait"]}
-{"type":"move","target":[1,3]}
-{"type":"move","waypoints":[[6,3],[12,3]],"target":[18,7]}
-```
-
-For the executor, `move.target` and optional ordered `move.waypoints` are always
-current map/world coordinates, matching the collision overlay labels and
-`state.position`. The executor visits each waypoint before the final target.
-Each destination is traversed through bounded 8-step Dijkstra segments with
-fresh observations between segments.
-
-The Google ADK planner returns one of those actions directly. Every plan is
-executed once, followed by a fresh RAM/GameState observation and a new planner
-call. Repeated button input is written explicitly in one ordered button array.
-
-```json
-{
-  "action":{"type":"buttons","buttons":["a","wait","a","wait","a"],"reason":"advance_dialog_three_times"}
-}
-```
-
-Run the Google ADK-backed safe loop:
-
-```powershell
-.\.venv\Scripts\pokemon-adk.exe
-```
-
-By default, this uses `--steps 10000 --window SDL2 --control-ui
---realtime-ticks --realtime-fps 60 --ui-refresh-hz 30 --adk-model
-"gemini-3.5-flash" --adk-vision`. With the control UI enabled, the game and
-collision overlay are rendered in one Qt window while a windowless SDL audio
-device plays BGM and sound effects. Use `--window null` for silent headless execution.
-
-Run with a Google ADK model planner:
-
-```powershell
-$env:GOOGLE_API_KEY="your-api-key"
-.\.venv\Scripts\python.exe -m pokemon_agent.adk_agent.runner --steps 20 --window SDL2 --control-ui --adk-model "gemini-3.5-flash"
-```
-
-You can also create a local `.env` file. It is ignored by git:
-
-```powershell
-$env:GOOGLE_API_KEY="your-api-key"
-Set-Content .env "GOOGLE_API_KEY=$env:GOOGLE_API_KEY"
-Add-Content .env "POKEMON_AGENT_ADK_MODEL=gemini-3.5-flash"
-```
-
-Then run:
-
-```powershell
-$env:POKEMON_AGENT_ADK_MODEL="gemini-3.5-flash"
-.\.venv\Scripts\python.exe -m pokemon_agent.adk_agent.runner
-```
-
-The default ADK runner sends the latest screenshot and collision overlay to the
-planner as transient per-request context. They reach the model but are not saved
-as inline image payloads in the Planner conversation history. The model returns
-direct `buttons` or world-coordinate `move` JSON with an explicit one-shot input
-sequence. Invalid or unavailable LLM responses stop the loop with
-`planning_failed` without sending game input. Use `--no-adk-vision` to disable
-image input.
-
-Each ADK execution action is also written as JSONL grouped by local date:
-`logs\actions\YYYYMMDD\actions.jsonl`. Use `--action-log-dir <path>` to change
-the directory or `--no-action-log` to disable this file log.
-
-The CLI also writes all ADK planner/interpreter events to the shared SQLite DB
-`data\adk_sessions.db`. Model context remains bounded: every five completed
-planner turns are compacted with one turn of overlap, while the result interpreter is stateless. Planner
-calls occur once per executed action.
-Interpreter calls occur only at failures, Goal completion,
-or durable events; a 20-entry history limit does not
-trigger LLM calls. The complete DB trace remains available to ADK Dev UI.
-Structured `goal.main/sub`, `active_action_plan`, `action_outcome`, `state_diff`, and
-`action_history` are updated atomically in `data\adk_runtime_state.json` for Dev UI status tools.
-
-For live UI refresh, realtime ticking, LLM planning, and vision together:
-
-```powershell
-.\.venv\Scripts\pokemon-adk.exe
-```
-
-Run the ADK Web UI with the traceable Pokemon runtime team:
+Start the Google ADK development interface:
 
 ```powershell
 .\run_adk_web.ps1
 ```
 
-This starts Dev UI with the same `data\adk_sessions.db` used by
-`pokemon-adk.exe`. Open `http://localhost:8000`, select the `adk_agent` app and
-user `user`. The CLI team trace is stored in the `pokemon-red-autoplay` session;
-refresh the session list/event view while the CLI runs to load new events.
+Open [http://127.0.0.1:8000/dev-ui/](http://127.0.0.1:8000/dev-ui/) and select
+the `adk_agent` app. A prompt such as `Play Pokemon for 100 steps.` invokes the
+same native Planner -> Executor -> Result Interpreter team used by the CLI.
+Sub-agent model calls, tool calls, token metadata, and phase events are visible
+in the ADK trace.
 
-The root agent also exposes `agent_runtime_status` and `recent_agent_actions`. In Dev UI, try:
+Raw ADK events are stored locally in `data/adk_sessions.db`. Context compaction
+bounds model input while retaining raw events for diagnostics. Historical image
+payloads are filtered so only the latest transient screenshot and overlay are
+sent to each vision call.
 
-```text
-Show the separately running CLI agent status and recent actions.
+## MCP Server
+
+Run the local stdio MCP server:
+
+```powershell
+.\.venv\Scripts\pokemon-mcp.exe
 ```
 
-To run autoplay from Dev UI, ask `Play Pokemon for 100 steps.` The web coordinator transfers the same invocation to
-`pokemon_red_team`, which starts an SDL2/Qt MCP worker and runs the vision-enabled planner, deterministic executor,
-result interpreter, checkpoints, action logs, and dashboard at `http://127.0.0.1:8765/`. The current Dev UI Trace shows
-`pokemon_red_web_coordinator -> pokemon_red_team -> planning -> execution -> result interpretation`, including nested
-model requests, responses, public decision summaries, token metadata, and memory-tool spans. Both CLI and Web autoplay use
-the same native Planner and Result Interpreter children inside their outer team trace; neither starts a nested ADK
-Runner or a separate sub-agent session.
+Headless mode:
 
-ADK Web records the coordinator transfer and each runtime phase in the current
-event history. The planner's latest game screenshot and collision overlay are
-attached to its model request; older image payloads are omitted from subsequent
-model context.
+```powershell
+.\.venv\Scripts\pokemon-mcp.exe --no-auto-start --no-control-ui
+```
 
-## Design Notes
+Primary tools:
 
-- The Google ADK planner produces one bounded `buttons` action or one persistent current-map `move` ActionPlan.
-- Python validates each action once and owns collision checks, screen-by-screen Dijkstra replanning, and interruption handling.
-- RAM-derived GameState deterministically verifies action results and Goal success.
-- The Planner optionally reads map, NPC, Pokemon, and event memories with at most one batched
-  `search_memory(queries=[...])` call when the next action needs a missing historical fact.
-- The result interpreter uses at most one atomic `save_memory(entries=[...])` call. Each entry selects `append` to
-  preserve and extend the value or `replace` to overwrite it; persisted keys are generated internally as
-  `map:<name>`, `npc:<name>`, `pokemon:<name>`, or `event:<name>`.
-- Navigation is deterministic Dijkstra over the latest visible walkability grid and automatically replans toward remote current-map coordinates.
-- Battle and dialog are isolated because they use different observations and
-  menu timing than overworld movement.
-- RAM reads are the source of truth for state such as map id and coordinates.
-- Screen/tile reads are supporting evidence for local terrain and UI state.
-- Save states are explicit checkpoints for retries.
-- After every completed agent turn, the current emulator state overwrites `states\fixed_start.state`; the periodic
-  `--checkpoint-every` backup to `states\last.state` remains separate.
+- `start_session`
+- `observe`
+- `press_buttons`
+- `wait`
+- `move_to_world_cell`
+- `save_state`
+- `load_state`
+- `reset_to_fixed`
+- `set_realtime_ticks`
+- `realtime_tick_status`
+- `recent_mcp_commands`
 
-Useful upstream references:
+`observe()` returns structured RAM state, game/collision matrices, visible world
+coordinates, a PNG screenshot, and a PNG collision overlay. Public actions do
+not expose frame timing or walk-cell coordinates.
 
-- PyBoy API: https://docs.pyboy.dk/
-- PyBoy Pokemon Gen1 wrapper: https://docs.pyboy.dk/plugins/game_wrapper_pokemon_gen1.html
-- pret/pokered disassembly: https://github.com/pret/pokered
+## Memory and Runtime Data
+
+Generated local data is intentionally not committed:
+
+```text
+data/long_term_memory.json   map, NPC, Pokemon, and event memories
+data/adk_runtime_state.json  latest goal and runtime snapshot
+data/adk_sessions.db         ADK event/session trace
+logs/actions/YYYYMMDD/       date-grouped action JSONL
+states/                      PyBoy save states
+captures/                    screenshots and recordings
+```
+
+Long-term memory tools support batched search and atomic append/replace writes.
+The latest goal contains only:
+
+```json
+{
+  "goal": {
+    "main": "Complete Pokemon Red",
+    "sub": "Reach the next concrete story milestone"
+  }
+}
+```
+
+## Development
+
+Run the full Python test suite:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
+
+Run dashboard tests and build:
+
+```powershell
+cd dashboard\frontend
+pnpm test
+pnpm build
+```
+
+Project layout:
+
+```text
+src/pokemon_agent/
+  adk_agent/
+    agents/          Planner, Executor, Result Interpreter, memory/goal tools
+    coordinator/     ordered action cycle and native ADK workflow
+    runtime/         state, history, persistence, logging, trace
+    web/             ADK Dev UI app and tools
+  dashboard/         FastAPI/WebSocket server and packaged frontend
+  emulator/          PyBoy adapter
+  memory/            RAM reader, GameState, world map, file memory
+  tools/             Dijkstra and shared screen/world navigation
+  ui/                PySide6 control panel
+  vision/            screenshots, collision overlays, capture
+  mcp_server.py      local MCP interface
+  session.py         real-time PyBoy session owner
+dashboard/frontend/  React dashboard source
+tests/               unit and integration tests
+```
+
+## Limitations
+
+- Navigation coordinates are local to the current map.
+- Story planning quality depends on the selected Gemini model and available context.
+- RAM addresses and dialog decoding target English Pokemon Red.
+- Save states are emulator/version-sensitive and are not portable project assets.
+- This project is for research and personal experimentation; it is not affiliated
+  with Nintendo, Game Freak, Creatures, or The Pokemon Company.
+
+## References
+
+- [PyBoy documentation](https://docs.pyboy.dk/)
+- [Google ADK documentation](https://google.github.io/adk-docs/)
+- [Model Context Protocol](https://modelcontextprotocol.io/)
+- [pret/pokered](https://github.com/pret/pokered)

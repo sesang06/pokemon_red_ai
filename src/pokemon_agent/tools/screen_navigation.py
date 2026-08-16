@@ -21,6 +21,55 @@ class ScreenPathPlan:
     stop_reason: str
 
 
+@dataclass(frozen=True)
+class WorldPathSegment:
+    requested_world_cell: GridPoint
+    requested_walk_cell: GridPoint
+    segment_walk_cell: GridPoint
+    resolved_world_cell: GridPoint
+    target_out_of_visible_area: bool
+    screen_plan: ScreenPathPlan
+
+
+def plan_world_path_segment(
+    target_x: int,
+    target_y: int,
+    collision_matrix: Any,
+    *,
+    player_position: GridPoint,
+    start: GridPoint = PLAYER_WALK_CELL,
+    accept_nearest: bool = True,
+    blocked_edges: set[tuple[GridPoint, GridPoint]] | None = None,
+) -> WorldPathSegment:
+    """Plan one visible segment toward a current-map world coordinate."""
+    requested_world_cell = GridPoint(int(target_x), int(target_y))
+    requested_walk_cell = map_position_to_walk_cell(requested_world_cell, player_position)
+    target_out_of_visible_area = not walk_cell_in_visible_area(requested_walk_cell)
+    segment_walk_cell = (
+        clamp_walk_cell_to_visible_area(requested_walk_cell)
+        if target_out_of_visible_area
+        else requested_walk_cell
+    )
+    screen_tile = walk_cell_to_screen_tile(segment_walk_cell)
+    screen_plan = plan_screen_path(
+        screen_tile.x,
+        screen_tile.y,
+        collision_matrix,
+        start=start,
+        accept_nearest=accept_nearest,
+        blocked_edges=blocked_edges,
+    )
+    resolved_world_cell = walk_cell_to_map_position(screen_plan.resolved_walk_cell, player_position)
+    return WorldPathSegment(
+        requested_world_cell=requested_world_cell,
+        requested_walk_cell=requested_walk_cell,
+        segment_walk_cell=segment_walk_cell,
+        resolved_world_cell=resolved_world_cell,
+        target_out_of_visible_area=target_out_of_visible_area,
+        screen_plan=screen_plan,
+    )
+
+
 def plan_screen_path(
     target_x: int,
     target_y: int,
@@ -148,6 +197,17 @@ def map_position_to_walk_cell(
     return GridPoint(
         player_walk_cell.x + map_position.x - player_position.x,
         player_walk_cell.y + map_position.y - player_position.y,
+    )
+
+
+def walk_cell_in_visible_area(point: GridPoint) -> bool:
+    return 0 <= point.x <= 9 and 0 <= point.y <= 8
+
+
+def clamp_walk_cell_to_visible_area(point: GridPoint) -> GridPoint:
+    return GridPoint(
+        max(0, min(9, int(point.x))),
+        max(0, min(8, int(point.y))),
     )
 
 

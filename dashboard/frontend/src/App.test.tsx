@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { GameViewport, Header, StatePanel, ThinkingPanel } from "./App";
+import { GameViewport, GoalPanel, Header, StatePanel, ThinkingPanel } from "./App";
 import type { LiveState } from "./types";
 
 
@@ -95,5 +95,24 @@ describe("GameViewport", () => {
     expect(markup).toContain("플래너");
     expect(markup).toContain("생성 중");
     expect(markup).toContain("The current target is reachable within the bounded path.");
+  });
+
+  it("renders the volatile main and sub goals", () => {
+    const state = {
+      agent: {
+        goal: {
+          main: "Complete Pokemon Red",
+          sub: "Travel to Pewter City and challenge the Gym.",
+        },
+      },
+    } as LiveState;
+
+    const markup = renderToStaticMarkup(<GoalPanel state={state} />);
+
+    expect(markup).toContain("현재 목표");
+    expect(markup).toContain("메인 목표");
+    expect(markup).toContain("다음 목표");
+    expect(markup).toContain("Complete Pokemon Red");
+    expect(markup).toContain("Travel to Pewter City and challenge the Gym.");
   });
 });
